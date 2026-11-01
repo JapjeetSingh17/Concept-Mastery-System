@@ -7,6 +7,7 @@ A production-grade, closed-loop educational mastery platform that solves the fun
 4. **Two-Layer Socratic Guardrails**: Pedagogical scaffolding that prevents direct answer blurting while enforcing strict citation grounding (`[Page X]`).
 5. **Closed-Loop LangGraph Engine**: Automated agentic cycle of Assessment &rarr; Diagnosis &rarr; Socratic Remediation &rarr; Re-assessment.
 6. **Multi-Model LLM Resilience**: Primary integration with Google Gemini (`gemini-3.8-flash`) and instant automated failover to Groq Cloud (`llama-3.3-70b-versatile`).
+7. **Multi-PDF Course Ingestion & Live Web Search**: Seamless batch ingestion of multiple PDFs into a unified prerequisite DAG, coupled with live web search powered by TinyFish Search API for broader queries, real-world examples, and conversational greetings.
 
 ---
 
@@ -189,3 +190,4 @@ PYTHONPATH=. .venv/bin/pytest tests/test_aggressive_suite.py tests/test_closed_l
 
 ## License
 MIT License. Created as part of the Closed-Loop Concept Mastery Platform research project.
+

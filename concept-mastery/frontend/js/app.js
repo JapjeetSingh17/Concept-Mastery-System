@@ -531,9 +531,9 @@
         <div class="grid grid-cols-2">
           <!-- Upload Dropzone Card -->
           <div class="card">
-            <h3 style="margin-bottom: 1.25rem;">Upload Document</h3>
+            <h3 style="margin-bottom: 1.25rem;">Upload Document(s)</h3>
             <div class="upload-dropzone" id="upload-dropzone">
-              <input type="file" id="pdf-file-input" accept=".pdf" style="display:none;">
+              <input type="file" id="pdf-file-input" accept=".pdf" multiple style="display:none;">
               <div class="upload-icon-pulse">
                 <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
                   <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
@@ -541,8 +541,8 @@
                   <line x1="12" y1="3" x2="12" y2="15"/>
                 </svg>
               </div>
-              <h4 style="font-size:1.1rem; margin-bottom:0.35rem;">Drag & drop your study PDF here</h4>
-              <p style="font-size:0.85rem; color:var(--ink-muted);">or click to browse your local computer</p>
+              <h4 style="font-size:1.1rem; margin-bottom:0.35rem;">Drag & drop your study PDF(s) here</h4>
+              <p style="font-size:0.85rem; color:var(--ink-muted);">or click to select one or multiple PDFs</p>
 
               <div id="selected-file-display" style="display:none;" class="upload-file-details">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
@@ -552,7 +552,7 @@
 
             <div style="margin-top:1.25rem; display:flex; justify-content:flex-end;">
               <button class="btn btn-primary" id="btn-process-pdf" disabled>
-                Process PDF Material
+                Process PDF Material(s)
               </button>
             </div>
           </div>
@@ -652,7 +652,7 @@
               </div>
               <div>
                 <span style="font-weight:700; font-size:0.92rem; color:var(--ink-primary);">Concept Mastery Tutor</span>
-                <span style="display:block; font-size:0.75rem; color:var(--color-strong);">● Grounded RAG active</span>
+                <span style="display:block; font-size:0.75rem; color:var(--color-strong);">● Grounded RAG + TinyFish Web Search active</span>
               </div>
             </div>
             <button id="btn-clear-chat" class="btn btn-secondary btn-sm" title="Clear conversation history">
@@ -669,13 +669,13 @@
           <div class="tutor-suggestions" id="tutor-suggestions">
             <button class="suggestion-chip" data-prompt="Can you give me an example with math formulas?">Can you give me an example?</button>
             <button class="suggestion-chip" data-prompt="What are the essential prerequisites for this concept?">What are the prerequisites?</button>
-            <button class="suggestion-chip" data-prompt="Why is this important in practice?">Why is this important?</button>
+            <button class="suggestion-chip" data-prompt="Search the web for recent industry applications of this concept.">Search web for applications</button>
             <button class="suggestion-chip" data-prompt="Explain this simply as if I were a beginner.">Explain simply</button>
           </div>
 
           <!-- Tutor Input Form -->
           <form class="tutor-input-form" id="tutor-input-form">
-            <input type="text" id="tutor-question-input" placeholder="Ask a question about your study material..." autocomplete="off" required>
+            <input type="text" id="tutor-question-input" placeholder="Ask about your study material, concepts, or search the web..." autocomplete="off" required>
             <button type="submit" class="btn btn-primary" id="btn-tutor-send">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
               Send
@@ -1087,12 +1087,22 @@
     const isUser = msg.sender === "user";
     const citationsHtml = msg.citations && msg.citations.length > 0 ? `
       <div class="citation-block">
-        ${msg.citations.map((c, i) => `
-          <button class="citation-chip view-citation-btn" data-page="${c.page || 1}" data-snippet="${esc(c.snippet)}" data-text="${esc(c.text || '')}">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-            <span>Page ${c.page || 1}: <strong>${esc(c.snippet || "Section")}</strong> &rarr;</span>
-          </button>
-        `).join("")}
+        ${msg.citations.map((c, i) => {
+          if (c.source_type === "web" || c.url) {
+            return `
+              <a href="${esc(c.url || '#')}" target="_blank" rel="noopener noreferrer" class="citation-chip web-citation-chip" style="text-decoration:none; display:inline-flex; align-items:center; gap:0.35rem; color:var(--primary);">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+                <span>${esc(c.snippet || c.title || "Web Source")} &nearr;</span>
+              </a>
+            `;
+          }
+          return `
+            <button class="citation-chip view-citation-btn" data-page="${c.page || 1}" data-snippet="${esc(c.snippet)}" data-text="${esc(c.text || '')}">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+              <span>Page ${c.page || 1}: <strong>${esc(c.snippet || "Section")}</strong> &rarr;</span>
+            </button>
+          `;
+        }).join("")}
       </div>
     ` : "";
 
@@ -1183,18 +1193,32 @@
       const sampleBtn = $("#btn-load-sample");
       const fileDisplay = $("#selected-file-display");
       const fileNameEl = $("#selected-file-name");
-      let selectedFile = null;
+      let selectedFiles = [];
 
       if (!dropzone || !fileInput || !processBtn) return;
 
       dropzone.onclick = () => fileInput.click();
 
+      function updateFileSelection(fileList) {
+        const pdfs = Array.from(fileList || []).filter(f => f.name.toLowerCase().endsWith(".pdf"));
+        if (!pdfs.length) {
+          showToast("Please select at least one valid PDF file.", "warning");
+          return;
+        }
+        selectedFiles = pdfs;
+        if (pdfs.length === 1) {
+          fileNameEl.textContent = pdfs[0].name;
+        } else {
+          fileNameEl.textContent = `${pdfs.length} PDFs selected (${pdfs.map(f => f.name).join(", ")})`;
+        }
+        fileDisplay.style.display = "inline-flex";
+        processBtn.disabled = false;
+        processBtn.textContent = `Process ${pdfs.length > 1 ? pdfs.length + " PDFs" : "PDF Material"}`;
+      }
+
       fileInput.onchange = () => {
-        if (fileInput.files && fileInput.files[0]) {
-          selectedFile = fileInput.files[0];
-          fileNameEl.textContent = selectedFile.name;
-          fileDisplay.style.display = "inline-flex";
-          processBtn.disabled = false;
+        if (fileInput.files && fileInput.files.length) {
+          updateFileSelection(fileInput.files);
         }
       };
 
@@ -1209,32 +1233,27 @@
         dropzone.addEventListener(ev, e => {
           e.preventDefault();
           dropzone.classList.remove("over");
-          if (ev === "drop" && e.dataTransfer.files && e.dataTransfer.files[0]) {
-            selectedFile = e.dataTransfer.files[0];
-            if (!selectedFile.name.toLowerCase().endsWith(".pdf")) {
-              showToast("Please upload a PDF file.", "warning");
-              return;
-            }
-            fileNameEl.textContent = selectedFile.name;
-            fileDisplay.style.display = "inline-flex";
-            processBtn.disabled = false;
+          if (ev === "drop" && e.dataTransfer.files && e.dataTransfer.files.length) {
+            updateFileSelection(e.dataTransfer.files);
           }
         });
       });
 
       // Process Ingestion
       processBtn.onclick = async () => {
-        if (!selectedFile) return;
+        if (!selectedFiles.length) return;
         processBtn.disabled = true;
-        processBtn.textContent = "Processing PDF...";
+        processBtn.textContent = `Processing ${selectedFiles.length > 1 ? selectedFiles.length + " PDFs" : "PDF"}...`;
 
         const stages = [$("#stage-1"), $("#stage-2"), $("#stage-3"), $("#stage-4")];
         stages.forEach(s => s && (s.className = "stage-item running"));
 
         try {
-          const result = await ApiService.uploadPdf(selectedFile);
+          const result = await ApiService.uploadPdf(selectedFiles);
           stages.forEach(s => s && (s.className = "stage-item done"));
-          showToast(`Ingestion complete! ${result.concepts || 6} concepts discovered.`, "success");
+          const discoveredCount = result.concepts ? (Array.isArray(result.concepts) ? result.concepts.length : result.concepts) : 6;
+          const filesCount = result.files_count || selectedFiles.length;
+          showToast(`Ingestion complete! ${discoveredCount} concepts discovered across ${filesCount} document(s).`, "success");
           await syncActiveDocument();
           setTimeout(() => {
             location.hash = "#dashboard";

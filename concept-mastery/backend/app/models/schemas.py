@@ -120,9 +120,12 @@ class QuizResult(BaseModel):
 # ── 6. Socratic Tutor Schemas ──────────────────────────────────────────────
 
 class Citation(BaseModel):
-    page: int
+    page: int | None = None
     snippet: str
     text: str
+    source_type: str = "document"  # "document" | "web"
+    url: str | None = None
+    title: str | None = None
 
 
 class TutorChatRequest(BaseModel):
@@ -160,6 +163,8 @@ class LoopState(TypedDict, total=False):
 class UploadResponse(BaseModel):
     job_id: str
     filename: str
+    filenames: list[str] = Field(default_factory=list)
+    files_count: int = 1
     pages: int
     chunks_indexed: int
     concepts_found: list[str]

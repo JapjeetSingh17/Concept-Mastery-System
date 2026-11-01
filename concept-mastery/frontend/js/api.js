@@ -50,6 +50,7 @@ const ENDPOINTS = {
   ingestSample:     { method: "POST", path: "/api/ingest/sample" },
   ingestStatus:     { method: "GET",  path: "/api/ingest/status" },
   ask:              { method: "POST", path: "/api/tutor/ask" },
+  webSearch:        { method: "POST", path: "/api/web/search" },
   graph:            { method: "GET",  path: "/api/graph" },
   conceptsGraph:    { method: "GET",  path: "/api/concepts/graph" },
   quizNext:         { method: "POST", path: "/api/quiz/next" },
@@ -133,10 +134,20 @@ const ApiService = {
     return callApi("ingestStatus");
   },
 
-  async uploadPdf(file) {
+  async uploadPdf(files) {
     const formData = new FormData();
-    formData.append("file", file);
+    if (files instanceof FileList || Array.isArray(files)) {
+      for (let i = 0; i < files.length; i++) {
+        formData.append("files", files[i]);
+      }
+    } else if (files instanceof File) {
+      formData.append("files", files);
+    }
     return callApi("ingest", formData);
+  },
+
+  async searchWeb(query, maxResults = 5) {
+    return callApi("webSearch", { query, max_results: maxResults });
   },
 
   async loadSamplePdf() {

@@ -35,6 +35,9 @@ htmlcov/
 *.db-journal
 concept-mastery/data/vectorstore/*.db
 concept-mastery/data/vectorstore/*.db-journal
+concept-mastery/data/vectorstore/*.json
+!concept-mastery/data/vectorstore/.gitkeep
 
 # Temporary archives
 concept-mastery.zip
+

@@ -1335,7 +1335,13 @@ button {
   transition: all 0.15s ease;
 }
 
-.citation-chip:hover {
+.citation-chip.web-citation-chip {
+  border-color: rgba(99, 102, 241, 0.35);
+  color: var(--primary);
+}
+
+.citation-chip:hover,
+.citation-chip.web-citation-chip:hover {
   background: var(--primary-light);
   border-color: var(--primary-border);
   color: var(--primary);

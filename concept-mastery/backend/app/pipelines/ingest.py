@@ -95,20 +95,38 @@ def chunk_pages(pages: list[tuple[int, str]], source_filename: str) -> list[dict
 
 
 def run_ingest(path: Path) -> dict:
-    """Run full vectorless ingestion pipeline synchronously."""
-    pages = extract_pages(path)
-    raw_chunks = chunk_pages(pages, source_filename=path.name)
-    if not raw_chunks:
-        raise store.UserError("No readable text found. Scanned PDFs need OCR first.")
+    """Run full vectorless ingestion pipeline for a single PDF synchronously."""
+    return run_ingest_multiple([path])
 
-    # 1. Build Prerequisite Concept DAG
-    cs, edges = concepts.build(raw_chunks)
+
+def run_ingest_multiple(paths: list[Path]) -> dict:
+    """Run vectorless ingestion pipeline across one or more study PDFs."""
+    if not paths:
+        raise store.UserError("No PDF files provided for ingestion.")
+
+    all_raw_chunks: list[dict] = []
+    total_pages = 0
+    valid_filenames: list[str] = []
+
+    for path in paths:
+        if not path.exists():
+            continue
+        valid_filenames.append(path.name)
+        pages = extract_pages(path)
+        total_pages += len(pages)
+        raw_chunks = chunk_pages(pages, source_filename=path.name)
+        all_raw_chunks.extend(raw_chunks)
+
+    if not all_raw_chunks:
+        raise store.UserError("No readable text found in uploaded PDF(s). Scanned PDFs need OCR first.")
+
+    # 1. Build Prerequisite Concept DAG across all combined material
+    cs, edges = concepts.build(all_raw_chunks)
     concept_names = [c["name"] for c in cs]
 
     # 2. Tag each chunk with canonical concept IDs
-    for chunk in raw_chunks:
+    for chunk in all_raw_chunks:
         detected = NORMALIZER.detect_canonical_concepts(chunk["text"], concept_names)
-        # Also include section if it matches a concept
         section_norm = NORMALIZER.canonicalize(chunk["section"])
         if section_norm and section_norm not in detected:
             detected.append(section_norm)
@@ -123,26 +141,29 @@ def run_ingest(path: Path) -> dict:
             section_title=c["section"],
             text=c["text"],
             canonical_concepts=c["canonical_concepts"],
-            source_filename=path.name,
+            source_filename=c.get("source_filename", valid_filenames[0]),
         )
-        for c in raw_chunks
+        for c in all_raw_chunks
     ]
     GLOBAL_INDEX.index_chunks(chunk_models)
 
-    # 4. Save to legacy KB for frontend compatibility
+    # 4. Save to KB for frontend and API compatibility
+    combined_name = ", ".join(valid_filenames)
     from ..core.vector_index import VectorIndex
-    index = VectorIndex.build(raw_chunks)
-    store.save_kb(path.name, len(pages), index, cs, edges)
+    index = VectorIndex.build(all_raw_chunks)
+    store.save_kb(combined_name, total_pages, index, cs, edges)
     mastery.reset(cs)
 
     return {
-        "job_id": path.name,
-        "file": path.name,
-        "filename": path.name,
-        "pages": len(pages),
-        "chunks": len(raw_chunks),
-        "chunk_count": len(raw_chunks),
-        "chunks_indexed": len(raw_chunks),
+        "job_id": combined_name,
+        "file": combined_name,
+        "filename": combined_name,
+        "filenames": valid_filenames,
+        "files_count": len(valid_filenames),
+        "pages": total_pages,
+        "chunks": len(all_raw_chunks),
+        "chunk_count": len(all_raw_chunks),
+        "chunks_indexed": len(all_raw_chunks),
         "concepts": [c["name"] for c in cs],
         "concepts_found": [c["name"] for c in cs],
         "graph_nodes": len(cs),
@@ -150,7 +171,8 @@ def run_ingest(path: Path) -> dict:
     }
 
 
-async def run_ingest_async(path: Path) -> dict:
+async def run_ingest_async(path_or_paths: Path | list[Path]) -> dict:
     """Run ingest in an executor so it never blocks the async event loop."""
+    paths = [path_or_paths] if isinstance(path_or_paths, Path) else path_or_paths
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, run_ingest, path)
+    return await loop.run_in_executor(None, run_ingest_multiple, paths)

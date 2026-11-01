@@ -11,7 +11,7 @@ Endpoints:
 """
 
 from pathlib import Path
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException, Request
 from pydantic import BaseModel
 
 from . import config
@@ -41,20 +41,35 @@ def health():
 
 # ── 1. Document Ingestion & Vectorless Index ───────────────────────────────
 
+async def _save_uploaded_pdfs(files: list[UploadFile], file: UploadFile | None) -> list[Path]:
+    all_uploads: list[UploadFile] = list(files or [])
+    if file:
+        all_uploads.append(file)
+
+    valid_pdfs = [f for f in all_uploads if f.filename and f.filename.lower().endswith(".pdf")]
+    if not valid_pdfs:
+        raise HTTPException(status_code=400, detail="Please upload at least one valid PDF file.")
+
+    saved_paths: list[Path] = []
+    for f in valid_pdfs:
+        fname = Path(f.filename).name
+        dest = config.UPLOAD_DIR / fname
+        content = await f.read()
+        dest.write_bytes(content)
+        saved_paths.append(dest)
+    return saved_paths
+
+
 @router.post("/upload", response_model=UploadResponse)
 @router.post("/upload/", response_model=UploadResponse)
-async def post_upload(file: UploadFile = File(...)):
-    """Upload PDF, run section chunking & vectorless indexing, build prerequisite DAG."""
-    filename = Path(file.filename or "uploaded_material.pdf").name
-    if not filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
-
-    dest = config.UPLOAD_DIR / filename
-    content = await file.read()
-    dest.write_bytes(content)
-
+async def post_upload(
+    files: list[UploadFile] = File(default=[]),
+    file: UploadFile | None = File(default=None)
+):
+    """Upload one or multiple PDFs, run section chunking & vectorless indexing, build prerequisite DAG."""
+    saved_paths = await _save_uploaded_pdfs(files, file)
     try:
-        res = await ingest.run_ingest_async(dest)
+        res = await ingest.run_ingest_async(saved_paths)
         return UploadResponse(**res)
     except store.UserError as ue:
         raise HTTPException(status_code=400, detail=str(ue))
@@ -64,27 +79,28 @@ async def post_upload(file: UploadFile = File(...)):
 
 @router.post("/ingest")
 @router.post("/ingest/")
-async def post_ingest(file: UploadFile = File(...)):
-    """Legacy ingest endpoint maintaining backward compatibility with existing SPA."""
-    name = Path(file.filename or "upload.pdf").name
-    if not name.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Please upload a PDF file.")
-    dest = config.UPLOAD_DIR / name
-    content = await file.read()
-    dest.write_bytes(content)
+async def post_ingest(
+    files: list[UploadFile] = File(default=[]),
+    file: UploadFile | None = File(default=None)
+):
+    """Ingest one or multiple PDFs maintaining backward compatibility with existing SPA."""
+    saved_paths = await _save_uploaded_pdfs(files, file)
     try:
-        res = await ingest.run_ingest_async(dest)
-        return {"jobId": name, **res}
+        res = await ingest.run_ingest_async(saved_paths)
+        return {"jobId": res["job_id"], **res}
     except store.UserError as ue:
         raise HTTPException(status_code=400, detail=str(ue))
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Couldn't read this PDF: {e}")
+        raise HTTPException(status_code=400, detail=f"Couldn't read PDF(s): {e}")
 
 
 @router.post("/ingest/upload")
 @router.post("/ingest/upload/")
-async def post_ingest_upload(file: UploadFile = File(...)):
-    return await post_upload(file)
+async def post_ingest_upload(
+    files: list[UploadFile] = File(default=[]),
+    file: UploadFile | None = File(default=None)
+):
+    return await post_upload(files=files, file=file)
 
 
 @router.get("/ingest/status", response_model=IngestStatusResponse)
@@ -170,6 +186,20 @@ class LegacyAsk(BaseModel):
 @router.post("/tutor/ask")
 def legacy_ask(body: LegacyAsk):
     return tutor.chat(message=body.question, concept_id=body.conceptId).model_dump()
+
+
+class WebSearchRequest(BaseModel):
+    query: str
+    max_results: int = 5
+
+
+@router.post("/tutor/search")
+@router.post("/web/search")
+def post_web_search(req: WebSearchRequest):
+    """Execute live web search via TinyFish Search API."""
+    from .core import web_search
+    results = web_search.search(req.query, max_results=req.max_results)
+    return {"query": req.query, "results": results, "count": len(results)}
 
 
 # ── 4. Assessment & Quiz Engine ────────────────────────────────────────────
