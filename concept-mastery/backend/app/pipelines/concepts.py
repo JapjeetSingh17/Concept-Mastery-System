@@ -1,0 +1,311 @@
+"""Prerequisite Concept Graph Pipeline (DAG).
+
+Constructs a Directed Acyclic Graph (DAG) of prerequisite concepts from uploaded course chunks.
+Eliminates cycles based on earliest page number appearance.
+Provides topological learning paths and dependency queries.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from collections import Counter
+from functools import lru_cache
+from pathlib import Path
+from typing import List, Tuple
+
+import networkx as nx
+
+from ..core import store, llm
+from ..core.text import normalize, STOP, SYN, NORMALIZER
+from ..models.schemas import ConceptNode, ConceptEdge, GraphExport
+
+MAX_CONCEPTS = 12
+
+# In-memory graph references
+_GRAPH: nx.DiGraph = nx.DiGraph()
+_CONCEPTS_MAP: dict[str, dict] = {}
+
+
+@lru_cache(maxsize=None)
+def _pat(name: str, key: str):
+    base = {name.lower(), key} | {k for k, v in SYN.items() if v.rstrip("s") == key.rstrip("s")}
+    parts = [re.escape(n.rstrip("s") if len(n) > 4 else n) + ("s?" if len(n) > 4 else "") for n in base]
+    return re.compile(r"\b(?:" + "|".join(sorted(parts, key=len, reverse=True)) + r")\b", re.I)
+
+
+def pattern(c):
+    return _pat(c["name"], c.get("key", normalize(c["name"])))
+
+
+def _slug(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:40] or "concept"
+
+
+def _candidate_terms(chunks: list[dict], limit: int) -> list[str]:
+    tf, df = Counter(), Counter()
+    for c in chunks:
+        words = re.findall(r"[a-z][a-z\-]*", normalize(c["text"]))
+        seen = set()
+        for n in (1, 2):
+            for i in range(len(words) - n + 1):
+                g = words[i:i + n]
+                if g[0] in STOP or g[-1] in STOP or any(len(w) < 3 for w in g):
+                    continue
+                t = " ".join(g)
+                tf[t] += 1
+                seen.add(t)
+        df.update(seen)
+
+    ok = [(tf[t] * (1.6 if " " in t else 1.0), t) for t in tf if 2 <= df[t] <= 0.6 * len(chunks) and tf[t] >= 3]
+    out: list[str] = []
+    for _, t in sorted(ok, reverse=True):
+        if not any(t in o or o in t for o in out):
+            out.append(t)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _llm_extract_definitions_and_prereqs(chunks: list[dict], concept_names: list[str]) -> dict[str, dict]:
+    """Prompt the LLM to extract key concepts, concise textbook definitions, and explicit prerequisites."""
+    if not llm.enabled() or not concept_names:
+        return {}
+
+    ctx_parts = [f"[Page {c['page']} · {c['section']}] {c['text']}" for c in chunks[:12]]
+    ctx = "\n\n".join(ctx_parts)
+
+    system_prompt = (
+        "You are an expert curriculum designer. Return a JSON array of concepts with concise textbook definitions "
+        "grounded in the text and explicit prerequisite dependencies. Respond with valid JSON only."
+    )
+
+    user_prompt = (
+        f"Concepts to analyze: {json.dumps(concept_names)}\n\n"
+        f"Context from study material:\n{ctx}\n\n"
+        f"Output JSON schema:\n"
+        f'[\n  {{"concept": "<name>", "definition": "<concise definition under 25 words>", "prerequisites": ["<prereq concept>", ...]}}\n]'
+    )
+
+    try:
+        raw = llm.complete(system_prompt, user_prompt, max_tokens=800)
+        if not raw:
+            return {}
+        arr = json.loads(re.search(r"\[.*\]", raw, re.S).group(0))
+        results = {}
+        valid = {n.lower() for n in concept_names}
+        for item in arr:
+            name = str(item.get("concept", "")).strip()
+            if name.lower() in valid:
+                prereqs = [p for p in item.get("prerequisites", []) if p.lower() in valid and p.lower() != name.lower()]
+                results[name.lower()] = {
+                    "definition": str(item.get("definition", "")).strip(),
+                    "prerequisites": prereqs,
+                }
+        return results
+    except Exception:
+        return {}
+
+
+def _break_cycles(G: nx.DiGraph, page_map: dict[str, int]) -> nx.DiGraph:
+    """Check for cycles and break back-edges using earliest page number appearance."""
+    while True:
+        try:
+            cycles = list(nx.simple_cycles(G))
+            if not cycles:
+                break
+            # For each cycle, remove the back-edge whose source appears on a later page
+            cycle = cycles[0]
+            cycle_edges = list(zip(cycle, cycle[1:] + [cycle[0]]))
+            worst_edge = max(cycle_edges, key=lambda e: (page_map.get(e[0], 999), page_map.get(e[1], 0)))
+            G.remove_edge(worst_edge[0], worst_edge[1])
+        except Exception:
+            break
+    return G
+
+
+def _layout(concepts: list[dict]):
+    """Calculate x, y coordinates for clean DAG visualization."""
+    if not concepts:
+        return
+    maxd = max((c.get("depth", 0) for c in concepts), default=0)
+    if maxd <= 4:
+        cols: dict[int, list] = {}
+        for c in concepts:
+            cols.setdefault(c["depth"], []).append(c)
+        for d, col in cols.items():
+            for k, c in enumerate(col):
+                c["x"] = 90.0 + d * (520.0 / max(maxd, 1)) if maxd else 350.0
+                c["y"] = 115.0 if len(col) == 1 else 55.0 + k * (125.0 / max(len(col) - 1, 1))
+    else:
+        for i, c in enumerate(concepts):
+            c["x"] = float(100 + (i % 4) * 166)
+            c["y"] = float(50 + (i // 4) * 75)
+
+
+def build(chunks: list[dict]) -> tuple[list[dict], list[list[str]]]:
+    """Construct DAG: extract concepts, mine prerequisites, break cycles, and compute topological depth."""
+    global _GRAPH, _CONCEPTS_MAP
+
+    names: list[str] = []
+    for c in chunks:
+        if c["section"] != "Introduction" and c["section"] not in names:
+            names.append(c["section"])
+    names = names[:MAX_CONCEPTS]
+    if len(names) < 6:
+        for t in _candidate_terms(chunks, MAX_CONCEPTS):
+            if len(names) >= MAX_CONCEPTS:
+                break
+            if t.title() not in names:
+                names.append(t.title())
+
+    concepts: list[dict] = []
+    used_ids: set[str] = set()
+
+    for name in names:
+        c: dict = {"name": name, "key": normalize(name), "definition": ""}
+        pat = pattern(c)
+        primary = [k["id"] for k in chunks if k["section"] == name]
+        mentions = [k["id"] for k in chunks if pat.search(normalize(k["text"]))]
+        ids = list(dict.fromkeys(primary + mentions))
+        if not ids:
+            continue
+        cid = _slug(name)
+        while cid in used_ids:
+            cid += "-2"
+        used_ids.add(cid)
+
+        source_pages = sorted(list({chunks[j]["page"] for j in (primary or ids)}))
+        c.update({
+            "id": cid,
+            "concept_id": cid,
+            "primary": primary,
+            "chunks": ids,
+            "order": len(concepts),
+            "page": source_pages[0] if source_pages else 1,
+            "source_pages": source_pages,
+            "prerequisites": [],
+        })
+        concepts.append(c)
+
+    if not concepts:
+        return [], []
+
+    # 1. Structural co-occurrence prerequisite candidate edges
+    edges: set[tuple[str, str]] = set()
+    for b in concepts:
+        text = normalize(" ".join(chunks[j]["text"] for j in (b["primary"] or b["chunks"][:2])))
+        pre = [a for a in concepts if a["order"] < b["order"] and pattern(a).search(text)]
+        edges.update((a["id"], b["id"]) for a in pre[-2:])
+
+    # Dense fallback if sparse
+    if len(edges) < len(concepts) / 2:
+        edges.update((p["id"], q["id"]) for p, q in zip(concepts, concepts[1:]))
+
+    # 2. LLM grounded definitions and verified prerequisites
+    llm_enrichment = _llm_extract_definitions_and_prereqs(chunks, [c["name"] for c in concepts])
+    by_name = {c["name"].lower(): c for c in concepts}
+    for name_lower, info in llm_enrichment.items():
+        c = by_name.get(name_lower)
+        if not c:
+            continue
+        if info.get("definition"):
+            c["definition"] = info["definition"]
+        for p_name in info.get("prerequisites", []):
+            p_node = by_name.get(p_name.lower())
+            if p_node and p_node["id"] != c["id"]:
+                edges.add((p_node["id"], c["id"]))
+
+    # 3. Construct NetworkX DiGraph & Break Cycles
+    G = nx.DiGraph()
+    page_map = {c["id"]: c["page"] for c in concepts}
+    for c in concepts:
+        G.add_node(c["id"], **c)
+    for src, tgt in edges:
+        G.add_edge(src, tgt)
+
+    G = _break_cycles(G, page_map)
+
+    # 4. Compute depths from validated DAG
+    depths: dict[str, int] = {}
+    for node in nx.topological_sort(G):
+        preds = list(G.predecessors(node))
+        depths[node] = max((depths.get(p, 0) + 1 for p in preds), default=0)
+
+    for c in concepts:
+        c["depth"] = depths.get(c["id"], 0)
+        c["prerequisites"] = list(G.predecessors(c["id"]))
+
+    _layout(concepts)
+
+    _GRAPH = G
+    _CONCEPTS_MAP = {c["id"]: c for c in concepts}
+
+    final_edges = sorted([list(e) for e in G.edges()])
+    return concepts, final_edges
+
+
+def get_prerequisites(concept_id: str) -> list[str]:
+    """Return immediate prerequisite concept IDs for concept_id."""
+    if _GRAPH and concept_id in _GRAPH:
+        return list(_GRAPH.predecessors(concept_id))
+    kb = store.KB
+    return [a for a, b in kb.get("edges", []) if b == concept_id]
+
+
+def get_next_concepts(concept_id: str) -> list[str]:
+    """Return concepts that directly depend on concept_id."""
+    if _GRAPH and concept_id in _GRAPH:
+        return list(_GRAPH.successors(concept_id))
+    kb = store.KB
+    return [b for a, b in kb.get("edges", []) if a == concept_id]
+
+
+def get_learning_path(unmastered_only: bool = True, mastered_ids: set[str] | None = None) -> list[str]:
+    """Topological sort of concepts in the prerequisite DAG."""
+    if _GRAPH and len(_GRAPH) > 0:
+        order = list(nx.topological_sort(_GRAPH))
+    else:
+        kb = store.KB
+        order = [c["id"] for c in kb.get("concepts", [])]
+
+    if unmastered_only and mastered_ids:
+        order = [cid for cid in order if cid not in mastered_ids]
+    return order
+
+
+def export_graph(user_mastery_map: dict[str, str] | None = None) -> dict:
+    """Export nodes and directed edges formatted for frontend rendering."""
+    kb = store.KB
+    if not kb.get("ready"):
+        return {"nodes": [], "edges": [], "learning_path": []}
+
+    mastery = user_mastery_map or {}
+    nodes: list[dict] = []
+    for c in kb["concepts"]:
+        cid = c["id"]
+        status = mastery.get(cid, "UNKNOWN").upper()
+        nodes.append({
+            "concept_id": cid,
+            "id": cid,
+            "name": c["name"],
+            "definition": c.get("definition", f"Key topic covered on page {c.get('page', 1)}"),
+            "prerequisites": get_prerequisites(cid),
+            "source_pages": c.get("source_pages", [c.get("page", 1)]),
+            "depth": c.get("depth", 0),
+            "x": c.get("x", 0.0),
+            "y": c.get("y", 0.0),
+            "mastery_status": status,
+            "status": status.lower(),
+        })
+
+    edges = [
+        {"source": a, "target": b, "relationship": "prerequisite"}
+        for a, b in kb.get("edges", [])
+    ]
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "learning_path": get_learning_path(),
+    }

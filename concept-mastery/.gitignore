@@ -1,0 +1,22 @@
+# Virtual environments & dependencies
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Environment secrets
+.env
+*.env
+!.env.example
+backend/.env
+
+# Caches
+.pytest_cache/
+.deepeval/
+.DS_Store
+
+# Runtime Databases
+data/vectorstore/*.db
+data/vectorstore/*.db-journal

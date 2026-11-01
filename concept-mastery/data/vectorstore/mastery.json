@@ -1,0 +1,1 @@
+{"loss-functions": {"a": 1.0, "b": 1.0, "n": 0}, "gradient-descent": {"a": 1.0, "b": 1.0, "n": 0}, "learning-rate": {"a": 1.0, "b": 1.0, "n": 0}, "backpropagation": {"a": 1.0, "b": 1.0, "n": 0}, "overfitting": {"a": 1.0, "b": 1.0, "n": 0}, "regularization": {"a": 1.0, "b": 1.0, "n": 0}}

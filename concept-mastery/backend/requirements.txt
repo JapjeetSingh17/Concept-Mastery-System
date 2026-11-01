@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv
+pypdf
+httpx
+rapidfuzz
+networkx
+langgraph
+deepeval
+pytest

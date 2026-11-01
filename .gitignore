@@ -1,11 +1,40 @@
-.env
-.venv/
+# Byte-compiled / optimized / DLL files
 __pycache__/
-*.pyc
-data/cache/
-data/output/
-*.egg-info/
-dist/
-build/
+*.py[cod]
+*$py.class
+*.so
+
+# Environment variables & secrets (CRITICAL)
+.env
+*.env
+!.env.example
+backend/.env
+concept-mastery/backend/.env
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE & OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/settings.json
+
+# Test & coverage caches
 .pytest_cache/
-.python-version
+.coverage
+htmlcov/
+.deepeval/
+
+# Runtime SQLite databases & journals
+*.db
+*.db-journal
+concept-mastery/data/vectorstore/*.db
+concept-mastery/data/vectorstore/*.db-journal
+
+# Temporary archives
+concept-mastery.zip

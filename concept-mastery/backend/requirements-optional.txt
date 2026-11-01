@@ -1,0 +1,3 @@
+# Optional: runs the answer -> estimate -> detect -> next-step loop as a LangGraph graph.
+# Without it the same steps run as plain functions (same result).
+langgraph
