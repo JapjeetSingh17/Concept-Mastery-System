@@ -26,12 +26,17 @@ _SMALL = {"of", "and", "the", "in", "to", "for", "a", "vs", "with", "on", "an"}
 def extract_pages(path: Path) -> list[tuple[int, str]]:
     """Extract pages from PDF returning [(1-based page_num, text), ...]."""
     from pypdf import PdfReader
-    reader = PdfReader(str(path))
-    pages = []
-    for i, p in enumerate(reader.pages):
-        text = p.extract_text() or ""
-        pages.append((i + 1, text))
-    return pages
+    try:
+        reader = PdfReader(str(path))
+        pages = []
+        for i, p in enumerate(reader.pages):
+            text = p.extract_text() or ""
+            pages.append((i + 1, text))
+        return pages
+    except store.UserError:
+        raise
+    except Exception as e:
+        raise store.UserError(f"Could not read PDF '{path.name}': {e}")
 
 
 def is_heading(line: str) -> bool:

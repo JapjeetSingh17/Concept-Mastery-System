@@ -30,7 +30,7 @@ GROQ_MODEL = _e("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_BASE_URL = _e("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 
 # TinyFish Web Search API
-TINYFISH_API_KEY = _e("TINYFISH_API_KEY", "sk-tinyfish-rERvpMmQ-WzPuHvr_ABW2PP7c7Q7Toup")
+TINYFISH_API_KEY = _e("TINYFISH_API_KEY", "")
 TINYFISH_SEARCH_URL = _e("TINYFISH_SEARCH_URL", "https://api.search.tinyfish.ai")
 
 # Legacy / Generic Provider

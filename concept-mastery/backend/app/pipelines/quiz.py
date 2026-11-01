@@ -226,20 +226,27 @@ def evaluate_submission(sub: QuizSubmission) -> QuizResult:
     q_data = REGISTRY.get(sub.question_id)
     
     if not q_data:
-        # Fallback check
-        q_type = "mcq"
-        correct_idx = 0
-        target_blank = ""
-        rubric = ""
-        source_page = 1
-        explanation = "Assessment evaluation complete."
-    else:
-        q_type = q_data.get("question_type", "mcq")
-        correct_idx = q_data.get("correct_option_idx", 0)
-        target_blank = q_data.get("target_blank_answer", "")
-        rubric = q_data.get("rubric", "")
-        source_page = q_data.get("source_page", 1)
-        explanation = q_data.get("explanation", "")
+        return QuizResult(
+            question_id=sub.question_id,
+            concept_id=sub.concept_id,
+            question_type="unknown",
+            is_correct=False,
+            correct_option_idx=-1,
+            correct_answer_display="",
+            user_answer=str(sub.selected_option_idx if sub.selected_option_idx is not None else sub.typed_answer or ""),
+            explanation="Invalid or expired question ID.",
+            score=0.0,
+            misconceptions=["Question ID not recognized in active registry."],
+            reasoning_clarity=0.0,
+            reasoning_depth_level="SURFACE_ROTE",
+        )
+
+    q_type = q_data.get("question_type", "mcq")
+    correct_idx = q_data.get("correct_option_idx", 0)
+    target_blank = q_data.get("target_blank_answer", "")
+    rubric = q_data.get("rubric", "")
+    source_page = q_data.get("source_page", 1)
+    explanation = q_data.get("explanation", "")
 
     is_correct = False
     score = 0.0
@@ -282,14 +289,16 @@ def evaluate_submission(sub: QuizSubmission) -> QuizResult:
         clean_target = re.sub(r"[^\w\s]", "", target_blank.lower()).strip()
 
         # String matching & fuzzy similarity tolerance for minor spelling variations
-        similarity = difflib.SequenceMatcher(None, clean_user, clean_target).ratio()
-        exact_match = (clean_user == clean_target)
-        contains_match = (clean_target in clean_user or clean_user in clean_target) and len(clean_user) >= 3 and len(clean_target) >= 3
+        similarity = difflib.SequenceMatcher(None, clean_user, clean_target).ratio() if (clean_user and clean_target) else 0.0
+        exact_match = bool(clean_user and clean_target and clean_user == clean_target)
 
         key_terms = [t.lower() for t in q_data.get("key_terms", [])] if q_data else []
-        term_match = any(t in clean_user for t in key_terms)
+        term_match = any(
+            clean_user == t or (len(clean_user) >= 4 and difflib.SequenceMatcher(None, clean_user, t).ratio() >= 0.85)
+            for t in key_terms
+        )
 
-        if exact_match or similarity >= 0.82 or contains_match or term_match:
+        if clean_user and (exact_match or similarity >= 0.82 or term_match):
             is_correct = True
             score = 1.0
             reasoning_clarity = 0.95
@@ -307,13 +316,25 @@ def evaluate_submission(sub: QuizSubmission) -> QuizResult:
         user_answer_str = raw_user
         correct_answer_display = rubric or explanation
 
+        key_terms = [t.lower() for t in q_data.get("key_terms", [])] if q_data else []
+        expl_tokens = set(tokens(explanation)) | set(tokens(rubric))
+        user_tokens = set(tokens(raw_user))
+        token_overlap = len(user_tokens & expl_tokens)
+        has_key_term = any(t in raw_user.lower() for t in key_terms)
+        concept_matches = (sub.concept_id.replace("-", " ") in raw_user.lower())
+
+        is_conceptually_sound = (
+            len(raw_user.split()) >= 4
+            and (token_overlap >= 1 or has_key_term or concept_matches)
+        )
+
         # Evaluate typed text directly via Semantic LLM-as-a-Judge
         eval_result = mastery.evaluate_mastery_semantic(
             concept_id=sub.concept_id,
             concept_definition=explanation,
             quiz_results=[{
                 "question_id": sub.question_id,
-                "is_correct": len(raw_user.split()) >= 4,
+                "is_correct": is_conceptually_sound,
                 "student_reasoning": raw_user,
                 "source_page": source_page,
             }],
@@ -322,8 +343,8 @@ def evaluate_submission(sub: QuizSubmission) -> QuizResult:
         )
 
         reasoning_depth = eval_result.reasoning_depth_level
-        is_correct = (reasoning_depth in ("DEVELOPING", "DEEP_CONCEPTUAL") and not eval_result.remedial_recommended)
-        score = eval_result.semantic_comprehension_score
+        is_correct = (is_conceptually_sound and reasoning_depth in ("DEVELOPING", "DEEP_CONCEPTUAL") and not eval_result.remedial_recommended)
+        score = eval_result.semantic_comprehension_score if is_correct else min(eval_result.semantic_comprehension_score, 0.4)
         reasoning_clarity = score
         misconceptions = eval_result.misconceptions_detected
 
@@ -408,12 +429,45 @@ def next_question(concept_id: str | None = None) -> dict:
 
 def evaluate_answer(student_answer: str, concept_id: str, question_text: str = "", ground_truth: str = "") -> dict:
     """Evaluate free-form student text."""
+    raw_ans = (student_answer or "").strip()
+    if not raw_ans:
+        return {
+            "score": 0.0,
+            "is_correct": False,
+            "misconceptions": ["No answer provided."],
+            "feedback": f"Grounded response for {concept_id} recorded: SURFACE_ROTE."
+        }
+
+    concept_obj = None
+    if store.KB.get("ready"):
+        for c in store.KB.get("concepts", []):
+            if c.get("id") == concept_id or c.get("name", "").lower() == concept_id.lower():
+                concept_obj = c
+                break
+
+    concept_name = concept_obj.get("name", concept_id) if concept_obj else concept_id
+    explanation = ground_truth or (concept_obj.get("definition") if concept_obj else "") or f"Conceptual explanation of {concept_id}"
+    source_page = (concept_obj.get("page") or concept_obj.get("source_page") or 1) if concept_obj else 1
+
+    REGISTRY["freeform"] = {
+        "question_id": "freeform",
+        "concept_id": concept_id,
+        "question_type": "typed_qa",
+        "question": question_text or f"Explain {concept_id}",
+        "options": [],
+        "correct_option_idx": -1,
+        "explanation": explanation,
+        "rubric": ground_truth or explanation,
+        "source_page": source_page,
+        "key_terms": [concept_name.lower()] + [t for t in tokens(explanation) if len(t) > 3][:5],
+    }
+
     sub = QuizSubmission(
         question_id="freeform",
         concept_id=concept_id,
-        selected_option_idx=0,
-        typed_answer=student_answer,
-        student_reasoning=student_answer,
+        selected_option_idx=None,
+        typed_answer=raw_ans,
+        student_reasoning=raw_ans,
     )
     res = evaluate_submission(sub)
     return {
