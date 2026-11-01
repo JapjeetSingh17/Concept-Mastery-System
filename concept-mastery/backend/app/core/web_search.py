@@ -65,3 +65,4 @@ def search(query: str, max_results: int = 5) -> list[dict[str, Any]]:
     except Exception as exc:
         logger.warning("TinyFish Search failed: %s", exc)
         return []
+

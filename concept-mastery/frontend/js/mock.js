@@ -251,7 +251,7 @@
       await delay(100);
       Object.keys(mockState.mastery).forEach(k => {
         mockState.mastery[k] = {
-          a: 1, b: 1, n: 0, score: 0.5, attempts: 0,
+          a: 1, b: 1, n: 0, score: 0.0, attempts: 0,
           status: "unknown", uncertainty: 0.28,
           why: "No answers yet. That isn’t enough evidence to call it strong or weak."
         };

@@ -252,7 +252,7 @@
       targetPoints.push(`${xMax},${yMax}`);
       axes.push(`<line x1="${center}" y1="${center}" x2="${xMax}" y2="${yMax}" stroke="var(--border-subtle)" stroke-width="1.5" stroke-dasharray="3 3"/>`);
 
-      const s = Math.max(0.1, Math.min(1.0, c.score || 0.5));
+      const s = (c.attempts && c.attempts > 0) ? Math.max(0.1, Math.min(1.0, c.score || 0)) : 0.05;
       const xScore = center + (radius * s) * Math.cos(angle);
       const yScore = center + (radius * s) * Math.sin(angle);
       scorePoints.push(`${xScore},${yScore}`);
@@ -321,7 +321,7 @@
       const unknownCount = masteryData.filter(c => getConceptStatus(c) === "unknown").length;
 
       const avgScore = totalConcepts > 0
-        ? Math.round((masteryData.reduce((acc, c) => acc + (c.score || 0), 0) / totalConcepts) * 100)
+        ? Math.round((masteryData.reduce((acc, c) => acc + (c.attempts > 0 ? (c.score || 0) : 0), 0) / totalConcepts) * 100)
         : 0;
 
       const topRec = recData.actions && recData.actions.length > 0 ? recData.actions[0] : null;
@@ -817,7 +817,7 @@
             <div class="roadmap-timeline">
               ${masteryData.map((c, i) => {
                 const st = getConceptStatus(c);
-                const scorePercent = Math.round((c.score || 0.5) * 100);
+                const scorePercent = (c.attempts && c.attempts > 0) ? Math.round((c.score || 0) * 100) : 0;
                 let actionBtn = `<a href="#practice" data-target-concept="${esc(c.id)}" class="btn btn-primary btn-sm start-target-quiz">Practice</a>`;
                 let statusLabel = "Not Assessed";
 
@@ -900,7 +900,7 @@
       const strongCount = masteryData.filter(c => getConceptStatus(c) === "strong").length;
       const weakCount = masteryData.filter(c => getConceptStatus(c) === "weak").length;
       const unknownCount = masteryData.filter(c => getConceptStatus(c) === "unknown").length;
-      const avg = total > 0 ? Math.round((masteryData.reduce((acc, c) => acc + (c.score || 0), 0) / total) * 100) : 0;
+      const avg = total > 0 ? Math.round((masteryData.reduce((acc, c) => acc + ((c.attempts && c.attempts > 0) ? (c.score || 0) : 0), 0) / total) * 100) : 0;
 
       return `
         <div class="page-header">
@@ -974,7 +974,7 @@
                 <tr><td colspan="7" style="text-align:center; padding:2rem; color:var(--ink-muted);">No concepts assessed yet. Upload material and take a quiz.</td></tr>
               ` : masteryData.map(c => {
                 const st = getConceptStatus(c);
-                const scorePercent = Math.round((c.score || 0.5) * 100);
+                const scorePercent = (c.attempts && c.attempts > 0) ? Math.round((c.score || 0) * 100) : 0;
                 const uncertainty = c.uncertainty !== undefined ? `&plusmn;${Math.round(c.uncertainty * 100)}%` : "&plusmn;25%";
                 return `
                   <tr>

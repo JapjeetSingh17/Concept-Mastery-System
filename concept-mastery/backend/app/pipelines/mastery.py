@@ -28,7 +28,7 @@ _CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS user_concept_mastery (
     user_id             TEXT NOT NULL DEFAULT 'default',
     concept_id          TEXT NOT NULL,
-    mastery_score       REAL NOT NULL DEFAULT 0.5,
+    mastery_score       REAL NOT NULL DEFAULT 0.0,
     state               TEXT NOT NULL DEFAULT 'UNKNOWN',
     attempt_count       INTEGER NOT NULL DEFAULT 0,
     quiz_correct        INTEGER NOT NULL DEFAULT 0,
@@ -64,7 +64,9 @@ def init_db():
         if "prereq_health" not in cols:
             conn.execute("ALTER TABLE user_concept_mastery ADD COLUMN prereq_health REAL NOT NULL DEFAULT 1.0")
         if "dialogue_score" not in cols:
-            conn.execute("ALTER TABLE user_concept_mastery ADD COLUMN dialogue_score REAL NOT NULL DEFAULT 0.5")
+            conn.execute("ALTER TABLE user_concept_mastery ADD COLUMN dialogue_score REAL NOT NULL DEFAULT 0.0")
+        # Ensure unattempted concepts always start at 0.0 demonstrated mastery
+        conn.execute("UPDATE user_concept_mastery SET mastery_score = 0.0 WHERE attempt_count = 0")
 
 
 init_db()
@@ -83,7 +85,7 @@ def _get_row(conn, concept_id: str, user_id: str = "default") -> dict:
     return {
         "user_id": user_id,
         "concept_id": concept_id,
-        "mastery_score": 0.5,
+        "mastery_score": 0.0,
         "state": "UNKNOWN",
         "attempt_count": 0,
         "quiz_correct": 0,
@@ -227,7 +229,7 @@ def get_record(user_id: str, concept_id: str) -> MasteryRecord:
 
 
 def reset(concepts: list[dict], user_id: str = "default"):
-    """Reset mastery records for a new document upload."""
+    """Reset mastery records for a new document upload to clean 0% initial state."""
     with get_db() as conn:
         conn.execute("DELETE FROM user_concept_mastery WHERE user_id=?", (user_id,))
         for c in concepts:
@@ -235,7 +237,7 @@ def reset(concepts: list[dict], user_id: str = "default"):
             _save_row(conn, {
                 "user_id": user_id,
                 "concept_id": cid,
-                "mastery_score": 0.5,
+                "mastery_score": 0.0,
                 "state": "UNKNOWN",
                 "attempt_count": 0,
                 "quiz_correct": 0,
@@ -273,11 +275,12 @@ def snapshot(user_id: str = "default") -> list[dict]:
             state_lower = row["state"].lower()
             notes = json.loads(row["evidence_notes"])
             why = notes[-1] if notes else ("No answers yet. That isn't enough evidence to call it strong or weak." if row["attempt_count"] == 0 else f"{row['quiz_correct']} of {row['quiz_total']} answers right.")
+            score_val = row["mastery_score"] if row["attempt_count"] > 0 else 0.0
             results.append({
                 "id": cid,
                 "concept_id": cid,
                 "name": c["name"],
-                "score": row["mastery_score"],
+                "score": score_val,
                 "status": state_lower,
                 "state": row["state"],
                 "attempts": row["attempt_count"],
@@ -291,7 +294,7 @@ def snapshot(user_id: str = "default") -> list[dict]:
 
 
 def get_dashboard(user_id: str = "default") -> LearnerDashboard:
-    """Generate explainable tri-state dashboard."""
+    """Generate explainable tri-state dashboard with 0% baseline for unattempted concepts."""
     snap = snapshot(user_id)
     records = [
         MasteryRecord(
@@ -310,7 +313,11 @@ def get_dashboard(user_id: str = "default") -> LearnerDashboard:
     unknown = [r for r in records if r.status == MasteryStatus.UNKNOWN]
 
     total = len(records)
-    overall = sum(r.score for r in records) / total if total > 0 else 0.0
+    demonstrated_scores = [
+        (r.score if r.status != MasteryStatus.UNKNOWN and r.attempt_count > 0 else 0.0)
+        for r in records
+    ]
+    overall = sum(demonstrated_scores) / total if total > 0 else 0.0
 
     summary = (
         f"{len(strong)} mastered, {len(weak)} needing remediation, {len(unknown)} unattempted "

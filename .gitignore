@@ -38,6 +38,11 @@ concept-mastery/data/vectorstore/*.db-journal
 concept-mastery/data/vectorstore/*.json
 !concept-mastery/data/vectorstore/.gitkeep
 
+# Uploaded files
+concept-mastery/data/uploads/*
+!concept-mastery/data/uploads/.gitkeep
+!concept-mastery/data/uploads/ml-basics.pdf
+
 # Temporary archives
 concept-mastery.zip
 
