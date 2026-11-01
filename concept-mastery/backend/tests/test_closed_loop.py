@@ -185,3 +185,69 @@ def test_5_deepeval_harness():
         print("\n[PASSED] DeepEval Test Case constructed and verified against vectorless ground truth.")
     except Exception as e:
         pytest.skip(f"DeepEval runtime skipped: {e}")
+
+
+def test_6_llm_as_a_judge_semantic_evaluator():
+    """Verify Semantic LLM-as-a-Judge Evaluation: Schema, Lucky Guess, Prerequisite Block, and Deep Reasoning."""
+    from app.models.schemas import MasteryEvaluationResult
+
+    # 1. Lucky Guess Detection (100% raw score overridden to WEAK)
+    lucky_res = mastery.evaluate_mastery_semantic(
+        concept_id="markov_chains",
+        concept_definition="A stochastic process with the Markov property.",
+        quiz_results=[{
+            "question_id": "q1",
+            "is_correct": True,
+            "student_reasoning": "I just guessed C randomly without understanding the formula",
+            "quiz_accuracy": 1.0,
+            "source_page": 4,
+        }],
+        dialogue_context=0.8,
+        attempt_count=2,
+    )
+    assert isinstance(lucky_res, MasteryEvaluationResult)
+    assert lucky_res.epistemic_status == "WEAK"
+    assert lucky_res.reasoning_depth_level == "SURFACE_ROTE"
+    assert lucky_res.remedial_recommended is True
+    assert len(lucky_res.misconceptions_detected) > 0
+    assert "Lucky guess" in lucky_res.explainable_audit_trail or "lucky" in lucky_res.explainable_audit_trail.lower()
+
+    # 2. Prerequisite Compromise Block (Good score blocked if parent DAG node is WEAK)
+    prereq_res = mastery.evaluate_mastery_semantic(
+        concept_id="deep_concept_b",
+        concept_definition="Advanced composite model.",
+        quiz_results=[{
+            "question_id": "q2",
+            "is_correct": True,
+            "student_reasoning": "Applied the formula accurately using the definition.",
+            "quiz_accuracy": 1.0,
+            "source_page": 2,
+        }],
+        dialogue_context=0.8,
+        prerequisite_context={"concept_a": {"status": "WEAK", "score": 0.2}},
+        attempt_count=2,
+    )
+    assert prereq_res.epistemic_status == "WEAK"
+    assert prereq_res.remedial_recommended is True
+    assert any("prerequisite" in m.lower() for m in prereq_res.misconceptions_detected)
+
+    # 3. Deep Conceptual Reasoning (Sustained accurate demonstration)
+    deep_res = mastery.evaluate_mastery_semantic(
+        concept_id="gradient_descent",
+        concept_definition="Optimization algorithm that iteratively steps in the direction of steepest descent.",
+        quiz_results=[{
+            "question_id": "q3",
+            "is_correct": True,
+            "student_reasoning": "The negative gradient points in direction of steepest descent because derivative minimizes loss.",
+            "quiz_accuracy": 1.0,
+            "source_page": 3,
+        }],
+        dialogue_context=0.75,
+        prerequisite_context={"derivatives": {"status": "STRONG", "score": 0.9}},
+        attempt_count=2,
+    )
+    assert deep_res.epistemic_status == "STRONG"
+    assert deep_res.reasoning_depth_level == "DEEP_CONCEPTUAL"
+    assert deep_res.semantic_comprehension_score >= 0.75
+    assert deep_res.remedial_recommended is False
+    print("\n[PASSED] LLM-as-a-Judge Evaluator: Lucky Guess, Prereq Block, and Deep Reasoning validated.")

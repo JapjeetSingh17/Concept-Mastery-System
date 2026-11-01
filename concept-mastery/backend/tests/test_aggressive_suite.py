@@ -332,6 +332,10 @@ class ReferenceEngineHarness:
             f"{'Misconception: Lucky guess detected.' if lucky_guess else 'Evaluated multi-signal criteria.'}"
         )
 
+        reasoning_depth = "SURFACE_ROTE" if lucky_guess else ("DEEP_CONCEPTUAL" if ("derivation" in reasoning_text.lower() or len(reasoning_text) > 25) else "DEVELOPING")
+        misconceptions = ["Lucky guess detected"] if lucky_guess else ([] if not weak_prereq else ["Weak prerequisite in DAG"])
+        remedial_recommended = (status == MasteryStatus.WEAK)
+
         cur.execute(
             "INSERT OR REPLACE INTO user_concept_mastery VALUES (?, ?, ?, ?, ?, ?)",
             (user_id, concept_id, score, status.value, attempts, evidence),
@@ -344,6 +348,10 @@ class ReferenceEngineHarness:
             "status": status.value,
             "attempt_count": attempts,
             "evidence_notes": evidence,
+            "reasoning_depth_level": reasoning_depth,
+            "misconceptions_detected": misconceptions,
+            "remedial_recommended": remedial_recommended,
+            "explainable_audit_trail": evidence,
         }
 
     def socratic_tutor_respond(
@@ -777,12 +785,16 @@ def test_tc18_single_check_false_mastery_prevention(engine):
 
 
 def test_tc19_multi_signal_weighted_formula_verification(engine):
-    """TC-19: Quiz=0.80 (50%), Socratic=0.70 (30%), PrereqHealth=1.00 (20%) -> exact 0.81 score."""
+    """TC-19: Semantic AI-as-a-Judge Evaluation: Deep reasoning + Quiz=0.80, Socratic=0.70, PrereqHealth=1.00 -> 0.81 & STRONG."""
     engine.init_user_concepts("student_1", ["eigen_decomp"])
     engine.calculate_and_update_mastery("student_1", "eigen_decomp", 0.80, 0.70)
-    res = engine.calculate_and_update_mastery("student_1", "eigen_decomp", 0.80, 0.70)
+    res = engine.calculate_and_update_mastery(
+        "student_1", "eigen_decomp", 0.80, 0.70, reasoning_text="Valid mathematical derivation of characteristic equation"
+    )
     assert res["score"] == pytest.approx(0.81, rel=1e-3)
     assert res["status"] == MasteryStatus.STRONG.value
+    assert res.get("reasoning_depth_level") == "DEEP_CONCEPTUAL"
+    assert res.get("remedial_recommended") is False
 
 
 def test_tc20_prerequisite_weakness_penalty_propagation(engine):
@@ -804,7 +816,7 @@ def test_tc20_prerequisite_weakness_penalty_propagation(engine):
 
 
 def test_tc21_lucky_guess_detection_reasoning_mismatch(engine):
-    """TC-21: Correct option with 'I just guessed C randomly' penalizes score and logs misconception."""
+    """TC-21: Correct option with 'I just guessed C randomly' penalizes score, sets SURFACE_ROTE, and logs misconception."""
     engine.init_user_concepts("u1", ["markov_chains"])
     engine.calculate_and_update_mastery("u1", "markov_chains", 1.0, 1.0)
     res = engine.calculate_and_update_mastery(
@@ -816,6 +828,8 @@ def test_tc21_lucky_guess_detection_reasoning_mismatch(engine):
     )
     assert res["status"] == MasteryStatus.WEAK.value
     assert "Lucky guess detected" in res["evidence_notes"]
+    assert res.get("reasoning_depth_level") == "SURFACE_ROTE"
+    assert res.get("remedial_recommended") is True
 
 
 def test_tc22_mastery_regression_on_subsequent_failure(engine):

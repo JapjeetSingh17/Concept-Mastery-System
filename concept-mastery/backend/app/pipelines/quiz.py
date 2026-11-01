@@ -181,6 +181,9 @@ def evaluate_submission(sub: QuizSubmission) -> QuizResult:
         concept_id=sub.concept_id,
         is_correct=is_correct,
         evidence_text=evidence,
+        student_reasoning=sub.student_reasoning,
+        question_id=sub.question_id,
+        page_ref=source_page,
     )
 
     return QuizResult(

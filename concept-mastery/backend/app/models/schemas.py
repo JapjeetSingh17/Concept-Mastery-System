@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import TypedDict
+from typing import TypedDict, Literal
 from pydantic import BaseModel, Field
 
 
@@ -58,6 +58,29 @@ class GraphExport(BaseModel):
 
 # ── 4. Knowledge Tracing & Epistemic Mastery Record ────────────────────────
 
+class MasteryEvaluationResult(BaseModel):
+    """Pydantic v2 schema for Semantic LLM-as-a-Judge Conceptual Evaluation."""
+    concept_id: str = Field(..., description="Target canonical concept ID")
+    epistemic_status: Literal["UNKNOWN", "WEAK", "STRONG"] = Field(
+        ..., description="3-state epistemic classification determined by semantic comprehension"
+    )
+    semantic_comprehension_score: float = Field(
+        ..., ge=0.0, le=1.0, description="Calibrated comprehension score (0.0 to 1.0) by AI"
+    )
+    misconceptions_detected: list[str] = Field(
+        default_factory=list, description="Specific conceptual misconceptions or reasoning flaws detected"
+    )
+    reasoning_depth_level: Literal["SURFACE_ROTE", "DEVELOPING", "DEEP_CONCEPTUAL"] = Field(
+        default="DEVELOPING", description="Cognitive depth level of student explanation"
+    )
+    remedial_recommended: bool = Field(
+        default=False, description="Flag indicating if targeted remedial intervention is recommended"
+    )
+    explainable_audit_trail: str = Field(
+        ..., description="Transparent pedagogical evidence and audit trail for student dashboard"
+    )
+
+
 class MasteryRecord(BaseModel):
     """Explainable mastery record for a user-concept pair."""
     user_id: str = Field(default="default")
@@ -70,6 +93,9 @@ class MasteryRecord(BaseModel):
     quiz_accuracy: float = Field(default=0.0, ge=0.0, le=1.0)
     dialogue_score: float = Field(default=0.5, ge=0.0, le=1.0)
     prereq_health: float = Field(default=1.0, ge=0.0, le=1.0)
+    reasoning_depth_level: str = Field(default="DEVELOPING", description="Cognitive depth level of student explanation")
+    misconceptions: list[str] = Field(default_factory=list, description="Detected conceptual misconceptions")
+    audit_trail: str = Field(default="", description="Transparent explainable audit trail from evaluator")
 
 
 class LearnerDashboard(BaseModel):
