@@ -1,5 +1,7 @@
 # Concept Mastery Platform
 
+![System Architecture](docs/architecture.png)
+
 A closed-loop concept mastery learning system built around the epistemic architecture:
 **Study PDF → Semantic section chunker & synonym normalizer → Vector index with page metadata + Prerequisite concept graph → Grounded tutor & quiz generator → Epistemic Beta belief mastery engine → Weak vs. Unknown detector → Targeted re-teaching & adaptive assessment → Explainable learner dashboard.**
 

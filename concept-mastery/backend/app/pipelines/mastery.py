@@ -345,6 +345,20 @@ Respond strictly with a single JSON object."""
                         "Compromised foundation: Prerequisite concept in DAG is marked WEAK."
                     ]
                 
+                # Check for sustained demonstration without misconceptions
+                has_misconceptions = bool(parsed.get("misconceptions_detected"))
+                llm_score = float(parsed.get("semantic_comprehension_score", score))
+                if (
+                    status == "WEAK"
+                    and not weak_prereq
+                    and not lucky_guess
+                    and not has_misconceptions
+                    and attempt_count >= 2
+                    and (llm_score >= 0.68 or score >= 0.68)
+                ):
+                    status = "STRONG"
+                    parsed["remedial_recommended"] = False
+                
                 return MasteryEvaluationResult(
                     concept_id=concept_id,
                     epistemic_status=status,
