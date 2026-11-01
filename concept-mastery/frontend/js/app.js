@@ -26,7 +26,8 @@
       totalQuestions: 6,
       score: 0,
       history: [],
-      targetConceptId: null
+      targetConceptId: null,
+      currentConceptId: null
     }
   };
 
@@ -690,11 +691,34 @@
     // -----------------------------------------------------------------------
     async practice() {
       await syncActiveDocument();
+      if (!AppState.masteryList || !AppState.masteryList.length) {
+        try {
+          const mRes = await ApiService.getMastery();
+          AppState.masteryList = mRes.concepts || [];
+        } catch (e) {
+          console.warn("Could not load mastery list for practice view", e);
+        }
+      }
+
+      const activeConceptId = AppState.quizSession.targetConceptId || AppState.quizSession.currentConceptId || "";
+      const conceptOptions = (AppState.masteryList || []).map(c => `
+        <option value="${esc(c.id)}" ${c.id === activeConceptId ? "selected" : ""}>
+          ${esc(c.name || c.id)}
+        </option>
+      `).join("");
+
       return `
-        <div class="page-header">
+        <div class="page-header" style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:1rem;">
           <div class="page-header-text">
             <h1>Concept Check</h1>
             <p>Test your understanding of key concepts with adaptive questions generated from verified material.</p>
+          </div>
+          <div class="page-header-actions" style="display:flex; align-items:center; gap:0.6rem;">
+            <label for="practice-topic-select" style="font-size:0.85rem; font-weight:600; color:var(--ink-secondary);">Topic:</label>
+            <select id="practice-topic-select" class="form-select" style="padding:0.45rem 0.85rem; border-radius:var(--radius-sm); border:1px solid var(--border-subtle); background:var(--surface); font-size:0.88rem; font-weight:600; color:var(--ink-primary); cursor:pointer;">
+              <option value="">🎯 Auto-Adaptive (All Concepts)</option>
+              ${conceptOptions}
+            </select>
           </div>
         </div>
 
@@ -1394,8 +1418,17 @@
     },
 
     practice() {
-      loadQuizQuestion(AppState.quizSession.targetConceptId);
-      AppState.quizSession.targetConceptId = null;
+      const targetId = AppState.quizSession.targetConceptId;
+      startNewQuizSession(targetId);
+
+      const topicSelect = $("#practice-topic-select");
+      if (topicSelect) {
+        topicSelect.value = targetId || AppState.quizSession.currentConceptId || "";
+        topicSelect.onchange = () => {
+          const selectedCid = topicSelect.value || null;
+          startNewQuizSession(selectedCid);
+        };
+      }
     },
 
     learningPath() {
@@ -1527,9 +1560,28 @@
   // QUIZ ENGINE CONTROLLER (Authoritative Server Evaluation)
   // =========================================================================
 
+  function startNewQuizSession(conceptId = null) {
+    AppState.quizSession.active = true;
+    AppState.quizSession.currentConceptId = conceptId || null;
+    AppState.quizSession.targetConceptId = null;
+    AppState.quizSession.currentQuestion = null;
+    AppState.quizSession.currentIndex = 1;
+    AppState.quizSession.totalQuestions = 6;
+    AppState.quizSession.score = 0;
+    AppState.quizSession.history = [];
+
+    // Reset session donut & stats
+    updateQuizDonut();
+
+    // Load first question for the fresh session
+    loadQuizQuestion(conceptId);
+  }
+
   async function loadQuizQuestion(conceptId = null) {
     const box = $("#quiz-card-box");
     if (!box) return;
+
+    const targetCid = conceptId !== undefined && conceptId !== null ? conceptId : (AppState.quizSession.currentConceptId || null);
 
     box.innerHTML = `
       <div style="padding:2.5rem; text-align:center;">
@@ -1541,7 +1593,7 @@
     `;
 
     try {
-      const q = await ApiService.getNextQuestion(conceptId);
+      const q = await ApiService.getNextQuestion(targetCid);
       AppState.quizSession.currentQuestion = q;
       renderActiveQuestion(q);
     } catch (err) {
@@ -1560,7 +1612,9 @@
     if (!box) return;
 
     const letters = ["A", "B", "C", "D"];
-    const progressPercent = Math.round((AppState.quizSession.currentIndex / AppState.quizSession.totalQuestions) * 100);
+    const completedCount = AppState.quizSession.history.length;
+    const totalQuestions = AppState.quizSession.totalQuestions || 6;
+    const progressPercent = Math.round((completedCount / totalQuestions) * 100);
     const qType = (q.questionType || q.question_type || (q.options && q.options.length ? "mcq" : "typed_qa")).toLowerCase();
 
     let typeBadgeLabel = "Multiple Choice";
@@ -1624,9 +1678,9 @@
         </div>
         <div style="display:flex; align-items:center; gap:0.75rem;">
           <span style="font-size:0.82rem; font-weight:600; color:var(--ink-muted);">
-            Question ${AppState.quizSession.currentIndex} of ${AppState.quizSession.totalQuestions}
+            Question ${AppState.quizSession.currentIndex} of ${totalQuestions} (${completedCount}/${totalQuestions} completed)
           </span>
-          <div style="width:110px;" class="progress-bar-track">
+          <div style="width:110px;" class="progress-bar-track" title="${completedCount} of ${totalQuestions} questions completed">
             <div class="progress-bar-fill" style="width:${progressPercent}%;"></div>
           </div>
         </div>
@@ -1699,8 +1753,20 @@
 
     if (skipBtn) {
       skipBtn.onclick = () => {
-        AppState.quizSession.currentIndex++;
-        loadQuizQuestion();
+        AppState.quizSession.history.push({
+          question: q.question,
+          concept: q.conceptName,
+          questionType: qType,
+          userAnswer: "(Skipped)",
+          isCorrect: false
+        });
+        updateQuizDonut();
+        if (AppState.quizSession.currentIndex >= AppState.quizSession.totalQuestions) {
+          renderQuizResults();
+        } else {
+          AppState.quizSession.currentIndex++;
+          loadQuizQuestion(AppState.quizSession.currentConceptId);
+        }
       };
     }
 
@@ -1812,7 +1878,7 @@
               renderQuizResults();
             } else {
               AppState.quizSession.currentIndex++;
-              loadQuizQuestion(result.next);
+              loadQuizQuestion(AppState.quizSession.currentConceptId || result.next);
             }
           };
         } catch (e) {
@@ -1830,7 +1896,14 @@
     if (!numEl || !donutEl) return;
 
     const answered = AppState.quizSession.history.length;
-    if (answered === 0) return;
+    if (answered === 0) {
+      numEl.textContent = "0%";
+      donutEl.innerHTML = createDonutSvg(0, 110, 8, "var(--primary)");
+      if (encourEl) {
+        encourEl.textContent = "Answer questions to sharpen your mastery profile.";
+      }
+      return;
+    }
     const pct = Math.round((AppState.quizSession.score / answered) * 100);
 
     numEl.textContent = `${pct}%`;
@@ -1876,10 +1949,7 @@
     const restartBtn = $("#btn-restart-quiz");
     if (restartBtn) {
       restartBtn.onclick = () => {
-        AppState.quizSession.currentIndex = 1;
-        AppState.quizSession.score = 0;
-        AppState.quizSession.history = [];
-        loadQuizQuestion();
+        startNewQuizSession(AppState.quizSession.currentConceptId);
       };
     }
   }
@@ -1971,6 +2041,19 @@
     if (topAvatar) topAvatar.textContent = AppState.studentName[0] || "A";
 
     window.addEventListener("hashchange", handleHashChange);
+    
+    // Global navigation listener for practice links ensuring clean session start on topic switch
+    document.addEventListener("click", (e) => {
+      const targetLink = e.target.closest("a[href='#practice'], button.start-target-quiz, a.start-target-quiz");
+      if (targetLink) {
+        const cid = targetLink.getAttribute("data-target-concept");
+        AppState.quizSession.targetConceptId = cid || null;
+        if (location.hash === "#practice") {
+          navigateTo("practice");
+        }
+      }
+    });
+
     handleHashChange();
   }
 
