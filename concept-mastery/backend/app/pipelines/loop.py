@@ -301,6 +301,10 @@ def submit_quiz_answer(sub: QuizSubmission) -> dict:
         "correct_option_idx": eval_result.correct_option_idx,
         "explanation": eval_result.explanation,
         "misconceptions": eval_result.misconceptions,
+        "question_type": eval_result.question_type,
+        "correct_answer_display": eval_result.correct_answer_display,
+        "user_answer": eval_result.user_answer,
+        "reasoning_depth_level": eval_result.reasoning_depth_level,
         "updated_mastery": {
             "score": record.score,
             "status": record.status.value,

@@ -112,22 +112,27 @@ class LearnerDashboard(BaseModel):
 # ── 5. Assessment & Quiz Schemas ───────────────────────────────────────────
 
 class QuizQuestion(BaseModel):
-    """A strictly grounded diagnostic multiple-choice question."""
+    """A strictly grounded diagnostic assessment question (MCQ, FITB, or Typed Q&A)."""
     question_id: str
     concept_id: str
+    question_type: Literal["mcq", "fill_in_the_blanks", "typed_qa"] = "mcq"
     question_text: str
-    options: list[str] = Field(..., min_length=2, max_length=6)
-    correct_option_idx: int = Field(..., ge=0, le=5)
+    options: list[str] = Field(default_factory=list)
+    correct_option_idx: int = Field(default=0, ge=0, le=5)
+    target_blank_answer: str = Field(default="", description="Target keyword for fill-in-the-blanks")
+    rubric: str = Field(default="", description="Pedagogical rubric for evaluating open-ended typed answers")
+    key_terms: list[str] = Field(default_factory=list, description="Essential concept keywords expected")
     explanation: str
     source_page: int = Field(..., ge=1)
 
 
 class QuizSubmission(BaseModel):
-    """Student submission with option choice and conceptual reasoning."""
+    """Student submission with option choice, typed text, and conceptual reasoning."""
     user_id: str = "default"
     question_id: str
     concept_id: str
-    selected_option_idx: int
+    selected_option_idx: int | None = None
+    typed_answer: str = Field(default="", description="Typed response for fill-in-the-blanks or open-ended Q&A")
     student_reasoning: str = Field(default="", description="Student self-explanation for multi-signal verification")
 
 
@@ -135,12 +140,16 @@ class QuizResult(BaseModel):
     """Graded result of a quiz submission."""
     question_id: str
     concept_id: str
+    question_type: str = "mcq"
     is_correct: bool
-    correct_option_idx: int
+    correct_option_idx: int = 0
+    correct_answer_display: str = ""
+    user_answer: str = ""
     explanation: str
     score: float
     misconceptions: list[str] = Field(default_factory=list)
     reasoning_clarity: float = Field(default=0.5)
+    reasoning_depth_level: str = "DEVELOPING"
 
 
 # ── 6. Socratic Tutor Schemas ──────────────────────────────────────────────

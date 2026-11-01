@@ -303,6 +303,14 @@ def evaluate_mastery_semantic(
         for p in prereq_ctx.values()
     ) if prereq_ctx else False
 
+    # Pre-inspect reasoning for lucky guess indicators & compute baseline score
+    lower_reasoning = student_reasoning.lower()
+    lucky_guess = bool(re.search(r"\b(guess|guessed|guessing|random|randomly|dont know|don't know|no idea|picked c|picked b|formula without knowing)\b", lower_reasoning))
+    base_quiz_eff = min(quiz_accuracy, 0.3) if lucky_guess else quiz_accuracy
+    base_dialogue_eff = 0.0 if lucky_guess else dialogue_score
+    base_prereq_eff = 0.2 if weak_prereq else 1.0
+    score = round((0.50 * base_quiz_eff) + (0.30 * base_dialogue_eff) + (0.20 * base_prereq_eff), 4)
+
     # Attempt LLM-as-a-Judge evaluation via active provider if enabled
     if llm.enabled():
         user_prompt = f"""EVALUATE THIS LEARNING INTERACTION:

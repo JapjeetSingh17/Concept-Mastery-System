@@ -225,6 +225,7 @@ class LegacyAnswer(BaseModel):
     correct: bool | None = None
     selectedIndex: int | None = None
     studentReasoning: str | None = None
+    typedAnswer: str | None = None
 
 @router.post("/quiz/answer")
 def legacy_quiz_answer(body: LegacyAnswer):
@@ -232,8 +233,9 @@ def legacy_quiz_answer(body: LegacyAnswer):
         user_id="default",
         question_id=body.questionId or "legacy_q",
         concept_id=body.conceptId,
-        selected_option_idx=body.selectedIndex if body.selectedIndex is not None else (0 if body.correct else 1),
-        student_reasoning=body.studentReasoning or "",
+        selected_option_idx=body.selectedIndex,
+        typed_answer=body.typedAnswer or "",
+        student_reasoning=body.studentReasoning or (body.typedAnswer or ""),
     )
     res = loop.submit_quiz_answer(sub)
     q_data = quiz.REGISTRY.get(sub.question_id, quiz.RECENT_QUESTIONS.get(sub.question_id, {}))
@@ -245,6 +247,10 @@ def legacy_quiz_answer(body: LegacyAnswer):
         "explanation": res["explanation"],
         "next_action": res["next_action"],
         "remedial_lesson": res.get("remedial_lesson"),
+        "question_type": res.get("question_type", "mcq"),
+        "correct_answer_display": res.get("correct_answer_display", ""),
+        "user_answer": res.get("user_answer", ""),
+        "reasoning_depth_level": res.get("reasoning_depth_level", "DEVELOPING"),
     }
 
 

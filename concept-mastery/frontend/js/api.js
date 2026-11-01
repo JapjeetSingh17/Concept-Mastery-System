@@ -188,14 +188,16 @@ const ApiService = {
   },
 
   /**
-   * Submit quiz answer for authoritative backend evaluation
+   * Submit quiz answer for authoritative backend evaluation (supports MCQ, FITB, and Typed Q&A)
    */
-  async submitAnswer(questionId, conceptId, selectedIndex, correct = null) {
+  async submitAnswer(questionId, conceptId, selectedIndex = null, correct = null, studentReasoning = "", typedAnswer = "") {
     const payload = {
       questionId,
       conceptId,
-      selectedIndex,
-      correct: correct !== null ? correct : undefined
+      selectedIndex: selectedIndex !== null ? selectedIndex : undefined,
+      correct: correct !== null ? correct : undefined,
+      studentReasoning: studentReasoning || undefined,
+      typedAnswer: typedAnswer || undefined
     };
     return callApi("quizAnswer", payload);
   },

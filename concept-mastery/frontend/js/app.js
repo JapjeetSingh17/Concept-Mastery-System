@@ -1561,12 +1561,66 @@
 
     const letters = ["A", "B", "C", "D"];
     const progressPercent = Math.round((AppState.quizSession.currentIndex / AppState.quizSession.totalQuestions) * 100);
+    const qType = (q.questionType || q.question_type || (q.options && q.options.length ? "mcq" : "typed_qa")).toLowerCase();
+
+    let typeBadgeLabel = "Multiple Choice";
+    let typeBadgeClass = "mcq";
+    if (qType === "fill_in_the_blanks") {
+      typeBadgeLabel = "Fill in the Blank";
+      typeBadgeClass = "fitb";
+    } else if (qType === "typed_qa") {
+      typeBadgeLabel = "Open-Ended Q&A";
+      typeBadgeClass = "typed_qa";
+    }
+
+    // Dynamic input area based on question type
+    let inputHtml = "";
+    if (qType === "fill_in_the_blanks") {
+      const sentenceText = q.question || "";
+      const hasBlank = sentenceText.includes("_____") || sentenceText.includes("___");
+      inputHtml = `
+        <div class="fitb-input-container">
+          <div class="fitb-sentence-box">
+            ${hasBlank 
+              ? esc(sentenceText).replace(/_{3,}/g, `<input type="text" id="fitb-user-input" class="fitb-blank-input" placeholder="type term..." autocomplete="off" />`)
+              : `<p style="margin-bottom:0.75rem;">${esc(sentenceText)}</p><input type="text" id="fitb-user-input" class="fitb-blank-input" placeholder="Type missing keyword..." autocomplete="off" style="width:100%; max-width:320px;" />`
+            }
+          </div>
+          <div class="qa-helper-bar">
+            <span>Type the exact term or concept keyword that completes the statement.</span>
+          </div>
+        </div>
+      `;
+    } else if (qType === "typed_qa") {
+      inputHtml = `
+        <div class="typed-qa-container">
+          <textarea id="typed-qa-user-input" class="quiz-textarea" rows="4" placeholder="Explain the principle, mechanism, or relationship in your own words..."></textarea>
+          <div class="qa-helper-bar">
+            <span>AI Mastery Judge evaluates your conceptual explanation and depth.</span>
+            <span id="qa-char-count">0 characters</span>
+          </div>
+        </div>
+      `;
+    } else {
+      // Standard MCQ
+      const options = q.options || [];
+      inputHtml = `
+        <div class="quiz-options-group" id="quiz-options-group">
+          ${options.map((opt, i) => `
+            <button class="quiz-opt-btn" data-index="${i}">
+              <span class="opt-letter-badge">${letters[i] || (i + 1)}</span>
+              <span class="opt-text">${esc(opt)}</span>
+            </button>
+          `).join("")}
+        </div>
+      `;
+    }
 
     box.innerHTML = `
       <div class="quiz-progress-header">
-        <div>
+        <div style="display:flex; align-items:center; gap:0.6rem;">
           <span class="status-pill unknown">${esc(q.conceptName || q.conceptId)}</span>
-          <span style="font-size:0.8rem; color:var(--ink-muted); margin-left:0.5rem;">Multiple Choice</span>
+          <span class="badge-question-type ${typeBadgeClass}">${typeBadgeLabel}</span>
         </div>
         <div style="display:flex; align-items:center; gap:0.75rem;">
           <span style="font-size:0.82rem; font-weight:600; color:var(--ink-muted);">
@@ -1580,14 +1634,7 @@
 
       <h3 class="question-prompt" id="question-prompt-text">${esc(q.question)}</h3>
 
-      <div class="quiz-options-group" id="quiz-options-group">
-        ${q.options.map((opt, i) => `
-          <button class="quiz-opt-btn" data-index="${i}">
-            <span class="opt-letter-badge">${letters[i]}</span>
-            <span class="opt-text">${esc(opt)}</span>
-          </button>
-        `).join("")}
-      </div>
+      ${inputHtml}
 
       <div id="quiz-feedback-container"></div>
 
@@ -1600,31 +1647,55 @@
     renderMath(box);
 
     let selectedIdx = null;
-    const optionBtns = box.querySelectorAll(".quiz-opt-btn");
     const submitBtn = $("#btn-quiz-submit");
     const skipBtn = $("#btn-quiz-skip");
+    const fitbInput = $("#fitb-user-input");
+    const typedQaInput = $("#typed-qa-user-input");
+    const optionBtns = box.querySelectorAll(".quiz-opt-btn");
 
-    optionBtns.forEach(btn => {
-      btn.onclick = () => {
-        optionBtns.forEach(b => b.classList.remove("selected"));
-        btn.classList.add("selected");
-        selectedIdx = parseInt(btn.getAttribute("data-index"), 10);
-        submitBtn.disabled = false;
+    // Input listeners per type
+    if (qType === "fill_in_the_blanks" && fitbInput) {
+      fitbInput.focus();
+      fitbInput.addEventListener("input", () => {
+        submitBtn.disabled = !fitbInput.value.trim();
+      });
+      fitbInput.addEventListener("keydown", e => {
+        if (e.key === "Enter" && !submitBtn.disabled) {
+          submitBtn.click();
+        }
+      });
+    } else if (qType === "typed_qa" && typedQaInput) {
+      typedQaInput.focus();
+      const countEl = $("#qa-char-count");
+      typedQaInput.addEventListener("input", () => {
+        const len = typedQaInput.value.trim().length;
+        if (countEl) countEl.textContent = `${len} character${len === 1 ? '' : 's'}`;
+        submitBtn.disabled = (len < 4);
+      });
+    } else {
+      // MCQ
+      optionBtns.forEach(btn => {
+        btn.onclick = () => {
+          optionBtns.forEach(b => b.classList.remove("selected"));
+          btn.classList.add("selected");
+          selectedIdx = parseInt(btn.getAttribute("data-index"), 10);
+          submitBtn.disabled = false;
+        };
+      });
+
+      const handleKeyNav = e => {
+        if (AppState.currentRoute !== "practice") return;
+        if (document.activeElement && ["INPUT", "TEXTAREA"].includes(document.activeElement.tagName)) return;
+        const k = e.key.toUpperCase();
+        const keyMap = { "1": 0, "2": 1, "3": 2, "4": 3, "A": 0, "B": 1, "C": 2, "D": 3 };
+        if (k in keyMap && optionBtns[keyMap[k]] && !optionBtns[keyMap[k]].disabled) {
+          optionBtns[keyMap[k]].click();
+        } else if (e.key === "Enter" && submitBtn && !submitBtn.disabled) {
+          submitBtn.click();
+        }
       };
-    });
-
-    const handleKeyNav = e => {
-      if (AppState.currentRoute !== "practice") return;
-      if (document.activeElement && ["INPUT", "TEXTAREA"].includes(document.activeElement.tagName)) return;
-      const k = e.key.toUpperCase();
-      const keyMap = { "1": 0, "2": 1, "3": 2, "4": 3, "A": 0, "B": 1, "C": 2, "D": 3 };
-      if (k in keyMap && optionBtns[keyMap[k]] && !optionBtns[keyMap[k]].disabled) {
-        optionBtns[keyMap[k]].click();
-      } else if (e.key === "Enter" && submitBtn && !submitBtn.disabled) {
-        submitBtn.click();
-      }
-    };
-    window.addEventListener("keydown", handleKeyNav);
+      window.addEventListener("keydown", handleKeyNav);
+    }
 
     if (skipBtn) {
       skipBtn.onclick = () => {
@@ -1635,17 +1706,38 @@
 
     if (submitBtn) {
       submitBtn.onclick = async () => {
-        if (selectedIdx === null) return;
+        let typedVal = "";
+        if (qType === "fill_in_the_blanks") {
+          typedVal = fitbInput ? fitbInput.value.trim() : "";
+          if (!typedVal) return;
+        } else if (qType === "typed_qa") {
+          typedVal = typedQaInput ? typedQaInput.value.trim() : "";
+          if (!typedVal) return;
+        } else {
+          if (selectedIdx === null) return;
+        }
+
         submitBtn.disabled = true;
         skipBtn.disabled = true;
+        if (fitbInput) fitbInput.disabled = true;
+        if (typedQaInput) typedQaInput.disabled = true;
         optionBtns.forEach(b => (b.disabled = true));
 
         try {
-          // Authoritative submission to backend
-          const result = await ApiService.submitAnswer(q.id, q.conceptId, selectedIdx);
+          // Authoritative submission to backend supporting mixed question formats
+          const result = await ApiService.submitAnswer(
+            q.id,
+            q.conceptId,
+            selectedIdx,
+            null,
+            typedVal,
+            typedVal
+          );
           const isCorrect = Boolean(result.correct);
           const correctIdx = result.correctIndex !== undefined ? result.correctIndex : q.correct;
           const explanation = result.explanation || q.explanation || "Evaluation recorded in learner belief model.";
+          const reasoningDepth = result.reasoning_depth_level || result.reasoningDepth || "EVALUATED";
+          const correctDisplay = result.correct_answer_display || result.correctAnswerDisplay || q.targetBlankAnswer || q.target_blank_answer || "";
 
           if (isCorrect) {
             AppState.quizSession.score++;
@@ -1653,35 +1745,58 @@
           AppState.quizSession.history.push({
             question: q.question,
             concept: q.conceptName,
+            questionType: qType,
+            userAnswer: typedVal || (optionBtns[selectedIdx]?.innerText || `Option ${selectedIdx}`),
             isCorrect
           });
 
-          // Style option buttons with evaluation state
-          optionBtns.forEach((b, idx) => {
-            if (idx === correctIdx) {
-              b.classList.add("correct");
-            } else if (idx === selectedIdx && !isCorrect) {
-              b.classList.add("incorrect");
-            }
-          });
+          // Style option buttons for MCQ
+          if (qType === "mcq") {
+            optionBtns.forEach((b, idx) => {
+              if (idx === correctIdx) {
+                b.classList.add("correct");
+              } else if (idx === selectedIdx && !isCorrect) {
+                b.classList.add("incorrect");
+              }
+            });
+          }
 
-          // Update side donut accuracy
+          // Update session donut accuracy
           updateQuizDonut();
 
-          // Render explanation box
+          // Render comprehensive feedback box
           const feedbackBox = $("#quiz-feedback-container");
+          let reviewSnippet = "";
+
+          if (qType === "fill_in_the_blanks") {
+            reviewSnippet = `
+              <div class="quiz-answer-review">
+                <div>Your answer: <strong>${esc(typedVal)}</strong></div>
+                ${!isCorrect ? `<div>Target keyword: <strong style="color:var(--color-strong);">${esc(correctDisplay)}</strong></div>` : ''}
+              </div>
+            `;
+          } else if (qType === "typed_qa") {
+            reviewSnippet = `
+              <div class="quiz-answer-review">
+                <div>AI Judge Assessment: <strong>${isCorrect ? 'Conceptual Comprehension Verified' : 'Needs Conceptual Clarification'}</strong> (Depth: <em>${esc(reasoningDepth)}</em>)</div>
+                ${correctDisplay ? `<div style="margin-top:0.25rem; font-size:0.83rem;">Expected Concepts: ${esc(correctDisplay)}</div>` : ''}
+              </div>
+            `;
+          }
+
           feedbackBox.innerHTML = `
             <div class="quiz-explanation-box ${isCorrect ? 'correct' : 'incorrect'}">
               <div style="display:flex; align-items:center; gap:0.5rem; margin-bottom:0.35rem; font-weight:700;">
                 ${isCorrect ? `
                   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
-                  <span>Correct!</span>
+                  <span>${qType === 'typed_qa' ? 'Concept Well Explained!' : 'Correct!'}</span>
                 ` : `
                   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-                  <span>Not quite.</span>
+                  <span>${qType === 'typed_qa' ? 'Review Recommended.' : 'Not quite.'}</span>
                 `}
               </div>
-              <p style="margin:0; font-size:0.9rem;">${esc(explanation)}</p>
+              ${reviewSnippet}
+              <p style="margin:0; font-size:0.9rem; margin-top:0.4rem;">${esc(explanation)}</p>
             </div>
           `;
           renderMath(feedbackBox);

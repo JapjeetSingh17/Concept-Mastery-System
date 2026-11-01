@@ -251,3 +251,87 @@ def test_6_llm_as_a_judge_semantic_evaluator():
     assert deep_res.semantic_comprehension_score >= 0.75
     assert deep_res.remedial_recommended is False
     print("\n[PASSED] LLM-as-a-Judge Evaluator: Lucky Guess, Prereq Block, and Deep Reasoning validated.")
+
+
+def test_7_mixed_question_types_generation_and_evaluation():
+    """Verify Support for Diverse Assessment Types: MCQ, Fill-in-the-Blanks, and Typed Q&A."""
+    kb = store.require()
+    cid = "learning-rate"
+
+    # 1. Generation: Verify balanced question types
+    questions = quiz.generate_diagnostic_quiz(cid, count=3)
+    assert len(questions) == 3
+    q_types = {q.question_type for q in questions}
+    assert "mcq" in q_types or "fill_in_the_blanks" in q_types or "typed_qa" in q_types
+
+    # 2. Fill-in-the-Blanks Evaluation: Exact match & case-insensitive keyword
+    fitb_q = quiz.QuizQuestion(
+        question_id="fitb_test_01",
+        concept_id="learning-rate",
+        question_type="fill_in_the_blanks",
+        question_text="Fill in the blank: \"The _____ hyperparameter determines the step size in gradient descent.\"",
+        target_blank_answer="learning rate",
+        options=[],
+        correct_option_idx=0,
+        explanation="Learning rate controls step size. (p. 1)",
+        source_page=1,
+    )
+    quiz.REGISTRY["fitb_test_01"] = fitb_q.model_dump()
+
+    # 2a. Correct submission
+    fitb_sub_correct = QuizSubmission(
+        question_id="fitb_test_01",
+        concept_id="learning-rate",
+        typed_answer="learning rate",
+    )
+    res_fitb_ok = quiz.evaluate_submission(fitb_sub_correct)
+    assert res_fitb_ok.is_correct is True
+    assert res_fitb_ok.score == 1.0
+    assert res_fitb_ok.question_type == "fill_in_the_blanks"
+
+    # 2b. Incorrect submission
+    fitb_sub_wrong = QuizSubmission(
+        question_id="fitb_test_01",
+        concept_id="learning-rate",
+        typed_answer="batch normalization",
+    )
+    res_fitb_bad = quiz.evaluate_submission(fitb_sub_wrong)
+    assert res_fitb_bad.is_correct is False
+    assert res_fitb_bad.score == 0.0
+    assert len(res_fitb_bad.misconceptions) > 0
+
+    # 3. Typed Q&A Evaluation: Conceptual explanation graded by AI Judge
+    typed_q = quiz.QuizQuestion(
+        question_id="typed_qa_test_01",
+        concept_id="learning-rate",
+        question_type="typed_qa",
+        question_text="Explain why an excessively high learning rate prevents model convergence.",
+        rubric="Must explain that large step sizes cause overshooting the loss minimum and lead to divergence.",
+        options=[],
+        correct_option_idx=0,
+        explanation="A high learning rate causes overshooting and divergence. (p. 1)",
+        source_page=1,
+    )
+    quiz.REGISTRY["typed_qa_test_01"] = typed_q.model_dump()
+
+    # 3a. Deep conceptual explanation
+    typed_sub_good = QuizSubmission(
+        question_id="typed_qa_test_01",
+        concept_id="learning-rate",
+        typed_answer="When the learning rate is too high, each gradient step overshoots the local minimum of the loss surface, causing oscillations and divergence.",
+    )
+    res_typed_good = quiz.evaluate_submission(typed_sub_good)
+    assert res_typed_good.question_type == "typed_qa"
+    assert res_typed_good.reasoning_depth_level in ("DEVELOPING", "DEEP_CONCEPTUAL")
+    assert res_typed_good.score >= 0.50
+
+    # 3b. Superficial / guessing answer
+    typed_sub_shallow = QuizSubmission(
+        question_id="typed_qa_test_01",
+        concept_id="learning-rate",
+        typed_answer="idk I just guess random stuff",
+    )
+    res_typed_shallow = quiz.evaluate_submission(typed_sub_shallow)
+    assert res_typed_shallow.is_correct is False
+    assert res_typed_shallow.reasoning_depth_level == "SURFACE_ROTE"
+    print("\n[PASSED] Mixed Question Types: MCQ, Fill-in-the-Blanks, and Typed Q&A fully validated.")
