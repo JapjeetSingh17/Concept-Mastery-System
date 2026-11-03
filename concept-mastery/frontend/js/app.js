@@ -34,6 +34,15 @@
       currentConceptId: null,
       seenQuestionIds: new Set(),
       remedialMode: false
+    },
+    smartNotes: {
+      selectedTask: null,
+      activeNote: null,
+      savedNotes: [],
+      selectedConceptId: null,
+      customInstructions: "",
+      diagramSvg: null,
+      activeAudioUrl: null
     }
   };
 
@@ -51,6 +60,143 @@
       '"': "&quot;",
       "'": "&#39;"
     }[c]));
+  }
+
+  // Trigger file download via temporary anchor
+  function triggerBrowserDownload(url, filename = "") {
+    if (!url) return;
+    const a = document.createElement("a");
+    a.href = url;
+    if (filename) a.download = filename;
+    a.target = "_blank";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  }
+
+  // Format grounded citation tags inside text
+  function formatGroundedCitations(text) {
+    if (!text) return "";
+    return text.replace(/\[(Page|Slide|Section)\s+([^\]]+)\]/gi, (match, type, loc) => {
+      const cleanLoc = esc(loc.trim());
+      const cleanType = esc(type);
+      return `<button class="grounded-citation-chip view-citation-chip" data-loc="${cleanLoc}" data-type="${cleanType}" type="button">📖 ${cleanType} ${cleanLoc}</button>`;
+    });
+  }
+
+  // Markdown renderer for Smart Notes
+  function formatMarkdownNotes(mdText) {
+    if (!mdText) return "";
+    let html = "";
+    const lines = mdText.split("\n");
+    let inCodeBlock = false;
+    let codeBlockContent = "";
+    let codeLang = "";
+    let inList = false;
+    let listType = "";
+
+    function closeList() {
+      if (inList) {
+        html += (listType === "ul" ? "</ul>" : "</ol>");
+        inList = false;
+      }
+    }
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+
+      // Code blocks
+      if (line.trim().startsWith("```")) {
+        if (!inCodeBlock) {
+          closeList();
+          inCodeBlock = true;
+          codeLang = line.trim().slice(3).trim();
+          codeBlockContent = "";
+        } else {
+          inCodeBlock = false;
+          html += `<pre><code class="language-${esc(codeLang)}">${esc(codeBlockContent)}</code></pre>`;
+        }
+        continue;
+      }
+
+      if (inCodeBlock) {
+        codeBlockContent += (codeBlockContent ? "\n" : "") + line;
+        continue;
+      }
+
+      // Headers
+      if (line.startsWith("# ")) {
+        closeList();
+        html += `<h1>${formatInlineText(line.slice(2))}</h1>`;
+        continue;
+      }
+      if (line.startsWith("## ")) {
+        closeList();
+        html += `<h2>${formatInlineText(line.slice(3))}</h2>`;
+        continue;
+      }
+      if (line.startsWith("### ")) {
+        closeList();
+        html += `<h3>${formatInlineText(line.slice(4))}</h3>`;
+        continue;
+      }
+      if (line.startsWith("#### ")) {
+        closeList();
+        html += `<h4>${formatInlineText(line.slice(5))}</h4>`;
+        continue;
+      }
+
+      // Unordered lists
+      const ulMatch = line.match(/^(\s*)[-*+]\s+(.*)$/);
+      if (ulMatch) {
+        if (!inList || listType !== "ul") {
+          closeList();
+          html += "<ul>";
+          inList = true;
+          listType = "ul";
+        }
+        html += `<li>${formatInlineText(ulMatch[2])}</li>`;
+        continue;
+      }
+
+      // Ordered lists
+      const olMatch = line.match(/^(\s*)\d+\.\s+(.*)$/);
+      if (olMatch) {
+        if (!inList || listType !== "ol") {
+          closeList();
+          html += "<ol>";
+          inList = true;
+          listType = "ol";
+        }
+        html += `<li>${formatInlineText(olMatch[2])}</li>`;
+        continue;
+      }
+
+      // Empty line closes active list
+      if (!line.trim()) {
+        closeList();
+        continue;
+      }
+
+      // Paragraph
+      closeList();
+      html += `<p>${formatInlineText(line)}</p>`;
+    }
+
+    closeList();
+    if (inCodeBlock) {
+      html += `<pre><code>${esc(codeBlockContent)}</code></pre>`;
+    }
+    return html;
+  }
+
+  function formatInlineText(str) {
+    if (!str) return "";
+    let out = str.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    out = out.replace(/(^|[^*])\*([^*]+)\*([^*]|$)/g, "$1<em>$2</em>$3");
+    out = out.replace(/`([^`]+)`/g, "<code>$1</code>");
+    out = formatGroundedCitations(out);
+    return out;
   }
 
   // Toast Notification
@@ -1835,6 +1981,308 @@
     },
 
     // -----------------------------------------------------------------------
+    // C2. SMART STUDY NOTES & MULTIMODAL ARTIFACTS
+    // -----------------------------------------------------------------------
+    async smartNotes() {
+      await syncActiveDocument();
+      const userId = getCurrentUserId();
+
+      // Fetch concepts list from mastery or graph
+      let conceptsList = [];
+      try {
+        const [mRes, gRes] = await Promise.all([
+          ApiService.getMastery().catch(() => ({ concepts: [] })),
+          ApiService.getConceptsGraph().catch(() => ({ nodes: [] }))
+        ]);
+        if (mRes && mRes.concepts && mRes.concepts.length) {
+          conceptsList = mRes.concepts.map(c => ({
+            id: c.id,
+            label: c.name || c.id.replace(/_/g, " ").replace(/\b\w/g, l => l.toUpperCase()),
+            score: c.score
+          }));
+        } else if (gRes && gRes.nodes && gRes.nodes.length) {
+          conceptsList = gRes.nodes.map(n => ({
+            id: n.id,
+            label: n.label || n.id.replace(/_/g, " ").replace(/\b\w/g, l => l.toUpperCase())
+          }));
+        }
+      } catch (e) {
+        console.warn("Could not fetch concepts for smart notes", e);
+      }
+
+      if (!conceptsList.length) {
+        conceptsList = [
+          { id: "recursion", label: "Recursion & State Invariants" },
+          { id: "dynamic_programming", label: "Dynamic Programming" },
+          { id: "binary_search", label: "Binary Search Boundaries" },
+          { id: "graph_traversal", label: "Graph Traversal & DAGs" }
+        ];
+      }
+
+      if (!AppState.smartNotes.selectedConceptId) {
+        AppState.smartNotes.selectedConceptId = conceptsList[0].id;
+      }
+
+      // Fetch saved notes archive
+      let savedNotes = [];
+      try {
+        savedNotes = await ApiService.getNotes(null, userId);
+        AppState.smartNotes.savedNotes = savedNotes;
+      } catch (e) {
+        console.warn("Could not fetch saved notes archive", e);
+      }
+
+      const selectedTask = AppState.smartNotes.selectedTask;
+      const activeNote = AppState.smartNotes.activeNote;
+
+      return `
+        <div class="smart-notes-container">
+          <!-- Page Header -->
+          <div class="page-header">
+            <div class="page-header-text">
+              <h1 class="page-title">Smart Study Notes</h1>
+              <p class="page-subtitle">
+                Elicit targeted study formats grounded in primary material chunks with ElevenLabs voice notes, PDF handouts, and PPTX slide decks.
+              </p>
+            </div>
+          </div>
+
+          <!-- Step 1: Pre-Generation Task Selector -->
+          <div class="task-selector-section">
+            <div class="task-selector-header">
+              <div>
+                <h3 style="margin:0 0 0.25rem 0; font-size:1.15rem; font-family:var(--font-heading); color:var(--ink-primary);">
+                  Step 1: Select Target Task Format <span class="status-pill weak" style="font-size:0.75rem; vertical-align:middle; margin-left:0.4rem;">Required</span>
+                </h3>
+                <p style="margin:0; font-size:0.86rem; color:var(--ink-muted);">
+                  Students must select an evaluation format before generating notes to align with cognitive task demands.
+                </p>
+              </div>
+            </div>
+
+            <!-- Task Selector 5 Cards -->
+            <div class="task-selector-grid" id="task-selector-grid">
+              <div class="task-card ${selectedTask === 'exam' ? 'selected' : ''}" data-task="exam">
+                <div class="task-card-icon">📝</div>
+                <div class="task-card-title">
+                  <span>Exam Prep</span>
+                  <span class="task-card-check">&check;</span>
+                </div>
+                <p class="task-card-desc">High-yield derivations, step-by-step formulas, common exam traps, and worked numerical problems.</p>
+              </div>
+
+              <div class="task-card ${selectedTask === 'viva' ? 'selected' : ''}" data-task="viva">
+                <div class="task-card-icon">🎙️</div>
+                <div class="task-card-title">
+                  <span>Viva / Interview</span>
+                  <span class="task-card-check">&check;</span>
+                </div>
+                <p class="task-card-desc">30-second elevator pitch, intuitive real-world analogy, and counter-arguments for examiner probes.</p>
+              </div>
+
+              <div class="task-card ${selectedTask === 'quiz' ? 'selected' : ''}" data-task="quiz">
+                <div class="task-card-icon">⚡</div>
+                <div class="task-card-title">
+                  <span>Quiz Cheat Sheet</span>
+                  <span class="task-card-check">&check;</span>
+                </div>
+                <p class="task-card-desc">Rapid review triggers, invariant properties, edge-case traps, and high-speed formula reference sheet.</p>
+              </div>
+
+              <div class="task-card ${selectedTask === 'essay' ? 'selected' : ''}" data-task="essay">
+                <div class="task-card-icon">✍️</div>
+                <div class="task-card-title">
+                  <span>Essay / Assignment</span>
+                  <span class="task-card-check">&check;</span>
+                </div>
+                <p class="task-card-desc">Formal academic prose, theoretical synthesis, literature context, and grounded discussion.</p>
+              </div>
+
+              <div class="task-card ${selectedTask === 'custom' ? 'selected' : ''}" data-task="custom">
+                <div class="task-card-icon">💡</div>
+                <div class="task-card-title">
+                  <span>Custom Prompt</span>
+                  <span class="task-card-check">&check;</span>
+                </div>
+                <p class="task-card-desc">Define custom study requirements, specific rubric targets, or specialized problem-solving focus.</p>
+              </div>
+            </div>
+
+            <!-- Validation Error Alert -->
+            <div class="task-selector-error-msg" id="task-selector-error">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+              <span>Please select your task type (Exam Prep, Viva, Quiz, Essay, or Custom) before generating notes.</span>
+            </div>
+
+            <!-- Custom Instructions Box (Toggled for Custom Prompt) -->
+            <div class="custom-prompt-container ${selectedTask === 'custom' ? 'visible' : ''}" id="custom-prompt-box">
+              <label for="custom-instructions-input" style="display:block; font-size:0.86rem; font-weight:600; margin-bottom:0.35rem; color:var(--ink-primary);">
+                Custom Instructions &amp; Guidance:
+              </label>
+              <textarea id="custom-instructions-input" rows="2" class="form-input" style="width:100%; border-radius:var(--radius-md); padding:0.65rem; font-family:inherit; font-size:0.9rem;" placeholder="E.g., Include asymptotic runtime proof, emphasize recursion tree diagrams, and add boundary condition traps...">${esc(AppState.smartNotes.customInstructions || '')}</textarea>
+            </div>
+
+            <!-- Step 2: Concept Selector & Generation Button -->
+            <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:1rem; margin-top:1.25rem; border-top:1px solid var(--border-subtle); padding-top:1.25rem;">
+              <div style="display:flex; align-items:center; gap:0.75rem; flex-wrap:wrap;">
+                <label for="smart-notes-concept-select" style="font-size:0.88rem; font-weight:600; color:var(--ink-secondary);">
+                  Target Concept:
+                </label>
+                <select id="smart-notes-concept-select" class="form-input" style="min-width:240px; padding:0.55rem 0.85rem; border-radius:var(--radius-md); font-weight:600;">
+                  ${conceptsList.map(c => `
+                    <option value="${esc(c.id)}" ${c.id === AppState.smartNotes.selectedConceptId ? 'selected' : ''}>
+                      ${esc(c.label)}
+                    </option>
+                  `).join('')}
+                </select>
+              </div>
+
+              <button id="btn-generate-smart-notes" class="btn btn-primary" style="padding:0.65rem 1.4rem; gap:0.5rem; font-weight:700;">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
+                </svg>
+                <span>Generate Smart Notes</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Step 3: Active Generated Note View -->
+          ${activeNote ? `
+            <div class="note-content-card" id="active-note-view">
+              <!-- Note Action Bar -->
+              <div class="note-action-bar">
+                <div class="note-action-buttons">
+                  <button class="btn btn-sm btn-outline" id="btn-note-audio" title="Synthesize executive spoken summary with ElevenLabs Flash">
+                    🎧 Listen to Audio Note (ElevenLabs Flash)
+                  </button>
+                  <button class="btn btn-sm btn-outline" id="btn-note-pdf" title="Download printable PDF handout">
+                    📄 Download PDF
+                  </button>
+                  <button class="btn btn-sm btn-outline" id="btn-note-pptx" title="Export 5-slide PPTX deck">
+                    📊 Export PPTX
+                  </button>
+                  <button class="btn btn-sm btn-outline" id="btn-note-diagram" title="Generate grounded SVG architectural diagram">
+                    🖼️ Generate Diagram
+                  </button>
+                </div>
+                <div style="font-size:0.8rem; color:var(--ink-muted);">
+                  Grounded in <strong>${esc(activeNote.citations?.length || 1)} source citations</strong>
+                </div>
+              </div>
+
+              <!-- Inline HTML5 Audio Player -->
+              <div class="note-audio-player-container ${activeNote.audio_url || AppState.smartNotes.activeAudioUrl ? 'visible' : ''}" id="note-audio-player-box">
+                <span style="font-size:0.86rem; font-weight:700; color:var(--primary); white-space:nowrap;">
+                  🎧 Spoken Summary:
+                </span>
+                <audio controls src="${esc(ApiService.getArtifactUrl(activeNote.audio_url || AppState.smartNotes.activeAudioUrl || ''))}" style="flex:1; height:36px;" id="note-audio-element"></audio>
+                <a href="${esc(ApiService.getArtifactUrl(activeNote.audio_url || AppState.smartNotes.activeAudioUrl || ''))}" download class="btn btn-xs btn-outline" style="white-space:nowrap;">
+                  Save MP3
+                </a>
+              </div>
+
+              <!-- Inline Diagram SVG Container -->
+              <div class="note-diagram-wrapper" id="note-diagram-box" style="${AppState.smartNotes.diagramSvg ? '' : 'display:none;'}">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
+                  <strong style="font-size:0.9rem; color:var(--ink-primary);">🖼️ Concept Flow Diagram</strong>
+                  <span style="font-size:0.75rem; color:var(--ink-muted);">Interactive SVG</span>
+                </div>
+                <div id="note-diagram-inner" style="max-height:380px; overflow:auto;">
+                  ${AppState.smartNotes.diagramSvg || ''}
+                </div>
+              </div>
+
+              <!-- Note Title & Header Metadata -->
+              <div class="note-header">
+                <div class="note-badge-row">
+                  <span class="status-pill strong">${esc((activeNote.task_type || 'exam').toUpperCase())} NOTE</span>
+                  <span style="font-size:0.82rem; color:var(--ink-muted); font-weight:600;">${esc(activeNote.concept_id?.replace(/_/g, ' ').toUpperCase() || 'CONCEPT')}</span>
+                  ${activeNote.created_at ? `<span style="font-size:0.8rem; color:var(--ink-faint); margin-left:auto;">${esc(activeNote.created_at.slice(0, 10))}</span>` : ''}
+                </div>
+                <h2 style="margin:0.25rem 0; font-size:1.6rem; font-family:var(--font-heading); color:var(--ink-primary);">
+                  ${esc(activeNote.title || 'Smart Study Note')}
+                </h2>
+              </div>
+
+              <!-- High-Yield Key Takeaways -->
+              ${activeNote.key_takeaways && activeNote.key_takeaways.length ? `
+                <div class="note-takeaways-box">
+                  <h4>⚡ High-Yield Key Takeaways</h4>
+                  <ul class="note-takeaways-list">
+                    ${activeNote.key_takeaways.map(t => `<li>${formatGroundedCitations(esc(t))}</li>`).join('')}
+                  </ul>
+                </div>
+              ` : ''}
+
+              <!-- Rendered Markdown Body -->
+              <div class="note-markdown-body" id="note-markdown-body">
+                ${formatMarkdownNotes(activeNote.markdown_content || '')}
+              </div>
+            </div>
+          ` : ''}
+
+          <!-- Step 4: Saved Notes Archive List -->
+          <div class="archive-section">
+            <div class="archive-header">
+              <div>
+                <h3 style="margin:0 0 0.25rem 0; font-size:1.2rem; font-family:var(--font-heading); color:var(--ink-primary);">
+                  📚 Saved Notes Archive (${savedNotes.length})
+                </h3>
+                <p style="margin:0; font-size:0.84rem; color:var(--ink-muted);">
+                  Previously generated notes with instant re-read, audio review, and multi-format export.
+                </p>
+              </div>
+            </div>
+
+            ${savedNotes.length ? `
+              <div class="saved-notes-grid" id="saved-notes-grid">
+                ${savedNotes.map(n => `
+                  <div class="saved-note-card" data-note-id="${esc(n.note_id)}">
+                    <div>
+                      <div class="saved-note-meta">
+                        <span class="status-pill strong" style="font-size:0.72rem; padding:0.15rem 0.5rem;">${esc((n.task_type || 'exam').toUpperCase())}</span>
+                        <span>&bull;</span>
+                        <span style="font-weight:600;">${esc(n.concept_id?.replace(/_/g, ' ') || 'Concept')}</span>
+                        ${n.created_at ? `<span style="margin-left:auto; font-size:0.75rem;">${esc(n.created_at.slice(0, 10))}</span>` : ''}
+                      </div>
+                      <div class="saved-note-title">${esc(n.title || 'Study Note')}</div>
+                      <div style="font-size:0.82rem; color:var(--ink-secondary); line-height:1.45; max-height:3.6em; overflow:hidden;">
+                        ${esc(n.key_takeaways?.[0] || (n.markdown_content || '').slice(0, 120))}...
+                      </div>
+                    </div>
+                    <div class="saved-note-actions">
+                      <button class="btn btn-xs btn-primary btn-read-saved-note" data-id="${esc(n.note_id)}">
+                        📖 Read
+                      </button>
+                      <button class="btn btn-xs btn-outline btn-audio-saved-note" data-id="${esc(n.note_id)}" data-url="${esc(n.audio_url || '')}">
+                        🎧 Audio
+                      </button>
+                      <button class="btn btn-xs btn-outline btn-pdf-saved-note" data-id="${esc(n.note_id)}" data-url="${esc(n.pdf_url || '')}">
+                        📄 PDF
+                      </button>
+                      <button class="btn btn-xs btn-outline btn-pptx-saved-note" data-id="${esc(n.note_id)}" data-url="${esc(n.pptx_url || '')}">
+                        📊 PPTX
+                      </button>
+                      <button class="btn btn-xs btn-outline btn-delete-saved-note" data-id="${esc(n.note_id)}" style="color:var(--color-danger); border-color:var(--color-danger-border); margin-left:auto;" title="Delete note">
+                        🗑️
+                      </button>
+                    </div>
+                  </div>
+                `).join('')}
+              </div>
+            ` : `
+              <div class="card" style="padding:2.5rem; text-align:center; color:var(--ink-muted);">
+                <div style="font-size:2rem; margin-bottom:0.5rem;">📚</div>
+                <h4 style="margin:0 0 0.25rem 0; color:var(--ink-secondary);">No Saved Notes Yet</h4>
+                <p style="margin:0; font-size:0.86rem;">Select a task type and concept above to generate your first high-yield smart study guide.</p>
+              </div>
+            `}
+          </div>
+        </div>
+      `;
+    },
+
+    // -----------------------------------------------------------------------
     // D. CONCEPT CHECK / QUIZ VIEW
     // -----------------------------------------------------------------------
     async practice() {
@@ -2317,6 +2765,65 @@
       </div>
     ` : "";
 
+    const artifactsHtml = (msg.artifacts && msg.artifacts.length > 0) ? `
+      <div class="chat-artifacts-container">
+        ${msg.artifacts.map(art => {
+          const rawUrl = art.url || art.download_url || art.filename || "";
+          const artUrl = ApiService.getArtifactUrl(rawUrl);
+          const isSvg = art.type === "visual" || rawUrl.endsWith(".svg");
+          const isAudio = art.type === "audio" || rawUrl.endsWith(".mp3");
+          const isPptx = art.type === "pptx" || rawUrl.endsWith(".pptx");
+          const isPdf = art.type === "pdf" || rawUrl.endsWith(".pdf");
+          let icon = "📄";
+          if (isSvg) icon = "🖼️";
+          else if (isAudio) icon = "🎧";
+          else if (isPptx) icon = "📊";
+          else if (isPdf) icon = "📑";
+
+          return `
+            <div class="chat-artifact-card">
+              <div style="display:flex; justify-content:space-between; align-items:center;">
+                <div style="display:flex; align-items:center; gap:0.5rem;">
+                  <span style="font-size:1.1rem;">${icon}</span>
+                  <div>
+                    <strong style="font-size:0.88rem; color:var(--ink-primary);">${esc(art.title || art.filename || "Study Artifact")}</strong>
+                    <div style="font-size:0.75rem; color:var(--ink-muted);">${esc(art.type ? art.type.toUpperCase() : "ARTIFACT")} &bull; Grounded Material</div>
+                  </div>
+                </div>
+                ${artUrl ? `
+                  <a href="${esc(artUrl)}" target="_blank" download class="btn btn-xs btn-primary" style="text-decoration:none;">
+                    Download
+                  </a>
+                ` : ''}
+              </div>
+              ${isAudio && artUrl ? `
+                <audio controls src="${esc(artUrl)}" style="width:100%; margin-top:0.4rem; height:36px;"></audio>
+              ` : ''}
+              ${isSvg && art.svg ? `
+                <div style="max-height:220px; overflow:auto; background:#ffffff; padding:0.5rem; border-radius:var(--radius-sm); border:1px solid var(--border-subtle); margin-top:0.4rem;">
+                  ${art.svg}
+                </div>
+              ` : ''}
+            </div>
+          `;
+        }).join("")}
+      </div>
+    ` : "";
+
+    const linksHtml = (msg.external_links && msg.external_links.length > 0) ? `
+      <div class="chat-external-links">
+        ${msg.external_links.map(link => `
+          <a href="${esc(link.url || '#')}" target="_blank" rel="noopener noreferrer" class="chat-external-card">
+            <div style="display:flex; align-items:center; gap:0.5rem;">
+              <span style="background:var(--surface-brand); color:var(--primary); font-weight:700; font-size:0.75rem; padding:0.15rem 0.45rem; border-radius:4px;">External Resource</span>
+              <span style="font-weight:600;">${esc(link.title || link.url)}</span>
+            </div>
+            <span style="color:var(--primary); font-size:0.9rem;">&nearr;</span>
+          </a>
+        `).join("")}
+      </div>
+    ` : "";
+
     return `
       <div class="chat-row ${isUser ? 'user' : 'assistant'}">
         <div class="chat-avatar ${isUser ? 'user-avatar' : 'bot-avatar'}">
@@ -2327,6 +2834,8 @@
         <div class="message-bubble">
           <div>${msg.text}</div>
           ${citationsHtml}
+          ${artifactsHtml}
+          ${linksHtml}
         </div>
       </div>
     `;
@@ -2787,14 +3296,36 @@
               `;
             } else {
               // PDF, PPTX, Markdown, DOCX
+              const isDeepAudioSupported = (stype === "pdf" || stype === "pptx");
+              const deepAudioBanner = isDeepAudioSupported ? `
+                <div class="deep-audio-banner">
+                  <div>
+                    <strong style="color:var(--primary); font-size:0.92rem;">🎧 Professor Audio Deep-Dive</strong>
+                    <p style="margin:0; font-size:0.8rem; color:var(--ink-muted);">Generate an in-depth spoken audio explanation with ElevenLabs Flash speech synthesis.</p>
+                  </div>
+                  <button class="btn btn-sm btn-primary btn-generate-deep-audio" data-mat-id="${esc(preview.material_id || matId)}" data-index="0">
+                    🎧 Deeper Audio Explanation
+                  </button>
+                </div>
+                <div id="modal-deep-audio-player-wrapper" style="display:none; margin-bottom:1rem; padding:0.75rem; background:var(--surface-muted); border-radius:var(--radius-md);"></div>
+              ` : '';
+
               bodyHtml = `
+                ${deepAudioBanner}
                 <div class="preview-cards-list">
-                  ${items.map(it => `
+                  ${items.map((it, idx) => `
                     <div class="preview-card-item">
-                      <div class="preview-card-header">
-                        <span class="preview-locator-pill">${esc(it.label)}</span>
-                        ${it.title ? `<strong style="font-size:0.95rem; color:var(--ink-primary);">${esc(it.title)}</strong>` : ''}
-                        ${it.heading ? `<strong style="font-size:0.95rem; color:var(--ink-primary);">${esc(it.heading)}</strong>` : ''}
+                      <div class="preview-card-header" style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:0.5rem;">
+                        <div style="display:flex; align-items:center; gap:0.5rem;">
+                          <span class="preview-locator-pill">${esc(it.label)}</span>
+                          ${it.title ? `<strong style="font-size:0.95rem; color:var(--ink-primary);">${esc(it.title)}</strong>` : ''}
+                          ${it.heading ? `<strong style="font-size:0.95rem; color:var(--ink-primary);">${esc(it.heading)}</strong>` : ''}
+                        </div>
+                        ${isDeepAudioSupported ? `
+                          <button class="btn btn-xs btn-outline btn-generate-deep-audio" data-mat-id="${esc(preview.material_id || matId)}" data-index="${it.index !== undefined ? it.index : idx}">
+                            🎧 Deeper Audio Explanation
+                          </button>
+                        ` : ''}
                       </div>
                       <div class="preview-card-text">${esc(it.text)}</div>
                       ${it.notes ? `
@@ -2808,7 +3339,46 @@
               `;
             }
 
-            if (previewModalBody) previewModalBody.innerHTML = bodyHtml;
+            if (previewModalBody) {
+              previewModalBody.innerHTML = bodyHtml;
+
+              // Bind Deeper Audio Explanation handlers if eligible
+              if (stype === "pdf" || stype === "pptx") {
+                const daBtns = previewModalBody.querySelectorAll(".btn-generate-deep-audio");
+                daBtns.forEach(daBtn => {
+                  daBtn.onclick = async () => {
+                    const targetMatId = daBtn.getAttribute("data-mat-id") || matId;
+                    const targetIndex = parseInt(daBtn.getAttribute("data-index") || "0", 10);
+                    const origBtnText = daBtn.innerHTML;
+                    daBtn.disabled = true;
+                    daBtn.textContent = "Synthesizing deep audio...";
+
+                    try {
+                      const audioRes = await ApiService.generateDeepAudio(targetMatId, targetIndex, getCurrentUserId());
+                      const audioUrl = ApiService.getArtifactUrl(audioRes.audio_url || audioRes.url || audioRes);
+                      let playerWrap = $("#modal-deep-audio-player-wrapper", previewModalBody);
+                      if (playerWrap) {
+                        playerWrap.style.display = "block";
+                        playerWrap.innerHTML = `
+                          <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:0.4rem;">
+                            <span style="font-weight:600; font-size:0.84rem; color:var(--ink-primary);">🎧 Deep Spoken Explanation (Section/Slide ${targetIndex + 1})</span>
+                            <a href="${esc(audioUrl)}" target="_blank" download class="btn btn-xs btn-outline">Save MP3</a>
+                          </div>
+                          <audio controls autoplay src="${esc(audioUrl)}" style="width:100%; height:36px;"></audio>
+                        `;
+                      }
+                      showToast("Deep audio explanation generated!", "success");
+                    } catch (audioErr) {
+                      showToast(`Deep audio synthesis failed: ${audioErr.message}`, "danger");
+                    } finally {
+                      daBtn.disabled = false;
+                      daBtn.innerHTML = origBtnText;
+                    }
+                  };
+                });
+              }
+            }
+
             previewModal.showModal();
           } catch (err) {
             btn.disabled = false;
@@ -2904,7 +3474,9 @@
             const tutorMsg = {
               sender: "assistant",
               text: esc(resp.answer),
-              citations: resp.citations || []
+              citations: resp.citations || [],
+              artifacts: resp.artifacts || [],
+              external_links: resp.external_links || []
             };
             AppState.chatMessages.push(tutorMsg);
             stream.insertAdjacentHTML("beforeend", renderChatMessage(tutorMsg));
@@ -3100,6 +3672,348 @@
           };
         });
       }
+    },
+
+    smartNotes() {
+      renderMath(document);
+
+      // 1. Pre-Generation Task Selector interaction
+      const taskCards = $$(".task-card");
+      const customPromptBox = $("#custom-prompt-box");
+      const errorMsg = $("#task-selector-error");
+      const customInput = $("#custom-instructions-input");
+      const conceptSelect = $("#smart-notes-concept-select");
+      const generateBtn = $("#btn-generate-smart-notes");
+
+      taskCards.forEach(card => {
+        card.onclick = () => {
+          const task = card.getAttribute("data-task");
+          AppState.smartNotes.selectedTask = task;
+
+          taskCards.forEach(c => c.classList.remove("selected"));
+          card.classList.add("selected");
+
+          if (errorMsg) errorMsg.classList.remove("visible");
+
+          if (customPromptBox) {
+            if (task === "custom") {
+              customPromptBox.classList.add("visible");
+            } else {
+              customPromptBox.classList.remove("visible");
+            }
+          }
+        };
+      });
+
+      if (customInput) {
+        customInput.oninput = () => {
+          AppState.smartNotes.customInstructions = customInput.value;
+        };
+      }
+
+      if (conceptSelect) {
+        conceptSelect.onchange = () => {
+          AppState.smartNotes.selectedConceptId = conceptSelect.value;
+        };
+      }
+
+      // 2. Generate Smart Notes Button Click
+      if (generateBtn) {
+        generateBtn.onclick = async () => {
+          // MANDATORY GATE: Task type must be selected
+          if (!AppState.smartNotes.selectedTask) {
+            if (errorMsg) errorMsg.classList.add("visible");
+            showToast("Please select your task type before generating notes.", "warning");
+            const grid = $("#task-selector-grid");
+            if (grid) grid.scrollIntoView({ behavior: "smooth", block: "center" });
+            return;
+          }
+
+          const conceptId = (conceptSelect && conceptSelect.value) || AppState.smartNotes.selectedConceptId || "recursion";
+          const taskType = AppState.smartNotes.selectedTask;
+          const customInstructions = (customInput && customInput.value.trim()) || AppState.smartNotes.customInstructions || "";
+          const userId = getCurrentUserId();
+
+          generateBtn.disabled = true;
+          const origText = generateBtn.innerHTML;
+          generateBtn.innerHTML = `
+            <span class="upload-icon-pulse" style="width:16px; height:16px; border:2px solid #fff; border-top-color:transparent; border-radius:50%; display:inline-block; animation:spin 1s linear infinite;"></span>
+            <span>Synthesizing ${taskType.toUpperCase()} Notes...</span>
+          `;
+
+          try {
+            const noteRes = await ApiService.generateNote({
+              concept_id: conceptId,
+              task_type: taskType,
+              custom_instructions: customInstructions || undefined,
+              user_id: userId
+            });
+
+            AppState.smartNotes.activeNote = noteRes;
+            AppState.smartNotes.diagramSvg = null;
+            AppState.smartNotes.activeAudioUrl = noteRes.audio_url || null;
+
+            showToast(`Generated ${taskType.toUpperCase()} notes for ${conceptId.replace(/_/g, ' ')}!`, "success");
+            await navigateTo("smart-notes");
+
+            // Scroll to active note view
+            const activeNoteView = $("#active-note-view");
+            if (activeNoteView) {
+              activeNoteView.scrollIntoView({ behavior: "smooth", block: "start" });
+            }
+          } catch (err) {
+            showToast(`Note generation failed: ${err.message}`, "danger");
+          } finally {
+            generateBtn.disabled = false;
+            generateBtn.innerHTML = origText;
+          }
+        };
+      }
+
+      // 3. Note Action Bar Buttons (Active Note)
+      const activeNote = AppState.smartNotes.activeNote;
+      if (activeNote) {
+        // A. Listen to Audio Note (ElevenLabs Flash)
+        const audioBtn = $("#btn-note-audio");
+        const playerBox = $("#note-audio-player-box");
+        const audioElement = $("#note-audio-element");
+
+        if (audioBtn) {
+          audioBtn.onclick = async () => {
+            audioBtn.disabled = true;
+            const origAudioText = audioBtn.innerHTML;
+            audioBtn.innerHTML = "🎧 Synthesizing Flash Audio...";
+
+            try {
+              const res = await ApiService.generateNoteAudio(activeNote.note_id, getCurrentUserId());
+              const audioUrl = ApiService.getArtifactUrl(res.audio_url || (activeNote.note_id ? `/api/artifacts/audio_${activeNote.note_id}.mp3` : ""));
+              AppState.smartNotes.activeAudioUrl = audioUrl;
+
+              if (playerBox) playerBox.classList.add("visible");
+              if (audioElement) {
+                audioElement.src = audioUrl;
+                audioElement.play().catch(() => {});
+              }
+              showToast("ElevenLabs audio summary ready!", "success");
+              audioBtn.innerHTML = "🎧 Audio Ready";
+            } catch (err) {
+              showToast(`Audio generation failed: ${err.message}`, "danger");
+              audioBtn.innerHTML = origAudioText;
+            } finally {
+              audioBtn.disabled = false;
+            }
+          };
+        }
+
+        // B. Download PDF
+        const pdfBtn = $("#btn-note-pdf");
+        if (pdfBtn) {
+          pdfBtn.onclick = async () => {
+            pdfBtn.disabled = true;
+            const origPdfText = pdfBtn.innerHTML;
+            pdfBtn.innerHTML = "📄 Building PDF...";
+
+            try {
+              const res = await ApiService.exportNoteArtifact(activeNote.note_id, "pdf", getCurrentUserId());
+              const pdfUrl = ApiService.getArtifactUrl(res.pdf_url || res.url || res.download_url || "");
+              triggerBrowserDownload(pdfUrl, `Note_${activeNote.concept_id}_${activeNote.note_id}.pdf`);
+              showToast("PDF handout downloaded!", "success");
+            } catch (err) {
+              showToast(`PDF export failed: ${err.message}`, "danger");
+            } finally {
+              pdfBtn.disabled = false;
+              pdfBtn.innerHTML = origPdfText;
+            }
+          };
+        }
+
+        // C. Export PPTX
+        const pptxBtn = $("#btn-note-pptx");
+        if (pptxBtn) {
+          pptxBtn.onclick = async () => {
+            pptxBtn.disabled = true;
+            const origPptxText = pptxBtn.innerHTML;
+            pptxBtn.innerHTML = "📊 Building Deck...";
+
+            try {
+              const res = await ApiService.exportNoteArtifact(activeNote.note_id, "pptx", getCurrentUserId());
+              const pptxUrl = ApiService.getArtifactUrl(res.pptx_url || res.url || res.download_url || "");
+              triggerBrowserDownload(pptxUrl, `Deck_${activeNote.concept_id}_${activeNote.note_id}.pptx`);
+              showToast("PPTX slide deck downloaded!", "success");
+            } catch (err) {
+              showToast(`PPTX export failed: ${err.message}`, "danger");
+            } finally {
+              pptxBtn.disabled = false;
+              pptxBtn.innerHTML = origPptxText;
+            }
+          };
+        }
+
+        // D. Generate Diagram
+        const diagramBtn = $("#btn-note-diagram");
+        const diagramBox = $("#note-diagram-box");
+        const diagramInner = $("#note-diagram-inner");
+
+        if (diagramBtn) {
+          diagramBtn.onclick = async () => {
+            diagramBtn.disabled = true;
+            const origDiagText = diagramBtn.innerHTML;
+            diagramBtn.innerHTML = "🖼️ Rendering Diagram...";
+
+            try {
+              const res = await ApiService.generateToolArtifact("visual", activeNote.concept_id, "", 5, getCurrentUserId());
+              const svgContent = res.svg || res.code || (res.download_url ? `<img src="${esc(ApiService.getArtifactUrl(res.download_url))}" style="max-width:100%;" />` : "");
+              AppState.smartNotes.diagramSvg = svgContent;
+
+              if (diagramBox) diagramBox.style.display = "block";
+              if (diagramInner) diagramInner.innerHTML = svgContent;
+              showToast("SVG Architecture diagram embedded!", "success");
+            } catch (err) {
+              showToast(`Diagram generation failed: ${err.message}`, "danger");
+            } finally {
+              diagramBtn.disabled = false;
+              diagramBtn.innerHTML = origDiagText;
+            }
+          };
+        }
+
+        // Clickable citation chips inside note
+        $$(".grounded-citation-chip", $("#active-note-view") || document).forEach(chip => {
+          chip.onclick = () => {
+            const loc = chip.getAttribute("data-loc") || "1";
+            openSourceModal({
+              page: loc,
+              snippet: activeNote.concept_id.replace(/_/g, ' ').toUpperCase(),
+              text: `Grounded citation reference for ${activeNote.concept_id} verified from primary source at ${loc}.`
+            });
+          };
+        });
+      }
+
+      // 4. Saved Notes Archive Actions
+      $$(".btn-read-saved-note").forEach(btn => {
+        btn.onclick = () => {
+          const noteId = btn.getAttribute("data-id");
+          const note = (AppState.smartNotes.savedNotes || []).find(n => n.note_id === noteId);
+          if (note) {
+            AppState.smartNotes.activeNote = note;
+            AppState.smartNotes.selectedTask = note.task_type || "exam";
+            AppState.smartNotes.selectedConceptId = note.concept_id;
+            AppState.smartNotes.diagramSvg = null;
+            AppState.smartNotes.activeAudioUrl = note.audio_url || null;
+            navigateTo("smart-notes").then(() => {
+              const el = $("#active-note-view");
+              if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+            });
+          }
+        };
+      });
+
+      $$(".btn-audio-saved-note").forEach(btn => {
+        btn.onclick = async () => {
+          const noteId = btn.getAttribute("data-id");
+          const existingUrl = btn.getAttribute("data-url");
+          if (existingUrl) {
+            const url = ApiService.getArtifactUrl(existingUrl);
+            const playerBox = $("#note-audio-player-box");
+            const audioElement = $("#note-audio-element");
+            if (playerBox) playerBox.classList.add("visible");
+            if (audioElement) {
+              audioElement.src = url;
+              audioElement.play().catch(() => {});
+            }
+            showToast("Playing saved audio executive summary!", "info");
+          } else {
+            btn.disabled = true;
+            btn.textContent = "Synthesizing...";
+            try {
+              const res = await ApiService.generateNoteAudio(noteId, getCurrentUserId());
+              const url = ApiService.getArtifactUrl(res.audio_url || "");
+              btn.setAttribute("data-url", url);
+              const playerBox = $("#note-audio-player-box");
+              const audioElement = $("#note-audio-element");
+              if (playerBox) playerBox.classList.add("visible");
+              if (audioElement) {
+                audioElement.src = url;
+                audioElement.play().catch(() => {});
+              }
+              showToast("ElevenLabs audio summary ready!", "success");
+            } catch (err) {
+              showToast(`Audio synthesis failed: ${err.message}`, "danger");
+            } finally {
+              btn.disabled = false;
+              btn.textContent = "🎧 Audio";
+            }
+          }
+        };
+      });
+
+      $$(".btn-pdf-saved-note").forEach(btn => {
+        btn.onclick = async () => {
+          const noteId = btn.getAttribute("data-id");
+          const existingUrl = btn.getAttribute("data-url");
+          if (existingUrl) {
+            triggerBrowserDownload(ApiService.getArtifactUrl(existingUrl), `Note_${noteId}.pdf`);
+          } else {
+            btn.disabled = true;
+            btn.textContent = "Exporting...";
+            try {
+              const res = await ApiService.exportNoteArtifact(noteId, "pdf", getCurrentUserId());
+              const url = ApiService.getArtifactUrl(res.pdf_url || res.url || "");
+              btn.setAttribute("data-url", url);
+              triggerBrowserDownload(url, `Note_${noteId}.pdf`);
+              showToast("PDF handout downloaded!", "success");
+            } catch (err) {
+              showToast(`PDF export failed: ${err.message}`, "danger");
+            } finally {
+              btn.disabled = false;
+              btn.textContent = "📄 PDF";
+            }
+          }
+        };
+      });
+
+      $$(".btn-pptx-saved-note").forEach(btn => {
+        btn.onclick = async () => {
+          const noteId = btn.getAttribute("data-id");
+          const existingUrl = btn.getAttribute("data-url");
+          if (existingUrl) {
+            triggerBrowserDownload(ApiService.getArtifactUrl(existingUrl), `Deck_${noteId}.pptx`);
+          } else {
+            btn.disabled = true;
+            btn.textContent = "Exporting...";
+            try {
+              const res = await ApiService.exportNoteArtifact(noteId, "pptx", getCurrentUserId());
+              const url = ApiService.getArtifactUrl(res.pptx_url || res.url || "");
+              btn.setAttribute("data-url", url);
+              triggerBrowserDownload(url, `Deck_${noteId}.pptx`);
+              showToast("PPTX deck downloaded!", "success");
+            } catch (err) {
+              showToast(`PPTX export failed: ${err.message}`, "danger");
+            } finally {
+              btn.disabled = false;
+              btn.textContent = "📊 PPTX";
+            }
+          }
+        };
+      });
+
+      $$(".btn-delete-saved-note").forEach(btn => {
+        btn.onclick = async () => {
+          const noteId = btn.getAttribute("data-id");
+          if (!confirm("Are you sure you want to delete this smart study note?")) return;
+          try {
+            await ApiService.deleteNote(noteId, getCurrentUserId());
+            showToast("Smart note deleted.", "info");
+            if (AppState.smartNotes.activeNote && AppState.smartNotes.activeNote.note_id === noteId) {
+              AppState.smartNotes.activeNote = null;
+            }
+            navigateTo("smart-notes");
+          } catch (err) {
+            showToast(`Delete failed: ${err.message}`, "danger");
+          }
+        };
+      });
     },
 
     practice() {
@@ -3792,6 +4706,7 @@
         upload: "Study Material",
         tutor: "AI Tutor",
         "active-recall": "Active Recall",
+        "smart-notes": "Smart Notes",
         practice: "Concept Check",
         "learning-path": "Learning Path",
         progress: "Mastery Analytics",
@@ -3811,7 +4726,7 @@
   }
 
   async function navigateTo(routeId) {
-    const validRoutes = ["dashboard", "upload", "tutor", "active-recall", "practice", "learning-path", "progress", "settings"];
+    const validRoutes = ["dashboard", "upload", "tutor", "active-recall", "smart-notes", "practice", "learning-path", "progress", "settings"];
     const activeRoute = validRoutes.includes(routeId) ? routeId : "dashboard";
     AppState.currentRoute = activeRoute;
     updateNavigation(activeRoute);

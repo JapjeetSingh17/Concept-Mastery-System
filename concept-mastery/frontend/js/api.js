@@ -76,7 +76,15 @@ const ENDPOINTS = {
   authGoogle:          { method: "POST",   path: "/api/auth/google" },
   authMe:              { method: "GET",    path: "/api/auth/me" },
   authLogs:            { method: "GET",    path: "/api/auth/logs" },
-  authConfig:          { method: "GET",    path: "/api/auth/config" }
+  authConfig:          { method: "GET",    path: "/api/auth/config" },
+  notesGenerate:       { method: "POST",   path: "/api/notes/generate" },
+  notesList:           { method: "GET",    path: "/api/notes" },
+  notesDelete:         { method: "DELETE", path: "/api/notes/{note_id}" },
+  notesAudio:          { method: "POST",   path: "/api/notes/{note_id}/audio" },
+  notesExport:         { method: "POST",   path: "/api/notes/{note_id}/export" },
+  materialDeepAudio:   { method: "POST",   path: "/api/materials/{material_id}/deep-audio" },
+  toolsGenerate:       { method: "POST",   path: "/api/tools/generate" },
+  artifactFile:        { method: "GET",    path: "/api/artifacts/{filename}" }
 };
 
 /**
@@ -321,6 +329,80 @@ const ApiService = {
       pathParams: { material_id: materialId },
       params: { user_id: userId }
     });
+  },
+
+  // ── Smart Study Notes & Multimodal Artifacts ───────────────────────────────
+
+  async generateNote(req) {
+    return callApi("notesGenerate", req);
+  },
+
+  async getNotes(conceptId = null, userId = null) {
+    const params = {};
+    if (conceptId) params.concept_id = conceptId;
+    if (userId) params.user_id = userId;
+    const res = await callApi("notesList", null, { params });
+    return Array.isArray(res) ? res : (res && Array.isArray(res.notes) ? res.notes : []);
+  },
+
+  async deleteNote(noteId, userId = null) {
+    const params = {};
+    if (userId) params.user_id = userId;
+    return callApi("notesDelete", null, {
+      pathParams: { note_id: noteId },
+      params
+    });
+  },
+
+  async generateNoteAudio(noteId, userId = null) {
+    const params = {};
+    if (userId) params.user_id = userId;
+    return callApi("notesAudio", null, {
+      pathParams: { note_id: noteId },
+      params
+    });
+  },
+
+  async exportNoteArtifact(noteId, exportFormat = "pdf", userId = null) {
+    const fmt = exportFormat.toLowerCase().trim();
+    const params = { export_format: fmt };
+    if (userId) params.user_id = userId;
+    return callApi("notesExport", { export_format: fmt }, {
+      pathParams: { note_id: noteId },
+      params
+    });
+  },
+
+  async generateDeepAudio(materialId, sectionOrSlideIndex = 0, userId = null) {
+    return callApi("materialDeepAudio", {
+      section_or_slide_index: sectionOrSlideIndex,
+      user_id: userId || "default"
+    }, {
+      pathParams: { material_id: materialId }
+    });
+  },
+
+  async generateToolArtifact(toolType, conceptId, prompt = "", slideCount = 5, userId = null) {
+    return callApi("toolsGenerate", {
+      tool_type: toolType,
+      concept_id: conceptId,
+      prompt: prompt || "",
+      slide_count: slideCount,
+      user_id: userId || "default"
+    });
+  },
+
+  getArtifactUrl(pathOrFilename) {
+    if (!pathOrFilename) return "";
+    if (pathOrFilename.startsWith("http://") || pathOrFilename.startsWith("https://")) {
+      return pathOrFilename;
+    }
+    const base = getEffectiveBase();
+    let clean = pathOrFilename;
+    if (!clean.startsWith("/")) {
+      clean = `/api/artifacts/${clean}`;
+    }
+    return base ? `${base}${clean}` : clean;
   },
 
   // ── Authentication & Session Management ─────────────────────────────────────

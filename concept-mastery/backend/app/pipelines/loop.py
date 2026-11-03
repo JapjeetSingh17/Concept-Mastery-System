@@ -15,10 +15,15 @@ from typing import Dict, Any, Literal
 from langgraph.graph import StateGraph, END
 
 from ..core import store
-from ..models.schemas import LoopState, MasteryStatus, QuizSubmission
-from . import concepts, mastery, quiz, tutor
+from ..models.schemas import LoopState, MasteryStatus, QuizSubmission, TutorChatResponse
+from . import concepts, mastery, quiz, tutor, tools
 
 logger = logging.getLogger("concept_mastery.loop")
+
+
+class TutorResponse(TutorChatResponse):
+    """Container for tutor responses within the closed loop, containing artifacts and external_links."""
+    pass
 
 MAX_REMEDIAL_ITERATIONS = 3
 
@@ -190,6 +195,22 @@ def remedial_reteach_node(state: LoopState) -> LoopState:
 
     lesson = tutor.reteach(root_cause_cid, user_id=user_id)
     state["remedial_lesson"] = lesson
+
+    # Attach artifacts and external_links to state for rich remediation
+    artifacts = list(state.get("artifacts", []))
+    external_links = list(state.get("external_links", []))
+    try:
+        vis_art = tools.generate_visual_diagram_tool(root_cause_cid, prompt="Remedial diagram", user_id=user_id)
+        if vis_art:
+            artifacts.append(vis_art)
+        res_data = tools.suggest_curated_resources_tool(root_cause_cid, user_id=user_id)
+        if res_data and "resources" in res_data:
+            external_links.extend(res_data["resources"])
+    except Exception as e:
+        logger.warning(f"Failed generating remedial artifacts/links: {e}")
+
+    state["artifacts"] = artifacts
+    state["external_links"] = external_links
     state["next_step"] = "ASSESS"
     return state
 
@@ -201,6 +222,8 @@ def unlock_next_node(state: LoopState) -> LoopState:
 
     state["iteration_count"] = 0
     state["remedial_lesson"] = None
+    state["artifacts"] = []
+    state["external_links"] = []
 
     if successors:
         state["target_concept"] = successors[0]
@@ -308,6 +331,8 @@ def start_session(user_id: str = "default") -> dict:
         "quiz": questions[0] if questions else None,
         "quiz_count": len(questions),
         "remedial_lesson": res.get("remedial_lesson"),
+        "artifacts": res.get("artifacts", []),
+        "external_links": res.get("external_links", []),
         "reason": f"Active closed-loop step: {res.get('next_step')}",
     }
 
@@ -366,6 +391,8 @@ def submit_quiz_answer(sub: QuizSubmission) -> dict:
         "next_action": action,
         "next_concept_id": next_concept_id,
         "remedial_lesson": remedial_text,
+        "artifacts": remedial_state.get("artifacts", []) if routed == "remedial_reteach" else evaluated_state.get("artifacts", []),
+        "external_links": remedial_state.get("external_links", []) if routed == "remedial_reteach" else evaluated_state.get("external_links", []),
         "step_by_step_solution": eval_result.step_by_step_solution,
     }
 
@@ -652,4 +679,6 @@ def generate_remedial_quiz(user_id: str = "default", target_concept_id: str | No
         "target_concept": target_concept_id or root_cid,
         "root_cause_concept": root_cid,
         "remedial_lesson": lesson,
+        "artifacts": [],
+        "external_links": [],
     }

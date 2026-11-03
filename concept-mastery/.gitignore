@@ -11,6 +11,13 @@ __pycache__/
 *.env
 !.env.example
 backend/.env
+concept-mastery/backend/.env
+
+# Audio & Generated Artifacts
+*.mp3
+generated_artifacts/
+backend/generated_artifacts/
+concept-mastery/backend/generated_artifacts/
 
 # Caches
 .pytest_cache/

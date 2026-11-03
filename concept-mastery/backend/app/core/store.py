@@ -7,6 +7,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 from .. import config
 from .vector_index import VectorIndex
 
@@ -72,6 +73,25 @@ CREATE TABLE IF NOT EXISTS active_recall_sessions (
     created_at                  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_active_recall_user ON active_recall_sessions(user_id);
+
+-- Smart Notes
+CREATE TABLE IF NOT EXISTS smart_notes (
+    note_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    concept_id TEXT NOT NULL,
+    material_id TEXT,
+    task_type TEXT NOT NULL,
+    custom_instructions TEXT,
+    title TEXT NOT NULL,
+    markdown_content TEXT NOT NULL,
+    key_takeaways_json TEXT NOT NULL DEFAULT '[]',
+    citations_json TEXT NOT NULL DEFAULT '[]',
+    audio_url TEXT,
+    pdf_url TEXT,
+    pptx_url TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_smart_notes_user_concept ON smart_notes(user_id, concept_id);
 """
 
 @contextmanager
@@ -421,6 +441,180 @@ def list_active_recall_sessions(user_id: str = "default", limit: int = 50) -> li
             (user_id, limit)
         ).fetchall()
         return [dict(r) for r in rows]
+
+# ── Smart Notes Persistence ─────────────────────────────────────────────────
+
+def save_smart_note(note_data: dict) -> dict:
+    """Save or update a smart note in SQLite."""
+    init_materials_db()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    note_id = note_data.get("note_id") or f"sn_{uuid.uuid4().hex[:12]}"
+    user_id = note_data.get("user_id", "default")
+    concept_id = note_data.get("concept_id", "")
+    material_id = note_data.get("material_id")
+    task_type = note_data.get("task_type", "exam")
+    custom_instructions = note_data.get("custom_instructions")
+    title = note_data.get("title") or "Smart Note"
+    markdown_content = note_data.get("markdown_content") or ""
+
+    key_takeaways_json = note_data.get("key_takeaways_json")
+    if key_takeaways_json is None:
+        key_takeaways_json = json.dumps(note_data.get("key_takeaways", []))
+    elif not isinstance(key_takeaways_json, str):
+        key_takeaways_json = json.dumps(key_takeaways_json)
+
+    citations_json = note_data.get("citations_json")
+    if citations_json is None:
+        citations_json = json.dumps(note_data.get("citations", []))
+    elif not isinstance(citations_json, str):
+        citations_json = json.dumps(citations_json)
+
+    audio_url = note_data.get("audio_url")
+    pdf_url = note_data.get("pdf_url")
+    pptx_url = note_data.get("pptx_url")
+    created_at = note_data.get("created_at") or now_iso
+
+    with get_materials_db() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO smart_notes
+            (note_id, user_id, concept_id, material_id, task_type,
+             custom_instructions, title, markdown_content,
+             key_takeaways_json, citations_json,
+             audio_url, pdf_url, pptx_url, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                note_id, user_id, concept_id, material_id, task_type,
+                custom_instructions, title, markdown_content,
+                key_takeaways_json, citations_json,
+                audio_url, pdf_url, pptx_url, created_at
+            )
+        )
+    return {
+        "note_id": note_id,
+        "user_id": user_id,
+        "concept_id": concept_id,
+        "material_id": material_id,
+        "task_type": task_type,
+        "custom_instructions": custom_instructions,
+        "title": title,
+        "markdown_content": markdown_content,
+        "key_takeaways": json.loads(key_takeaways_json),
+        "key_takeaways_json": key_takeaways_json,
+        "citations": json.loads(citations_json),
+        "citations_json": citations_json,
+        "audio_url": audio_url,
+        "pdf_url": pdf_url,
+        "pptx_url": pptx_url,
+        "created_at": created_at,
+    }
+
+
+def get_smart_note(note_id: str, user_id: str = "default") -> Optional[dict]:
+    """Fetch a smart note by note_id, isolating by user_id with fallback."""
+    init_materials_db()
+    with get_materials_db() as conn:
+        row = None
+        if user_id:
+            row = conn.execute(
+                "SELECT * FROM smart_notes WHERE note_id = ? AND user_id = ?",
+                (note_id, user_id)
+            ).fetchone()
+        if not row:
+            row = conn.execute(
+                "SELECT * FROM smart_notes WHERE note_id = ?",
+                (note_id,)
+            ).fetchone()
+        if not row:
+            return None
+        res = dict(row)
+        try:
+            res["key_takeaways"] = json.loads(res.get("key_takeaways_json") or "[]")
+        except Exception:
+            res["key_takeaways"] = []
+        try:
+            res["citations"] = json.loads(res.get("citations_json") or "[]")
+        except Exception:
+            res["citations"] = []
+        return res
+
+
+def list_smart_notes(user_id: str = "default", concept_id: Optional[str] = None) -> list[dict]:
+    """Retrieve all smart notes for user_id, optionally filtered by concept_id."""
+    init_materials_db()
+    with get_materials_db() as conn:
+        query = "SELECT * FROM smart_notes WHERE 1=1"
+        params = []
+        if user_id:
+            query += " AND user_id = ?"
+            params.append(user_id)
+        if concept_id:
+            query += " AND (concept_id = ? OR LOWER(concept_id) = LOWER(?))"
+            params.extend([concept_id, concept_id])
+        query += " ORDER BY created_at DESC"
+        rows = conn.execute(query, tuple(params)).fetchall()
+        results = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["key_takeaways"] = json.loads(d.get("key_takeaways_json") or "[]")
+            except Exception:
+                d["key_takeaways"] = []
+            try:
+                d["citations"] = json.loads(d.get("citations_json") or "[]")
+            except Exception:
+                d["citations"] = []
+            results.append(d)
+        return results
+
+
+def delete_smart_note(note_id: str, user_id: str = "default") -> bool:
+    """Delete a smart note by ID."""
+    init_materials_db()
+    with get_materials_db() as conn:
+        if user_id:
+            res = conn.execute("DELETE FROM smart_notes WHERE note_id = ? AND user_id = ?", (note_id, user_id))
+            if res.rowcount == 0:
+                res = conn.execute("DELETE FROM smart_notes WHERE note_id = ?", (note_id,))
+        else:
+            res = conn.execute("DELETE FROM smart_notes WHERE note_id = ?", (note_id,))
+        return res.rowcount > 0
+
+
+def update_smart_note_urls(
+    note_id: str,
+    user_id: str = "default",
+    audio_url: Optional[str] = None,
+    pdf_url: Optional[str] = None,
+    pptx_url: Optional[str] = None
+) -> bool:
+    """Update artifact URLs for a smart note."""
+    init_materials_db()
+    updates = []
+    params = []
+    if audio_url is not None:
+        updates.append("audio_url = ?")
+        params.append(audio_url)
+    if pdf_url is not None:
+        updates.append("pdf_url = ?")
+        params.append(pdf_url)
+    if pptx_url is not None:
+        updates.append("pptx_url = ?")
+        params.append(pptx_url)
+
+    if not updates:
+        return False
+
+    with get_materials_db() as conn:
+        sql = f"UPDATE smart_notes SET {', '.join(updates)} WHERE note_id = ?"
+        params_with_id = list(params) + [note_id]
+        if user_id:
+            res = conn.execute(sql + " AND user_id = ?", tuple(params_with_id + [user_id]))
+            if res.rowcount > 0:
+                return True
+        res = conn.execute(sql, tuple(params_with_id))
+        return res.rowcount > 0
 
 # ── Knowledge Base Per-User Management ──────────────────────────────────────
 

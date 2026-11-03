@@ -8,11 +8,16 @@ Guardrail 2: Strictly grounded in vectorless SQLite chunks for the active concep
 from __future__ import annotations
 
 import re
+import logging
+from typing import Optional
 from ..core import store, llm, web_search
 from ..core.concept_index import GLOBAL_INDEX
 from ..core.text import NORMALIZER, tokens
 from ..models.schemas import TutorChatResponse, Citation
-from . import mastery
+from . import mastery, tools
+
+logger = logging.getLogger("concept_mastery.tutor")
+TutorResponse = TutorChatResponse
 
 SOCRATIC_GUARDRAIL_SYSTEM = """You are an expert Socratic tutor for an adaptive concept mastery platform.
 
@@ -53,6 +58,40 @@ WEB_SEARCH_TRIGGER = re.compile(
     re.IGNORECASE
 )
 
+VISUAL_INTENT_PATTERN = re.compile(
+    r"\b(diagram|visual|chart|draw|flowchart|architecture)s?\b",
+    re.IGNORECASE
+)
+
+SLIDES_INTENT_PATTERN = re.compile(
+    r"\b(ppt|pptx|slides?|presentation)s?\b",
+    re.IGNORECASE
+)
+
+PDF_INTENT_PATTERN = re.compile(
+    r"\b(pdf|handout|cheat\s*sheet(\s*file)?|download\s*notes)s?\b",
+    re.IGNORECASE
+)
+
+EXTERNAL_LINKS_INTENT_PATTERN = re.compile(
+    r"\b(youtube|video|link|article|extra\s*source|tutorial)s?\b",
+    re.IGNORECASE
+)
+
+
+def route_student_intent(message: str) -> Optional[str]:
+    """Detect keywords for visuals, slides, PDF handouts, or external links."""
+    clean = message.strip()
+    if VISUAL_INTENT_PATTERN.search(clean):
+        return "visual"
+    if SLIDES_INTENT_PATTERN.search(clean):
+        return "slides"
+    if PDF_INTENT_PATTERN.search(clean):
+        return "pdf"
+    if EXTERNAL_LINKS_INTENT_PATTERN.search(clean):
+        return "external_links"
+    return None
+
 
 def is_greeting(msg: str) -> bool:
     """Detect if student message is a conversational opener or greeting."""
@@ -71,8 +110,41 @@ def chat(
     kb = store.get_kb(user_id)
     kb_ready = kb.get("ready", False)
 
-    # 0. Conversational Greeting Handler
-    if is_greeting(clean_message):
+    # 0. Detect Student Intent for Artifacts or Curated Resources
+    detected_intent = route_student_intent(clean_message)
+    artifacts: list[dict] = []
+    external_links: list[dict] = []
+
+    active_cid = concept_id
+    if not active_cid and kb_ready:
+        for c in kb.get("concepts", []):
+            if c.get("name", "").lower() in clean_message.lower():
+                active_cid = c.get("id")
+                break
+        if not active_cid and kb.get("concepts"):
+            active_cid = kb.get("concepts")[0].get("id")
+    if not active_cid:
+        active_cid = "concept_overview"
+
+    if detected_intent:
+        try:
+            if detected_intent == "visual":
+                art = tools.generate_visual_diagram_tool(active_cid, prompt=clean_message, user_id=user_id)
+                artifacts.append(art)
+            elif detected_intent == "slides":
+                art = tools.generate_pptx_deck_tool(active_cid, user_id=user_id)
+                artifacts.append(art)
+            elif detected_intent == "pdf":
+                art = tools.generate_pdf_handout_tool(active_cid, user_id=user_id)
+                artifacts.append(art)
+            elif detected_intent == "external_links":
+                res = tools.suggest_curated_resources_tool(active_cid, query=clean_message, user_id=user_id)
+                external_links.extend(res.get("resources", []))
+        except Exception as e:
+            logger.warning(f"Error executing tool for intent '{detected_intent}': {e}")
+
+    # 0.1 Conversational Greeting Handler (unless an intent was specifically requested)
+    if is_greeting(clean_message) and not detected_intent:
         if kb_ready:
             doc_name = kb.get("file", "uploaded course material")
             concepts = [c["name"] for c in kb.get("concepts", [])[:4]]
@@ -93,6 +165,8 @@ def chat(
             citations=[],
             detected_concepts=[],
             dialogue_score=0.5,
+            artifacts=artifacts,
+            external_links=external_links,
         )
 
     wants_web_search = bool(WEB_SEARCH_TRIGGER.search(clean_message))
@@ -161,6 +235,8 @@ def chat(
                 citations=web_citations,
                 detected_concepts=[],
                 dialogue_score=0.6,
+                artifacts=artifacts,
+                external_links=external_links,
             )
 
     # 3. If no local chunks and no web results found
@@ -170,6 +246,8 @@ def chat(
             citations=[],
             detected_concepts=[],
             dialogue_score=0.5,
+            artifacts=artifacts,
+            external_links=external_links,
         )
 
     # 4. Grounded Response from Local Textbook Material
@@ -225,6 +303,8 @@ def chat(
         citations=citations,
         detected_concepts=detected,
         dialogue_score=clarity_score,
+        artifacts=artifacts,
+        external_links=external_links,
     )
 
 

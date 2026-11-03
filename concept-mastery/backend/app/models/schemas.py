@@ -183,6 +183,21 @@ class Citation(BaseModel):
     source_id: str | None = None
 
 
+class ArtifactItem(BaseModel):
+    artifact_type: Literal["visual", "pptx", "pdf", "audio"]
+    title: str
+    url: str
+    source_locator: str = ""
+    metadata: dict = Field(default_factory=dict)
+
+
+class ExternalResourceItem(BaseModel):
+    title: str
+    url: str
+    resource_type: Literal["youtube", "article"]
+    label: str = "[External Resource]"
+
+
 class TutorChatRequest(BaseModel):
     user_id: str = "default"
     concept_id: str | None = None
@@ -194,6 +209,8 @@ class TutorChatResponse(BaseModel):
     citations: list[Citation] = Field(default_factory=list)
     detected_concepts: list[str] = Field(default_factory=list)
     dialogue_score: float = 0.5
+    artifacts: list[ArtifactItem] = Field(default_factory=list)
+    external_links: list[ExternalResourceItem] = Field(default_factory=list)
 
 
 # ── 7. LangGraph Closed-Loop State ─────────────────────────────────────────
@@ -375,3 +392,42 @@ class ActiveRecallHistoryItem(BaseModel):
     retained_concepts: list[str] = Field(default_factory=list)
     missed_gaps: list[str] = Field(default_factory=list)
     created_at: str = ""
+
+
+# ── 10. Smart Notes & Tool Request Schemas ─────────────────────────────────
+
+class SmartNoteRequest(BaseModel):
+    user_id: str = "default"
+    concept_id: str
+    material_id: Optional[str] = None
+    task_type: str  # "exam" | "viva" | "quiz" | "essay" | "custom"
+    custom_instructions: Optional[str] = None
+
+
+class SmartNoteResponse(BaseModel):
+    note_id: str
+    user_id: str
+    concept_id: str
+    task_type: str
+    title: str
+    markdown_content: str
+    key_takeaways: list[str] = Field(default_factory=list)
+    citations: list[str] = Field(default_factory=list)
+    audio_url: Optional[str] = None
+    pdf_url: Optional[str] = None
+    pptx_url: Optional[str] = None
+    created_at: str = ""
+
+
+class ToolGenerateRequest(BaseModel):
+    tool_type: Literal["visual", "pptx", "pdf", "resources"]
+    concept_id: str
+    prompt: Optional[str] = ""
+    user_id: str = "default"
+    slide_count: Optional[int] = 5
+
+
+class DeepAudioRequest(BaseModel):
+    section_or_slide_index: int = 0
+    user_id: str = "default"
+

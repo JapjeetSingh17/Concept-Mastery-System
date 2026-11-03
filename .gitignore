@@ -11,6 +11,12 @@ __pycache__/
 backend/.env
 concept-mastery/backend/.env
 
+# Audio & Generated Artifacts
+*.mp3
+generated_artifacts/
+backend/generated_artifacts/
+concept-mastery/backend/generated_artifacts/
+
 # Virtual environments
 .venv/
 venv/

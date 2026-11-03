@@ -13,13 +13,15 @@ Endpoints:
 import logging
 import time
 from pathlib import Path
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Request, Depends
+from typing import Optional, Literal
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Request, Depends, Query, Body
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from . import config
-from .core import store
+from .core import store, tts
 from .core.auth import get_current_user, create_access_token, verify_google_credential
-from .pipelines import ingest, tutor, quiz, mastery, recommend, loop, concepts, active_recall
+from .pipelines import ingest, tutor, quiz, mastery, recommend, loop, concepts, active_recall, notes, tools
 from .pipelines.concepts import export_graph
 from .models.schemas import (
     UploadResponse,
@@ -44,8 +46,16 @@ from .models.schemas import (
     ActiveRecallEvaluateRequest,
     ActiveRecallResult,
     ActiveRecallHistoryItem,
+    SmartNoteRequest,
+    SmartNoteResponse,
+    ToolGenerateRequest,
+    DeepAudioRequest,
 )
 from .pipelines.ingest import UniversalMaterialIngestor
+
+# Ensure store.get_material alias exists for study materials
+if not hasattr(store, "get_material"):
+    store.get_material = store.get_study_material
 
 logger = logging.getLogger("concept_mastery.routes")
 
@@ -853,4 +863,196 @@ def delete_study_material(material_id: str, user_id: str = "default", current_us
         raise HTTPException(status_code=404, detail=str(ue))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete material: {e}")
+
+
+# ── Multimodal Artifacts & Smart Study Notes ─────────────────────────────────
+
+@router.get("/artifacts/{filename}")
+def get_generated_artifact(filename: str):
+    """Serve generated .pdf, .pptx, .svg, and .mp3 files from config.GENERATED_ARTIFACTS_DIR."""
+    safe_name = Path(filename).name
+    file_path = (config.GENERATED_ARTIFACTS_DIR / safe_name).resolve()
+    base_dir = config.GENERATED_ARTIFACTS_DIR.resolve()
+
+    if not file_path.is_file() or not str(file_path).startswith(str(base_dir)):
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    suffix = file_path.suffix.lower()
+    media_types = {
+        ".svg": "image/svg+xml",
+        ".pdf": "application/pdf",
+        ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ".mp3": "audio/mpeg",
+    }
+    media_type = media_types.get(suffix, "application/octet-stream")
+    return FileResponse(path=str(file_path), media_type=media_type)
+
+
+@router.post("/materials/{material_id}/deep-audio")
+@router.post("/materials/{material_id}/deep-audio/")
+def post_material_deep_audio(
+    material_id: str,
+    req: Optional[DeepAudioRequest] = None,
+    current_user: User = Depends(get_current_user)
+):
+    """Generate professor-style deep spoken explanation for a PDF or PPTX slide."""
+    uid = (req.user_id if req and req.user_id and req.user_id != "default" else None) or (current_user.user_id if current_user and current_user.user_id != "default" else "default")
+    section_index = req.section_or_slide_index if req else 0
+
+    mat = store.get_material(material_id, user_id=uid)
+    if not mat and uid != "default":
+        mat = store.get_material(material_id)
+    if not mat:
+        raise HTTPException(status_code=404, detail=f"Material '{material_id}' not found.")
+
+    try:
+        res = tts.generate_deep_material_audio(
+            material=mat,
+            user_id=uid,
+            section_or_slide_index=section_index
+        )
+        return res
+    except store.UserError as ue:
+        raise HTTPException(status_code=400, detail=str(ue))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate deep audio: {e}")
+
+
+@router.post("/notes/generate", response_model=SmartNoteResponse)
+@router.post("/notes/generate/", response_model=SmartNoteResponse)
+def post_notes_generate(
+    req: SmartNoteRequest,
+    current_user: User = Depends(get_current_user)
+):
+    """Generate smart study notes adhering strictly to task-type specifications."""
+    if (not req.user_id or req.user_id == "default") and (current_user and current_user.user_id and current_user.user_id != "default"):
+        req.user_id = current_user.user_id
+
+    try:
+        res = notes.generate_smart_note(req)
+        return res
+    except store.UserError as ue:
+        raise HTTPException(status_code=400, detail=str(ue))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate smart note: {e}")
+
+
+@router.post("/notes/{note_id}/audio")
+@router.post("/notes/{note_id}/audio/")
+def post_note_audio(
+    note_id: str,
+    user_id: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user)
+):
+    """Synthesize high-yield spoken audio executive summary using ElevenLabs Flash."""
+    uid = user_id or (current_user.user_id if current_user and current_user.user_id != "default" else "default")
+    try:
+        res = notes.generate_note_audio(note_id=note_id, user_id=uid)
+        return res
+    except store.UserError as ue:
+        err_msg = str(ue)
+        status = 404 if "not found" in err_msg.lower() else 400
+        raise HTTPException(status_code=status, detail=err_msg)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate note audio: {e}")
+
+
+@router.post("/notes/{note_id}/export")
+@router.post("/notes/{note_id}/export/")
+def post_note_export(
+    note_id: str,
+    export_format: Optional[str] = Query(None),
+    payload: Optional[dict] = Body(None),
+    user_id: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user)
+):
+    """Export a smart note as a PDF study handout or PPTX slide deck."""
+    fmt = (export_format or (payload.get("export_format") if isinstance(payload, dict) else None) or "pdf").lower().strip()
+    uid = (payload.get("user_id") if isinstance(payload, dict) else None) or user_id or (current_user.user_id if current_user and current_user.user_id != "default" else "default")
+    try:
+        res = notes.export_note_artifact(note_id=note_id, user_id=uid, export_format=fmt)
+        return res
+    except store.UserError as ue:
+        err_msg = str(ue)
+        status = 404 if "not found" in err_msg.lower() else 400
+        raise HTTPException(status_code=status, detail=err_msg)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to export note artifact: {e}")
+
+
+@router.get("/notes")
+@router.get("/notes/")
+def get_notes(
+    concept_id: Optional[str] = Query(None),
+    user_id: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user)
+):
+    """Retrieve saved smart study notes for the active learner."""
+    uid = user_id or (current_user.user_id if current_user and current_user.user_id != "default" else "default")
+    return store.list_smart_notes(user_id=uid, concept_id=concept_id)
+
+
+@router.delete("/notes/{note_id}")
+@router.delete("/notes/{note_id}/")
+def delete_smart_note(
+    note_id: str,
+    user_id: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user)
+):
+    """Delete a saved smart note from the archive."""
+    uid = user_id or (current_user.user_id if current_user and current_user.user_id != "default" else "default")
+    deleted = store.delete_smart_note(note_id=note_id, user_id=uid)
+    return {"ok": True, "deleted": deleted, "note_id": note_id}
+
+
+@router.post("/tools/generate")
+@router.post("/tools/generate/")
+def post_tools_generate(
+    req: ToolGenerateRequest,
+    current_user: User = Depends(get_current_user)
+):
+    """Invoke generative study tools (visual SVG diagram, PPTX deck, PDF handout, curated resources)."""
+    uid = (req.user_id if req.user_id and req.user_id != "default" else None) or (current_user.user_id if current_user and current_user.user_id != "default" else "default")
+    tool_type = req.tool_type.lower().strip()
+    try:
+        if tool_type == "visual":
+            return tools.generate_visual_diagram_tool(
+                concept_id=req.concept_id,
+                prompt=req.prompt or "",
+                user_id=uid
+            )
+        elif tool_type == "pptx":
+            return tools.generate_pptx_deck_tool(
+                concept_id=req.concept_id,
+                user_id=uid,
+                slide_count=req.slide_count or 5
+            )
+        elif tool_type == "pdf":
+            return tools.generate_pdf_handout_tool(
+                concept_id=req.concept_id,
+                user_id=uid
+            )
+        elif tool_type == "resources":
+            return tools.suggest_curated_resources_tool(
+                concept_id=req.concept_id,
+                query=req.prompt or "",
+                user_id=uid
+            )
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported tool type '{tool_type}'. Must be 'visual', 'pptx', 'pdf', or 'resources'.")
+    except store.UserError as ue:
+        raise HTTPException(status_code=400, detail=str(ue))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Tool generation failed: {e}")
+
 

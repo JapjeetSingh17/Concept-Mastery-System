@@ -54,6 +54,13 @@ GROQ_BASE_URL = _e("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 TINYFISH_API_KEY = _e("TINYFISH_API_KEY", "")
 TINYFISH_SEARCH_URL = _e("TINYFISH_SEARCH_URL", "https://api.search.tinyfish.ai")
 
+# ElevenLabs Flash v2.5 TTS
+ELEVENLABS_API_KEY = _e("ELEVENLABS_API_KEY", "")
+ELEVENLABS_MODEL_ID = _e("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5")
+ELEVENLABS_VOICE_ID = _e("ELEVENLABS_VOICE_ID", "JBFqnCBsd6RMkjVDRZzb")
+GENERATED_ARTIFACTS_DIR = (BASE / "generated_artifacts").resolve()
+GENERATED_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+
 # Legacy / Generic Provider
 LLM_PROVIDER, LLM_API_KEY, LLM_MODEL = _e("LLM_PROVIDER", "openai").lower(), _e("LLM_API_KEY"), _e("LLM_MODEL")
 LLM_BASE_URL = _e("LLM_BASE_URL", "https://api.openai.com/v1")
