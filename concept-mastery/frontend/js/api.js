@@ -261,13 +261,14 @@ const ApiService = {
     return callApi("activeRecallStart", { concept_id: conceptId, user_id: userId });
   },
 
-  async evaluateActiveRecall(conceptId, recallText, verificationAnswer = "", studyDurationSeconds = 0, userId = "default") {
+  async evaluateActiveRecall(conceptId, recallText, verificationAnswer = "", studyDurationSeconds = 0, userId = "default", sessionId = "") {
     return callApi("activeRecallEvaluate", {
       concept_id: conceptId,
       recall_text: recallText,
       verification_answer: verificationAnswer,
       study_duration_seconds: studyDurationSeconds,
-      user_id: userId
+      user_id: userId,
+      session_id: sessionId
     });
   },
 

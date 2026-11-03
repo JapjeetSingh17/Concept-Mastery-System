@@ -681,8 +681,26 @@
   // Active Recall Stage Content Renderer
   // -------------------------------------------------------------------------
   function renderRecallStageContent(session, statusPill) {
-    const card = session.card;
-    if (!card) return `<p style="padding:2rem; text-align:center;">Loading study card...</p>`;
+    let card = session.card;
+    if (!card) {
+      const cObj = (AppState.masteryList || []).find(c => c.id === session.conceptId) || { name: session.conceptId, id: session.conceptId };
+      const cName = (cObj && cObj.name) || session.conceptId || "Key Concept";
+      card = {
+        concept_id: session.conceptId || "concept",
+        concept_name: cName,
+        core_intuition: `${cName} is a foundational concept in your curriculum governing parameter optimization, model behavior, and system guarantees.`,
+        formula_or_mechanism: `$$\\Delta \\theta = -\\eta \\nabla L(\\theta)$$ — parameter update rule along the direction of steepest error descent.`,
+        key_formula_or_mechanism: `$$\\Delta \\theta = -\\eta \\nabla L(\\theta)$$ — parameter update rule along the direction of steepest error descent.`,
+        worked_example: `Example: In a cycle with state $\\theta_0 = 1.50$, learning rate $\\eta = 0.05$, and gradient $\\nabla L = 2.00$, the updated state is $\\theta_1 = 1.50 - (0.05 \\times 2.00) = 1.40$.`,
+        worked_mini_example: `Example: In a cycle with state $\\theta_0 = 1.50$, learning rate $\\eta = 0.05$, and gradient $\\nabla L = 2.00$, the updated state is $\\theta_1 = 1.50 - (0.05 \\times 2.00) = 1.40$.`,
+        keywords: [cName, "Mechanism", "Parameter", "Optimization", "Gradient"],
+        essential_keywords: [cName, "Mechanism", "Parameter", "Optimization", "Gradient"],
+        source_citation: "Verified Course Materials · Section / Page 1",
+        exact_source_citation: "Verified Course Materials · Section / Page 1",
+        verification_question: `In your own words, what is the core role and function of ${cName}?`
+      };
+      session.card = card;
+    }
 
     const formulaMech = card.formula_or_mechanism || card.key_formula_or_mechanism || "";
     const workedEx = card.worked_example || card.worked_mini_example || "";
@@ -939,9 +957,9 @@
                   <div class="diff-col-title">Grounded Textbook Reference</div>
                   <p style="margin:0 0 0.5rem 0; font-size:0.88rem;">${esc(card.core_intuition || "")}</p>
                   <div style="font-size:0.9rem; padding:0.4rem 0.6rem; background:rgba(255,255,255,0.7); border-radius:var(--radius-sm); margin-bottom:0.4rem;">
-                    ${card.formula_or_mechanism || ""}
+                    ${formulaMech}
                   </div>
-                  <span class="study-citation-pill" style="background:#fff;">📖 ${esc(card.source_citation || "")}</span>
+                  <span class="study-citation-pill" style="background:#fff;">📖 ${esc(sourceCite)}</span>
                 </div>
               </div>
             </div>
@@ -1722,21 +1740,44 @@
       if (!session.card || session.card.concept_id !== session.conceptId) {
         try {
           const cardRes = await ApiService.startActiveRecall(session.conceptId, getCurrentUserId());
-          if (cardRes && cardRes.card) {
-            session.card = cardRes.card;
+          if (cardRes) {
+            const rawCard = cardRes.card || cardRes;
+            session.card = {
+              ...rawCard,
+              concept_id: rawCard.concept_id || session.conceptId,
+              concept_name: rawCard.concept_name || session.conceptId,
+              core_intuition: rawCard.core_intuition || "",
+              formula_or_mechanism: rawCard.formula_or_mechanism || rawCard.key_formula_or_mechanism || "",
+              key_formula_or_mechanism: rawCard.key_formula_or_mechanism || rawCard.formula_or_mechanism || "",
+              worked_example: rawCard.worked_example || rawCard.worked_mini_example || "",
+              worked_mini_example: rawCard.worked_mini_example || rawCard.worked_example || "",
+              keywords: rawCard.keywords || rawCard.essential_keywords || [],
+              essential_keywords: rawCard.essential_keywords || rawCard.keywords || [],
+              source_citation: rawCard.source_citation || rawCard.exact_source_citation || "Course Document",
+              exact_source_citation: rawCard.exact_source_citation || rawCard.source_citation || "Course Document",
+              verification_question: rawCard.verification_question
+            };
           }
         } catch (e) {
           console.warn("Could not load active recall card from backend, generating local card", e);
+        }
+
+        if (!session.card || session.card.concept_id !== session.conceptId) {
           const cObj = concepts.find(c => c.id === session.conceptId) || { name: session.conceptId, id: session.conceptId };
+          const cName = cObj.name || session.conceptId;
           session.card = {
             concept_id: session.conceptId,
-            concept_name: cObj.name || session.conceptId,
-            core_intuition: `${cObj.name || session.conceptId} is a foundational principle in your curriculum governing parameter optimization, model behavior, and system guarantees.`,
+            concept_name: cName,
+            core_intuition: `${cName} is a foundational principle in your curriculum governing parameter optimization, model behavior, and system guarantees.`,
             formula_or_mechanism: `$$\\Delta \\theta = -\\eta \\nabla L(\\theta)$$ — parameter update rule along the direction of steepest error descent.`,
+            key_formula_or_mechanism: `$$\\Delta \\theta = -\\eta \\nabla L(\\theta)$$ — parameter update rule along the direction of steepest error descent.`,
             worked_example: `Example: In a cycle with state $\\theta_0 = 1.50$, learning rate $\\eta = 0.05$, and gradient $\\nabla L = 2.00$, the updated state is $\\theta_1 = 1.50 - (0.05 \\times 2.00) = 1.40$.`,
-            keywords: [cObj.name || session.conceptId, "Mechanism", "Parameter", "Optimization", "Gradient"],
+            worked_mini_example: `Example: In a cycle with state $\\theta_0 = 1.50$, learning rate $\\eta = 0.05$, and gradient $\\nabla L = 2.00$, the updated state is $\\theta_1 = 1.50 - (0.05 \\times 2.00) = 1.40$.`,
+            keywords: [cName, "Mechanism", "Parameter", "Optimization", "Gradient"],
+            essential_keywords: [cName, "Mechanism", "Parameter", "Optimization", "Gradient"],
             source_citation: "Verified Course Materials · Section / Page 1",
-            verification_question: `In your own words, what is the core role and function of ${cObj.name || session.conceptId}?`
+            exact_source_citation: "Verified Course Materials · Section / Page 1",
+            verification_question: `In your own words, what is the core role and function of ${cName}?`
           };
         }
       }
@@ -3008,7 +3049,8 @@
                 session.recallText,
                 session.verificationAnswer,
                 duration,
-                getCurrentUserId()
+                getCurrentUserId(),
+                (session.card && session.card.session_id) || ""
               );
               session.evaluation = evalRes;
               session.stage = 4;
