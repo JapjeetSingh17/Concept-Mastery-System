@@ -68,7 +68,7 @@ def chat(
 ) -> TutorChatResponse:
     """Socratic chat response grounded in vectorless chunks or live web search."""
     clean_message = message.strip()
-    kb = store.KB
+    kb = store.get_kb(user_id)
     kb_ready = kb.get("ready", False)
 
     # 0. Conversational Greeting Handler
@@ -101,9 +101,9 @@ def chat(
     retrieved_chunks = []
     if not wants_web_search:
         if concept_id:
-            retrieved_chunks = GLOBAL_INDEX.retrieve_chunks(concept_id, max_chunks=3)
+            retrieved_chunks = GLOBAL_INDEX.retrieve_chunks(concept_id, max_chunks=3, user_id=user_id)
         if not retrieved_chunks:
-            bm25_hits = GLOBAL_INDEX.search_bm25(clean_message, max_chunks=3)
+            bm25_hits = GLOBAL_INDEX.search_bm25(clean_message, max_chunks=3, user_id=user_id)
             retrieved_chunks = [hit[1] for hit in bm25_hits]
 
         if not retrieved_chunks and kb_ready:
@@ -173,8 +173,11 @@ def chat(
         )
 
     # 4. Grounded Response from Local Textbook Material
+    def _loc_str(c):
+        return getattr(c, "locator_label", None) or f"Page {c.page_number}"
+
     context_text = "\n\n".join(
-        f"[Page {c.page_number} · {c.section_title}]\n{c.text}"
+        f"[{_loc_str(c)} · {c.section_title}]\n{c.text}"
         for c in retrieved_chunks
     )
 
@@ -188,22 +191,26 @@ def chat(
     raw_answer = llm.complete(system_prompt, user_prompt, max_tokens=600)
     if not raw_answer:
         top_chunk = retrieved_chunks[0]
+        top_loc = _loc_str(top_chunk)
         raw_answer = (
-            f"Based on the study material on [Page {top_chunk.page_number}], {top_chunk.section_title} "
+            f"Based on the study material [{top_loc}], {top_chunk.section_title} "
             f"states: \"{top_chunk.text[:220]}...\"\n\n"
             f"How does this relate to your current question?"
         )
 
     citations: list[Citation] = []
-    seen_pages = set()
+    seen_locators = set()
     for c in retrieved_chunks[:3]:
-        if c.page_number not in seen_pages:
-            seen_pages.add(c.page_number)
+        loc = _loc_str(c)
+        if loc not in seen_locators:
+            seen_locators.add(loc)
             citations.append(Citation(
                 page=c.page_number,
-                snippet=c.section_title,
+                snippet=f"[{loc}] {c.section_title}",
                 text=c.text,
-                source_type="document"
+                source_type="document",
+                locator_label=loc,
+                source_id=getattr(c, "source_id", "")
             ))
 
     all_concept_names = [cn["name"] for cn in kb.get("concepts", [])] if kb_ready else []

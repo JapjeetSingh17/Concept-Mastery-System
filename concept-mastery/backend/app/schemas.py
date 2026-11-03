@@ -17,6 +17,11 @@ from .models.schemas import (
     LoopState,
     UploadResponse,
     LoopActionResponse,
+    ActiveRecallStartRequest,
+    ActiveRecallStudyCard,
+    ActiveRecallEvaluateRequest,
+    ActiveRecallResult,
+    ActiveRecallHistoryItem,
 )
 
 # Aliases for existing API compatibility

@@ -16,6 +16,12 @@
   <script defer src="vendor/katex/katex.min.js"></script>
   <script defer src="vendor/katex/auto-render.min.js"></script>
 
+  <!-- Google Identity Services SDK for Multi-Tenant Google OAuth 2.0 -->
+  <script>
+    window.GOOGLE_CLIENT_ID = "124113822819-heos1evktgvms8i6k7u5225gh83dahg5.apps.googleusercontent.com";
+  </script>
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+
   <!-- Main Design System Stylesheet -->
   <link rel="stylesheet" href="css/styles.css">
 </head>
@@ -56,6 +62,14 @@
           <path d="M16 10h.01"/>
         </svg>
         <span>AI Tutor</span>
+      </a>
+
+      <a href="#active-recall" class="nav-link" data-nav="active-recall">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 4.44-2.04"/>
+          <path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-4.44-2.04"/>
+        </svg>
+        <span>Active Recall</span>
       </a>
 
       <a href="#practice" class="nav-link" data-nav="practice">
@@ -167,13 +181,20 @@
           </svg>
         </button>
 
-        <!-- Student Profile Avatar -->
-        <div class="user-profile-badge">
+        <!-- Student Profile Avatar & Logout Dropdown -->
+        <div class="user-profile-badge" id="topbar-user-badge" title="Student Session">
           <div class="user-avatar" id="topbar-user-avatar">A</div>
           <div class="user-details">
             <span class="user-name" id="topbar-user-name">Alex</span>
-            <span class="user-status">Learner</span>
+            <span class="user-status" id="topbar-user-email">Learner</span>
           </div>
+          <button class="icon-action-btn logout-action-btn" id="logout-btn" title="Sign Out / Switch Account" aria-label="Sign Out" style="width:28px; height:28px; margin-left:6px; border-radius:50%;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+              <polyline points="16 17 21 12 16 7"/>
+              <line x1="21" y1="12" x2="9" y2="12"/>
+            </svg>
+          </button>
         </div>
       </div>
     </header>
@@ -217,6 +238,92 @@
         </button>
       </div>
       <div class="dialog-body" id="concept-modal-body"></div>
+    </div>
+  </dialog>
+
+  <!-- Native Modal Dialog for Interactive Source Material Preview -->
+  <dialog id="material-preview-modal" aria-labelledby="preview-modal-title" style="max-width: 900px; width: 92%;">
+    <div class="dialog-inner preview-dialog-inner">
+      <div class="dialog-header">
+        <div style="display:flex; align-items:center; gap:0.6rem;">
+          <span class="material-type-badge" id="preview-modal-type-badge">PDF</span>
+          <h3 id="preview-modal-title" style="margin:0; font-size:1.15rem;">Source Material Preview</h3>
+        </div>
+        <button class="dialog-close-btn" id="preview-modal-close" aria-label="Close dialog">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+      <div class="dialog-body preview-dialog-body" id="preview-modal-body">
+        <!-- Rendered dynamically: PDF pages, PPTX slides, YouTube embed + transcript, Web reader, or Audio player -->
+      </div>
+    </div>
+  </dialog>
+
+  <!-- Native Modal Dialog for Baseline Diagnostic Assessment -->
+  <dialog id="diagnostic-modal" aria-labelledby="diagnostic-modal-title" style="max-width: 760px; width: 92%; border-radius: var(--radius-xl); border: 1px solid var(--border-subtle); box-shadow: var(--shadow-modal); background: var(--surface-card);">
+    <div class="dialog-inner" style="padding: 1.75rem;">
+      <div class="modal-header" style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:1.25rem; border-bottom:1px solid var(--border-subtle); padding-bottom:1rem;">
+        <div>
+          <span class="status-pill strong" style="margin-bottom: 0.35rem; display: inline-block;">Baseline Knowledge Diagnostic</span>
+          <h3 id="diagnostic-modal-title" style="margin: 0; font-size: 1.25rem;">Initial Assessment (6 Questions)</h3>
+        </div>
+        <button class="modal-close" id="diagnostic-modal-close" aria-label="Close modal" style="background:none; border:none; font-size:1.5rem; cursor:pointer; color:var(--ink-muted);">&times;</button>
+      </div>
+      <div id="diagnostic-modal-body">
+        <!-- Rendered dynamically by app.js -->
+      </div>
+    </div>
+  </dialog>
+
+  <!-- Native Modal Dialog for Google Sign-In & Multi-Tenant Authentication Gate -->
+  <dialog id="auth-modal" aria-labelledby="auth-modal-title" style="max-width: 460px; width: 92%;">
+    <div class="dialog-inner auth-dialog-inner" style="padding: 2rem;">
+      <div style="text-align: center; margin-bottom: 1.5rem;">
+        <div class="brand-icon-wrap" style="width: 54px; height: 54px; margin: 0 auto 1rem auto; display: flex; align-items: center; justify-content: center; background: var(--surface-brand); border-radius: var(--radius-lg); color: var(--primary);">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M22 10v6M2 10l10-5 10 5-10 5z"/>
+            <path d="M6 12v5c3 3 9 3 12 0v-5"/>
+          </svg>
+        </div>
+        <h3 id="auth-modal-title" style="margin: 0 0 0.5rem 0; font-size: 1.35rem; font-family: var(--font-heading); font-weight: 700;">Student Sign-In</h3>
+        <p style="margin: 0; font-size: 0.88rem; color: var(--ink-muted); line-height: 1.45;">Sign in to access your isolated study materials, personalized prerequisite DAGs, and epistemic mastery records.</p>
+      </div>
+
+      <!-- Config Status Alert if Google Client ID is unconfigured -->
+      <div id="google-auth-tip" style="display:none; margin-bottom: 1.25rem;"></div>
+
+      <!-- Google Sign-In Button Container -->
+      <div style="display: flex; justify-content: center; margin-bottom: 1.25rem; min-height: 44px;" id="g_id_signin_wrapper">
+        <div id="g_id_signin"></div>
+      </div>
+
+      <div class="auth-divider" style="display: flex; align-items: center; text-align: center; margin: 1.25rem 0; color: var(--ink-subtle); font-size: 0.76rem; font-weight: 600; letter-spacing: 0.05em;">
+        <span style="flex: 1; border-bottom: 1px solid var(--border-subtle);"></span>
+        <span style="padding: 0 0.75rem;">OR QUICK DEV SIGN-IN</span>
+        <span style="flex: 1; border-bottom: 1px solid var(--border-subtle);"></span>
+      </div>
+
+      <!-- Dev / Offline Student Personas -->
+      <div style="display: flex; flex-direction: column; gap: 0.65rem;">
+        <button class="btn btn-outline" id="dev-login-ada" type="button" style="justify-content: flex-start; gap: 0.75rem; padding: 0.75rem 1rem; border-color: var(--border-strong);">
+          <div class="user-avatar" style="width: 32px; height: 32px; font-size: 0.85rem; background: #6366f1; color: #fff;">A</div>
+          <div style="text-align: left; line-height: 1.25;">
+            <div style="font-weight: 600; font-size: 0.88rem;">Ada Lovelace</div>
+            <div style="font-size: 0.76rem; color: var(--ink-muted);">ada.lovelace@university.edu</div>
+          </div>
+        </button>
+
+        <button class="btn btn-outline" id="dev-login-alan" type="button" style="justify-content: flex-start; gap: 0.75rem; padding: 0.75rem 1rem; border-color: var(--border-strong);">
+          <div class="user-avatar" style="width: 32px; height: 32px; font-size: 0.85rem; background: #0ea5e9; color: #fff;">T</div>
+          <div style="text-align: left; line-height: 1.25;">
+            <div style="font-weight: 600; font-size: 0.88rem;">Alan Turing</div>
+            <div style="font-size: 0.76rem; color: var(--ink-muted);">alan.turing@university.edu</div>
+          </div>
+        </button>
+      </div>
     </div>
   </dialog>
 

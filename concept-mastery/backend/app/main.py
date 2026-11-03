@@ -11,10 +11,6 @@ from .core import store
 from .pipelines import mastery
 from .routes import router
 
-# Load persisted state on boot
-store.load_kb()
-mastery.load()
-
 app = FastAPI(
     title="Closed-Loop Concept Mastery Platform",
     description="Vectorless RAG, Prerequisite Concept Graph (DAG), Socratic Guardrails, and LangGraph Engine.",

@@ -20,7 +20,28 @@ def _e(k, d=""): return os.getenv(k, d).split("#")[0].strip()
 # PageIndex API
 PAGEINDEX_API_KEY = _e("PAGEINDEX_API_KEY", "")
 
-# Primary Provider: Google Gemini
+# Google OAuth 2.0 & Session Security
+GOOGLE_CLIENT_ID = _e("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = _e("GOOGLE_CLIENT_SECRET", "")
+JWT_SECRET = _e("JWT_SECRET", "concept-mastery-jwt-secret-key-32bytes")
+JWT_ALGORITHM = _e("JWT_ALGORITHM", "HS256")
+JWT_EXPIRES_MINUTES = int(_e("JWT_EXPIRES_MINUTES", "10080"))  # 7 days
+ENVIRONMENT = _e("ENVIRONMENT", "development")
+
+# Unified OpenRouter Gateway & Fallback Models
+OPENROUTER_API_KEY = _e("OPENROUTER_API_KEY", "")
+OPENROUTER_BASE_URL = _e("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+OPENROUTER_MODELS = [
+    "google/gemini-2.5-flash",
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "deepseek/deepseek-chat-v3-0324:free",
+    "nvidia/nemotron-3.5-super-vl:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "openrouter/auto",
+]
+OPENROUTER_PRIMARY_MODEL = _e("OPENROUTER_MODEL", "google/gemini-2.5-flash")
+
+# Primary Provider: Google Gemini (Legacy/Direct)
 GEMINI_API_KEY = _e("GEMINI_API_KEY", "")
 GEMINI_MODEL = _e("GEMINI_MODEL", "gemini-3.8-flash")
 

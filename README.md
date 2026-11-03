@@ -1,13 +1,17 @@
 # Closed-Loop Concept Mastery Platform
 
 A production-grade, closed-loop educational mastery platform that solves the fundamental limitations of baseline TutorLLM architectures:
-1. **Vectorless RAG**: 100% dense-vector-free retrieval using section-based structural chunking, synonym normalization, and an inverted SQLite/BM25 index with exact page citations.
-2. **Prerequisite Concept Graph (DAG)**: Automated concept extraction and dependency mining via NetworkX, cycle breaking by earliest appearance, and topological learning path generation.
-3. **Explainable Epistemic Knowledge Tracing**: Tri-state mastery modeling (`UNKNOWN`, `WEAK`, `STRONG`) using Bayesian Beta belief distributions and uncertainty spreads, eliminating cold-start collapse and false single-check mastery.
-4. **Two-Layer Socratic Guardrails**: Pedagogical scaffolding that prevents direct answer blurting while enforcing strict citation grounding (`[Page X]`).
-5. **Closed-Loop LangGraph Engine**: Automated agentic cycle of Assessment &rarr; Diagnosis &rarr; Socratic Remediation &rarr; Re-assessment.
-6. **Multi-Model LLM Resilience**: Primary integration with Google Gemini (`gemini-3.8-flash`) and instant automated failover to Groq Cloud (`llama-3.3-70b-versatile`).
-7. **Multi-PDF Course Ingestion & Live Web Search**: Seamless batch ingestion of multiple PDFs into a unified prerequisite DAG, coupled with live web search powered by TinyFish Search API for broader queries, real-world examples, and conversational greetings.
+1. **Universal Multi-Format Ingestion**: Ingests textbooks (PDF), slide decks (PPTX), markdown notes (MD), word docs (DOCX), YouTube video lectures, educational web articles (e.g. GeeksforGeeks), and student voice lecture notes with rich interactive previews.
+2. **Vectorless RAG**: 100% dense-vector-free retrieval using section-based structural chunking, synonym normalization, and an inverted SQLite/BM25 index with exact dynamic citation anchors (`[Page X]`, `[Slide X]`, `[Timestamp MM:SS]`, `[Web Section]`).
+3. **Prerequisite Concept Graph (DAG)**: Automated concept extraction and dependency mining via NetworkX, cycle breaking by earliest appearance, and topological learning path generation scoped per authenticated learner.
+4. **Explainable Epistemic Knowledge Tracing**: Tri-state mastery modeling (`UNKNOWN`, `WEAK`, `STRONG`) using Bayesian Beta belief distributions and uncertainty spreads, eliminating cold-start collapse and false single-check mastery.
+5. **OpenRouter Unified LLM Gateway & NVIDIA Frontier Fallback**: Multi-model auto-failover across primary Google Gemini 2.5 Flash and NVIDIA frontier reasoning models (`nemotron-3-ultra-550b`, `nemotron-3.5-super-vl`, DeepSeek V3, Llama 3.3) with automated `<think>` block sanitization.
+6. **Google OAuth 2.0 Multi-Tenancy**: Complete student account isolation, session JWT issuance, login audit logging, and zero-state empty gating.
+7. **First-Run Baseline Diagnostic**: Calibrated 6-question baseline assessment across root and foundational DAG nodes to map prior knowledge before unlocking individual concept practice.
+8. **Numerical Step-by-Step Questions**: Full calculation/math problem support with given parameter grids, formula hints, tolerance-based grading, and step-by-step arithmetic derivations.
+9. **4-Stage Active Recall Engine**: Dedicated sidebar interactive learning loop: Teach Phase (structured Study Card) &rarr; Timed Focus Countdown (1m, 3m, 5m) &rarr; Notes-Hidden Blind Retrieval &rarr; AI Gap Audit & Epistemic Mastery Update.
+10. **Two-Layer Socratic Guardrails**: Pedagogical scaffolding that prevents direct answer blurting while enforcing strict citation grounding.
+11. **Closed-Loop LangGraph Engine**: Automated agentic cycle of Assessment &rarr; Diagnosis &rarr; Socratic Remediation &rarr; Re-assessment.
 
 ---
 
@@ -15,38 +19,49 @@ A production-grade, closed-loop educational mastery platform that solves the fun
 ```
                       PROPOSED CLOSED-LOOP ARCHITECTURE
                       
-  Student Study PDF
-         │
-         ▼
-  ┌────────────────────────────────────────────────┐
-  │  Section Chunker & Synonym Normalizer (rapidfuzz)│
-  └───────────────┬────────────────────────┬───────┘
-                  │                        │
-                  ▼                        ▼
-  ┌──────────────────────────────┐  ┌──────────────────────────────┐
-  │ Vectorless Inverted Index   │  │ Prerequisite Concept Graph   │
-  │ SQLite/BM25 with [Page X]   │  │ NetworkX DAG + Cycle Breaker │
-  └───────────────┬──────────────┘  └──────────────┬───────────────┘
-                  │                                │
-                  └───────────────┬────────────────┘
+   Universal Study Materials (PDF, PPTX, MD, DOCX, YouTube, Web, Audio)
+                                   │
+                                   ▼
+   ┌──────────────────────────────────────────────────────────────┐
+   │ Universal Material Ingestor & Synonym Normalizer (rapidfuzz) │
+   └───────────────┬──────────────────────────────┬───────────────┘
+                   │                              │
+                   ▼                              ▼
+   ┌──────────────────────────────┐┌──────────────────────────────┐
+   │  Vectorless Inverted Index   ││  Prerequisite Concept Graph  │
+   │  SQLite/BM25 Dynamic Anchors ││  NetworkX DAG + Cycle Breaker│
+   │  [Page X], [Slide X], [MM:SS]││  Multi-Tenant Scoped per User│
+   └───────────────┬──────────────┘└──────────────┬───────────────┘
+                   │                              │
+                   └──────────────┬───────────────┘
                                   ▼
                     ┌───────────────────────────┐
-                    │ Grounded Socratic Tutor   │
-                    │ & Diagnostic Quiz Engine  │
+                    │  Baseline Diagnostic Gate │
+                    │  (Foundational Calibration)
                     └─────────────┬─────────────┘
                                   │
                                   ▼
-                    ┌───────────────────────────┐
-                    │ Epistemic Mastery Engine  │
-                    │ (Beta Distribution &      │
-                    │  Weak vs Unknown Detector)│
-                    └─────────────┬─────────────┘
-                                  │
-                                  ▼
-                    ┌───────────────────────────┐
-                    │ Explainable Dashboard &   │
-                    │ Targeted Re-Assessment    │
-                    └───────────────────────────┘
+     ┌────────────────────────────┴───────────────────────────┐
+     ▼                                                        ▼
+┌───────────────────────────┐                            ┌───────────────────────────┐
+│ Grounded Socratic Tutor   │                            │ 4-Stage Active Recall     │
+│ & Diagnostic Quiz Engine  │                            │ (Teach -> Timer -> Blind  │
+│ (MCQ, FITB, Q&A, Numeric) │                            │  Retrieval -> Gap Audit)  │
+└─────────────┬─────────────┘                            └─────────────┬─────────────┘
+              │                                                        │
+              └───────────────────────────┬────────────────────────────┘
+                                          ▼
+                            ┌───────────────────────────┐
+                            │ Epistemic Mastery Engine  │
+                            │ (Beta Distribution &      │
+                            │  Weak vs Unknown Detector)│
+                            └─────────────┬─────────────┘
+                                          │
+                                          ▼
+                            ┌───────────────────────────┐
+                            │ Explainable Dashboard &   │
+                            │ Remedial Re-Assessment    │
+                            └───────────────────────────┘
 ```
 
 ---
@@ -55,90 +70,99 @@ A production-grade, closed-loop educational mastery platform that solves the fun
 
 ```text
 Concept-Mastery-System/
-├── Aggressive Test Suite.py     # Comprehensive 40-test suite across 5 core categories
+├── Aggressive Test Suite.py     # 40-test system-level verification suite
 ├── screenshots/                 # UI screenshots of the platform
-│   ├── dashboard.png
-│   ├── learning-path.png
-│   ├── practice.png
-│   ├── progress.png
-│   ├── tutor.png
-│   ├── upload.png
-│   └── settings.png
-├── frontend-designs/            # Figma/design reference specifications
 └── concept-mastery/             # Full application stack
     ├── backend/                 # FastAPI backend application
     │   ├── app/
-    │   │   ├── core/            # Text processing, normalizer, vectorless index
-    │   │   │   ├── concept_index.py
-    │   │   │   ├── text.py
-    │   │   │   └── store.py
+    │   │   ├── core/            # Normalizer, vectorless index, auth, persistence
+    │   │   │   ├── auth.py          # Google OAuth 2.0 & JWT session management
+    │   │   │   ├── concept_index.py # SQLite BM25 inverted index
+    │   │   │   ├── llm.py           # OpenRouter gateway & response sanitizer
+    │   │   │   ├── store.py         # SQLite materials, users, logs & sessions
+    │   │   │   ├── text.py          # Text tokenization & chunking
+    │   │   │   └── web_search.py    # TinyFish web search engine
     │   │   ├── models/          # Pydantic v2 schemas
     │   │   │   └── schemas.py
     │   │   ├── pipelines/       # Closed-loop AI pipelines
-    │   │   │   ├── concepts.py  # DAG prerequisite graph builder
-    │   │   │   ├── ingest.py    # Vectorless PDF ingestion & chunking
-    │   │   │   ├── loop.py      # LangGraph state machine & closed loop
-    │   │   │   ├── mastery.py   # Epistemic knowledge tracing engine
-    │   │   │   ├── quiz.py      # Diagnostic quiz generator & evaluator
-    │   │   │   ├── recommend.py # Prerequisite-aware recommendation engine
-    │   │   │   └── tutor.py     # Two-layer Socratic tutor
-    │   │   ├── config.py        # Centralized configuration & provider settings
+    │   │   │   ├── active_recall.py # 4-stage active recall study & gap audit engine
+    │   │   │   ├── concepts.py      # DAG prerequisite graph builder
+    │   │   │   ├── ingest.py        # Universal multi-format document ingestor
+    │   │   │   ├── loop.py          # Baseline diagnostic & LangGraph state machine
+    │   │   │   ├── mastery.py       # Epistemic knowledge tracing engine
+    │   │   │   ├── quiz.py          # Numerical, MCQ, FITB & Q&A quiz generator
+    │   │   │   ├── recommend.py     # Prerequisite-aware recommendation engine
+    │   │   │   └── tutor.py         # Two-layer Socratic grounded tutor
+    │   │   ├── config.py        # Centralized configuration & environment loader
     │   │   ├── main.py          # FastAPI app entrypoint & static mount
-    │   │   └── routes.py        # REST endpoints & API controllers
-    │   ├── tests/               # Test suites (Pytest + DeepEval)
-    │   │   ├── test_aggressive_suite.py  # 40-test system-level verification
-    │   │   └── test_closed_loop.py       # End-to-end integration tests
+    │   │   └── routes.py        # REST API endpoints & dependency injection
+    │   ├── tests/               # Pytest automated test suites
+    │   │   ├── openrouter_testcases.py         # 50 OpenRouter gateway tests
+    │   │   ├── test_baseline_diagnostic.py     # Baseline diagnostic & zero-state tests
+    │   │   ├── test_closed_loop.py             # Closed-loop lifecycle & DeepEval
+    │   │   ├── test_numerical_and_active_recall.py # Numerical math & active recall tests
+    │   │   ├── test_oauth_multi_tenancy.py     # Google OAuth & user isolation tests
+    │   │   ├── test_openrouter_gateway.py      # Gateway failover & sanitizer tests
+    │   │   └── test_universal_material_ingest.py # Multi-format loaders tests
+    │   ├── final_100_test_cases.py  # 100-test end-to-end regression battery
     │   ├── requirements.txt     # Python backend dependencies
-    │   ├── smoke_test.py        # Standalone verification runner
     │   └── synonyms.json        # Normalized domain ontology configuration
-    ├── frontend/                # Vanilla JS SPA (No node_modules required)
-    │   ├── css/                 # Modern styling & theme system
+    ├── frontend/                # Vanilla JS SPA (No build tools or node_modules needed)
+    │   ├── css/                 # Modern styling & design system
     │   │   └── styles.css
     │   ├── js/                  # SPA application controllers
-    │   │   ├── api.js           # API client with auto-port detection
-    │   │   ├── app.js           # Routing, DOM rendering & event loop
+    │   │   ├── api.js           # API client with JWT bearer injection
+    │   │   ├── app.js           # Routing, state machine, views & active recall loop
     │   │   └── mock.js          # Standalone offline mock data
     │   ├── vendor/              # Vendored KaTeX math rendering
     │   └── index.html           # Single-page application root
     └── data/                    # Persistent storage (SQLite DBs & uploads)
-        ├── uploads/             # Ingested PDF textbooks & materials
-        └── vectorstore/         # Inverted index & mastery SQLite DBs
+        ├── uploads/             # Ingested study materials
+        └── vectorstore/         # Inverted index, materials & mastery SQLite DBs
 ```
 
 ---
 
 ## Key Features
 
-### 1. Vectorless RAG
-- Strictly avoids dense vector stores (Chroma, Pinecone, FAISS).
-- Semantic section chunking preserving headers, paragraphs, and 1-indexed page boundaries.
-- RapidFuzz synonym normalizer mapping student aliases (`"SGD"`, `"loss function"`) to canonical concepts.
-- Inverted SQLite index + BM25 keyword matching for exact, deterministic chunk retrieval.
+### 1. Universal Study Material Ingestion
+- Ingests `.pdf`, `.pptx`, `.md`, `.txt`, `.docx`, YouTube links (`youtube.com`, `youtu.be`), web articles (GeeksforGeeks, documentation), and voice lecture notes (`.mp3`, `.wav`, `.m4a`, `.webm`).
+- Normalizes all content into an inverted SQLite/BM25 index preserving exact citations (`[Page 4]`, `[Slide 7]`, `[Timestamp 04:15]`, `[Web Section]`).
+- Includes an interactive **Source Material Preview** modal supporting embedded YouTube video playback, slide decks, markdown render, and audio players.
 
-### 2. Prerequisite Concept Graph (DAG)
-- Constructs a directed graph of dependencies between concepts.
-- Cycle detection with automatic topological resolution based on earliest textbook occurrence.
-- Provides prerequisite checks, learning paths, and next-concept recommendations.
+### 2. Multi-Tenant Google OAuth 2.0 & Session Security
+- Verified Google ID token sign-in with automatic student profile creation.
+- Session audit logging in `user_login_logs` tracking IP address, timestamp, and user agent.
+- Strict multi-tenant isolation across all SQLite tables, prerequisite DAGs, mastery records, and active recall sessions.
+- Zero-state empty gating: new students start with a pristine state with zero ghost concepts.
 
-### 3. Epistemic Knowledge Tracing
-- Uses Bayesian $\text{Beta}(\alpha, \beta)$ belief distributions to calculate expected mastery $\mu = \frac{\alpha}{\alpha + \beta}$.
-- Categorizes mastery into three distinct states:
-  - **`UNKNOWN`**: Low evidence (attempts $< 2$ or high uncertainty spread $\sigma > 0.22$).
-  - **`WEAK`**: High evidence of struggle ($\mu < 0.65$ after multiple attempts).
-  - **`STRONG`**: Verified mastery ($\mu \ge 0.65$ with low uncertainty).
-- Prerequisite Health Penalty: Discounts downstream mastery if parent concepts are unmastered.
+### 3. OpenRouter Unified LLM Gateway & Auto-Failover
+- Centralized completions gateway through OpenRouter (`https://openrouter.ai/api/v1/chat/completions`).
+- Prioritized native fallback routing:
+  1. `google/gemini-2.5-flash`
+  2. `nvidia/nemotron-3-ultra-550b-a55b:free`
+  3. `deepseek/deepseek-chat-v3-0324:free`
+  4. `nvidia/nemotron-3.5-super-vl:free`
+  5. `meta-llama/llama-3.3-70b-instruct:free`
+  6. `openrouter/auto`
+- Response sanitizer automatically strips `<think>...</think>` blocks and extracts clean JSON.
 
-### 4. Two-Layer Socratic Guardrails
-- Scaffolding enforcement: Never blurts out answers or solutions.
-- Grounded citations: Cites `[Page X]` and quotes source text verbatim.
-- Anti-hallucination verification through retrieved passage constraints.
+### 4. First-Run Baseline Diagnostic & Distinct Quiz Routing
+- Gating prevents jumping into random quizzes before prior knowledge is calibrated.
+- 6-question baseline test samples root and foundational DAG nodes.
+- High scores ($\ge 0.80$) mark concepts as `STRONG`, failed concepts mark as `WEAK`, and downstream unassessed concepts remain `UNKNOWN`.
+- Distinct quiz modes: Dashboard **"Start Review"** launches targeted remedial quizzes on top prerequisite bottlenecks, while **Concept Check** serves fresh non-repeating variants.
 
-### 5. Closed-Loop LangGraph Engine
-- Multi-step LangGraph state machine:
-  1. `assess`: Evaluates student submission.
-  2. `diagnose`: Pinpoints misconceptions.
-  3. `remediate`: Generates targeted Socratic remediation.
-  4. `reassess`: Loops back to diagnostic quiz until concept is mastered.
+### 5. Numerical Step-by-Step Questions
+- Support for mathematical/quantitative problems across 8 concept families: Gradient Descent updates, KNN Euclidean distance, MSE loss, Cross-Entropy, Precision/Recall, Bayes' Theorem, Learning Rate schedules, and Matrix dot products.
+- Given Parameters pill grid, collapsible formula hint, numeric input, and calculation scratchpad.
+- Tolerance-based grading ($\pm 0.05$) and step-by-step arithmetic derivations displayed upon submission.
+
+### 6. 4-Stage Active Recall Engine
+- **Stage 1 (Teach Phase)**: Concept selector, structured Study Card (Core Intuition, Formula/Mechanism, Worked Example, 3–5 Essential Keywords, citation pill), and timer presets (1m, 3m, 5m).
+- **Stage 2 (Timed Study)**: Live SVG countdown ring with real-time progress and early *"Test Me Now"* skip.
+- **Stage 3 (Blind Retrieval)**: Notes completely unmounted from DOM; open-ended retrieval textarea with word counter + 1 verification check.
+- **Stage 4 (Gap Audit)**: Retrieval score donut (0–100%), green retained concept pills, red missed gap pills, memory audit against verified material, and epistemic mastery updates.
 
 ---
 
@@ -155,9 +179,9 @@ source .venv/bin/activate       # On Windows: .venv\Scripts\activate
 # Install dependencies
 pip install -r requirements.txt
 
-# Configure environment keys (optional, runs with fallback offline)
+# Configure environment keys
 cp .env.example .env
-# Edit .env with your GEMINI_API_KEY and/or GROQ_API_KEY
+# Edit .env with your OPENROUTER_API_KEY, GOOGLE_CLIENT_ID, etc.
 
 # Start FastAPI server
 uvicorn app.main:app --port 8000 --reload
@@ -166,31 +190,39 @@ uvicorn app.main:app --port 8000 --reload
 ### 2. Access the Platform
 - **Application UI**: Open [http://localhost:8000](http://localhost:8000)
 - **API Swagger Docs**: [http://localhost:8000/docs](http://localhost:8000/docs)
-- **Alternative Static Preview**: If serving the frontend from an IDE preview (e.g. port 5500), `api.js` automatically routes API traffic to `http://localhost:8000`.
 
 ---
 
-## Running Tests
+## Running Tests (195 / 195 Passing — 100%)
+
+The platform includes comprehensive test suites validating all core architectural dimensions:
 
 ```bash
 cd concept-mastery/backend
-PYTHONPATH=. .venv/bin/pytest -v
+
+# 1. Run all modular test suites (45 tests)
+pytest tests/ -v
+
+# 2. Run OpenRouter gateway test battery (50 tests)
+pytest tests/openrouter_testcases.py -v
+
+# 3. Run the end-to-end regression test battery (100 tests)
+pytest final_100_test_cases.py -v
 ```
 
-### Test Suite Coverage (96/96 Passed — 100%)
-
-The platform includes a 96-test automated test harness validating end-to-end correctness across 6 core architectural dimensions:
-
-1. **Category 1 (TC-01 – TC-08)**: 100% Vectorless RAG & Dependency Audit (zero-vector guarantee, BM25 inverted index, exact 1-indexed citations, synonym normalization)
-2. **Category 2 (TC-09 – TC-16)**: NetworkX Prerequisite DAG & Topological Progression (cycle breaking via earliest page appearance, self-loop pruning, graph serialization)
-3. **Category 3 (TC-17 – TC-24)**: Epistemic AI Mastery Engine & Tri-State Classification (LLM-as-a-Judge semantic evaluation, lucky guess detection, prerequisite propagation, explainable audit trail)
-4. **Category 4 (TC-25 – TC-32)**: Two-Layer Socratic Guardrails & Grounded Citations (prompt injection defense, answer key withholding, mandatory `[Page X]` verification)
-5. **Category 5 (TC-33 – TC-40)**: Closed-Loop LangGraph State Machine & DeepEval (remedial routing, root-cause backtracking, circuit breakers, hallucination evaluation)
-6. **Category 6 (TC-41 – TC-50)**: Quiz Session Boundaries, Skip Overflows & UI State (skip question clamping, progress bar bounds, idempotency, concurrent request stability)
-7. **Integration Suite (6 Tests)**: Multi-page PDF ingestion, DeepEval context relevancy, Socratic citations, LangGraph closed-loop cycle, and Semantic AI-as-a-Judge validation.
+| Suite | Tests | Status |
+| :--- | :---: | :---: |
+| `tests/test_baseline_diagnostic.py` | 3 | **PASSED** |
+| `tests/test_numerical_and_active_recall.py` | 14 | **PASSED** |
+| `tests/test_oauth_multi_tenancy.py` | 7 | **PASSED** |
+| `tests/test_closed_loop.py` | 7 | **PASSED** |
+| `tests/test_universal_material_ingest.py` | 8 | **PASSED** |
+| `tests/test_openrouter_gateway.py` | 6 | **PASSED** |
+| `tests/openrouter_testcases.py` | 50 | **PASSED** |
+| `final_100_test_cases.py` | 100 | **PASSED** |
+| **Total** | **195** | **100% Passed** |
 
 ---
 
 ## License
 MIT License. Created as part of the Closed-Loop Concept Mastery Platform research project.
-

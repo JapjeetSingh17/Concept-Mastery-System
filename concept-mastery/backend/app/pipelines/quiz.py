@@ -14,10 +14,11 @@ from __future__ import annotations
 import difflib
 import itertools
 import json
+import math
 import random
 import re
 import uuid
-from typing import List, Tuple, Literal
+from typing import List, Tuple, Literal, Optional
 
 from ..core import store, llm
 from ..core.concept_index import GLOBAL_INDEX
@@ -29,22 +30,247 @@ from .concepts import pattern
 _q_counter = itertools.count(1)
 # Server-side authoritative question registry
 REGISTRY: dict[str, dict] = {}
+SERVED_QUESTIONS: dict[str, list[str]] = {}
+SERVED_SENTENCES: dict[str, set[str]] = {}
+
+
+def is_mathematical_concept(concept_id: str, concept_name: str = "") -> bool:
+    """Check if concept matches mathematical or algorithmic problem domains."""
+    t = f"{concept_id} {concept_name}".lower()
+    math_keywords = (
+        "gradient", "descent", "sgd", "knn", "nearest", "euclidean", "distance",
+        "mse", "loss", "error", "entropy", "cross-entropy", "bce",
+        "precision", "recall", "f1", "bayes", "posterior", "prior", "probability",
+        "learning_rate", "schedule", "decay", "matrix", "vector", "dot", "algebra",
+        "weight", "optimization"
+    )
+    return any(k in t for k in math_keywords)
+
+
+def generate_numerical_question(
+    concept_id: str,
+    concept_name: str = "",
+    user_id: str = "default",
+    source_page: int = 1,
+) -> QuizQuestion:
+    """Generate a concept-aware numerical question for mathematical and algorithmic concepts.
+    
+    Supported concept families:
+      1. Gradient descent weight update
+      2. KNN Euclidean distance
+      3. MSE loss
+      4. Cross-Entropy loss
+      5. Precision / Recall
+      6. Bayes' Theorem
+      7. Learning rate schedule
+      8. Matrix dot products
+    """
+    qid = f"num_{uuid.uuid4().hex[:8]}"
+    text_target = f"{concept_id} {concept_name}".lower().replace("-", "_")
+
+    if any(k in text_target for k in ("gradient", "descent", "sgd", "weight_update", "backprop")):
+        w0 = round(random.choice([1.0, 1.5, 2.0, 2.5, 3.0]), 2)
+        alpha = round(random.choice([0.01, 0.05, 0.1, 0.2]), 2)
+        g = round(random.choice([1.2, 2.0, 2.5, 3.2]), 2)
+        ans = round(w0 - (alpha * g), 2)
+        q_text = (
+            f"Given a single-weight linear model with current weight w = {w0}, learning rate α = {alpha}, "
+            f"and calculated loss gradient ∂L/∂w = {g}, compute the updated weight w_new after one gradient descent step."
+        )
+        hint = "w_new = w - α · (∂L/∂w)"
+        solution = (
+            f"Step 1: Identify given parameters: w = {w0}, α = {alpha}, ∂L/∂w = {g}.\n"
+            f"Step 2: Apply the weight update rule: w_new = w - α · (∂L/∂w).\n"
+            f"Step 3: Calculate the product: {alpha} × {g} = {alpha * g:.4f}.\n"
+            f"Step 4: Compute w_new = {w0} - {alpha * g:.4f} = {ans:.2f}."
+        )
+        params = {"current_weight": w0, "learning_rate": alpha, "gradient": g}
+        correct = ans
+
+    elif any(k in text_target for k in ("knn", "nearest_neighbor", "k_nearest", "euclidean", "distance_metric")):
+        x1, y1 = random.randint(1, 4), random.randint(1, 4)
+        dx, dy = random.choice([(3, 4), (4, 3), (6, 8), (1, 2), (2, 2)])
+        x2, y2 = x1 + dx, y1 + dy
+        ans = round(math.sqrt(dx**2 + dy**2), 2)
+        q_text = (
+            f"In a K-Nearest Neighbors (KNN) model, compute the Euclidean distance between sample point "
+            f"P1 = ({x1}, {y1}) and query point P2 = ({x2}, {y2})."
+        )
+        hint = "d(P1, P2) = √((x2 - x1)² + (y2 - y1)²)"
+        solution = (
+            f"Step 1: Compute coordinate differences: Δx = {x2} - {x1} = {dx}, Δy = {y2} - {y1} = {dy}.\n"
+            f"Step 2: Square differences: (Δx)² = {dx**2}, (Δy)² = {dy**2}.\n"
+            f"Step 3: Sum squares: {dx**2} + {dy**2} = {dx**2 + dy**2}.\n"
+            f"Step 4: Take the square root: √{dx**2 + dy**2} = {ans:.2f}."
+        )
+        params = {"x1": float(x1), "y1": float(y1), "x2": float(x2), "y2": float(y2)}
+        correct = ans
+
+    elif any(k in text_target for k in ("mse", "mean_squared_error", "l2_loss", "squared_error")):
+        y1, y2 = random.choice([2.0, 3.0, 4.0]), random.choice([4.0, 5.0, 6.0])
+        y_hat1 = round(y1 + random.choice([-1.0, 1.0, 2.0]), 1)
+        y_hat2 = round(y2 + random.choice([-2.0, -1.0, 1.0]), 1)
+        err1 = (y1 - y_hat1) ** 2
+        err2 = (y2 - y_hat2) ** 2
+        ans = round((err1 + err2) / 2.0, 2)
+        q_text = (
+            f"Calculate the Mean Squared Error (MSE) loss for a dataset with two observations: "
+            f"actual values y = [{y1}, {y2}] and model predictions ŷ = [{y_hat1}, {y_hat2}]."
+        )
+        hint = "MSE = (1/n) · Σ (y_i - ŷ_i)²"
+        solution = (
+            f"Step 1: Compute individual squared residuals:\n"
+            f"  (y1 - ŷ1)² = ({y1} - {y_hat1})² = {err1:.2f}\n"
+            f"  (y2 - ŷ2)² = ({y2} - {y_hat2})² = {err2:.2f}\n"
+            f"Step 2: Take the average: ({err1:.2f} + {err2:.2f}) / 2 = {ans:.2f}."
+        )
+        params = {"y1": y1, "y_hat1": y_hat1, "y2": y2, "y_hat2": y_hat2}
+        correct = ans
+
+    elif any(k in text_target for k in ("cross_entropy", "log_loss", "bce", "entropy")):
+        p = random.choice([0.60, 0.70, 0.75, 0.80, 0.85, 0.90])
+        ans = round(-math.log(p), 2)
+        q_text = (
+            f"For a binary classification instance where true class label y = 1, the model outputs "
+            f"predicted probability p(y=1) = {p:.2f}. Compute the Binary Cross-Entropy loss."
+        )
+        hint = "BCE = -[y · ln(p) + (1 - y) · ln(1 - p)] = -ln(p) for y = 1"
+        solution = (
+            f"Step 1: For ground truth y = 1, BCE reduces to -ln(p).\n"
+            f"Step 2: Calculate natural log: ln({p:.2f}) ≈ {math.log(p):.4f}.\n"
+            f"Step 3: Negate: -({math.log(p):.4f}) = {ans:.2f}."
+        )
+        params = {"true_label_y": 1.0, "predicted_probability_p": p}
+        correct = ans
+
+    elif any(k in text_target for k in ("precision", "recall", "f1", "confusion_matrix", "classification_metric")):
+        tp = random.choice([70, 80, 90])
+        fp = random.choice([10, 20, 30])
+        fn = random.choice([10, 15, 20])
+        if "recall" in text_target:
+            metric = "Recall"
+            ans = round(tp / (tp + fn), 2)
+            hint = "Recall = TP / (TP + FN)"
+            denom = tp + fn
+            solution = (
+                f"Step 1: Identify TP = {tp}, FN = {fn}.\n"
+                f"Step 2: Compute denominator TP + FN = {tp} + {fn} = {denom}.\n"
+                f"Step 3: Calculate Recall = {tp} / {denom} = {ans:.2f}."
+            )
+        else:
+            metric = "Precision"
+            ans = round(tp / (tp + fp), 2)
+            hint = "Precision = TP / (TP + FP)"
+            denom = tp + fp
+            solution = (
+                f"Step 1: Identify TP = {tp}, FP = {fp}.\n"
+                f"Step 2: Compute denominator TP + FP = {tp} + {fp} = {denom}.\n"
+                f"Step 3: Calculate Precision = {tp} / {denom} = {ans:.2f}."
+            )
+        q_text = (
+            f"A machine learning classifier evaluates test data yielding True Positives TP = {tp}, "
+            f"False Positives FP = {fp}, and False Negatives FN = {fn}. Calculate the model's {metric}."
+        )
+        params = {"TP": float(tp), "FP": float(fp), "FN": float(fn)}
+        correct = ans
+
+    elif any(k in text_target for k in ("bayes", "bayesian", "prior", "posterior", "conditional_prob")):
+        p_a = random.choice([0.02, 0.05, 0.10])
+        p_b_given_a = random.choice([0.80, 0.90, 0.95])
+        p_b_given_not_a = random.choice([0.05, 0.10])
+        p_not_a = round(1.0 - p_a, 4)
+        p_b = round((p_b_given_a * p_a) + (p_b_given_not_a * p_not_a), 4)
+        ans = round((p_b_given_a * p_a) / p_b, 2)
+        q_text = (
+            f"Given prior probability P(A) = {p_a}, sensitivity P(B|A) = {p_b_given_a}, and "
+            f"false positive rate P(B|¬A) = {p_b_given_not_a}, compute the posterior probability P(A|B) using Bayes' Theorem."
+        )
+        hint = "P(A|B) = [P(B|A) · P(A)] / [P(B|A)·P(A) + P(B|¬A)·P(¬A)]"
+        solution = (
+            f"Step 1: Calculate total probability P(B):\n"
+            f"  P(B) = ({p_b_given_a} × {p_a}) + ({p_b_given_not_a} × {p_not_a:.2f}) = {p_b:.4f}.\n"
+            f"Step 2: Calculate numerator P(B|A) · P(A) = {p_b_given_a * p_a:.4f}.\n"
+            f"Step 3: Compute posterior P(A|B) = {p_b_given_a * p_a:.4f} / {p_b:.4f} = {ans:.2f}."
+        )
+        params = {"P_A": p_a, "P_B_given_A": p_b_given_a, "P_B_given_not_A": p_b_given_not_a}
+        correct = ans
+
+    elif any(k in text_target for k in ("learning_rate", "lr_schedule", "decay", "schedule")):
+        alpha0 = random.choice([0.1, 0.2, 0.05])
+        gamma = random.choice([0.5, 0.8, 0.9])
+        step = random.choice([2, 3])
+        ans = round(alpha0 * (gamma ** step), 2)
+        q_text = (
+            f"Under an exponential learning rate decay schedule α_t = α_0 · γ^t, calculate the decayed learning rate "
+            f"at step t = {step} given initial learning rate α_0 = {alpha0} and decay factor γ = {gamma}."
+        )
+        hint = "α_t = α_0 · γ^t"
+        solution = (
+            f"Step 1: Compute decay factor exponent: {gamma}^{step} = {gamma ** step:.4f}.\n"
+            f"Step 2: Multiply by initial learning rate: {alpha0} × {gamma ** step:.4f} = {ans:.2f}."
+        )
+        params = {"initial_lr": alpha0, "decay_rate": gamma, "step": float(step)}
+        correct = ans
+
+    else:  # Matrix dot product / Linear algebra default
+        u = [random.randint(1, 4), random.randint(1, 3), random.randint(-2, 2)]
+        v = [random.randint(1, 3), random.randint(-1, 3), random.randint(1, 4)]
+        dot = float(sum(u[i] * v[i] for i in range(3)))
+        q_text = f"Compute the dot product u · v for 3D vectors u = {u} and v = {v}."
+        hint = "u · v = u1·v1 + u2·v2 + u3·v3"
+        terms = [f"({u[i]} × {v[i]})" for i in range(3)]
+        vals = [u[i] * v[i] for i in range(3)]
+        solution = (
+            f"Step 1: Multiply corresponding vector components: {' + '.join(terms)}.\n"
+            f"Step 2: Sum component products: {' + '.join(str(val) for val in vals)} = {dot:.2f}."
+        )
+        params = {"u1": float(u[0]), "u2": float(u[1]), "u3": float(u[2]), "v1": float(v[0]), "v2": float(v[1]), "v3": float(v[2])}
+        correct = dot
+
+    q = QuizQuestion(
+        question_id=qid,
+        concept_id=concept_id,
+        question_type="numerical",
+        question_text=q_text,
+        options=[],
+        correct_option_idx=0,
+        target_blank_answer=str(correct),
+        rubric=f"Numerical calculation within ±0.05 tolerance. Step-by-step solution provided.",
+        key_terms=[str(correct)],
+        explanation=solution,
+        source_page=source_page,
+        given_parameters=params,
+        formula_hint=hint,
+        correct_numeric_answer=correct,
+        tolerance=0.05,
+        unit_or_format="Round to 2 decimal places",
+        step_by_step_solution=solution,
+    )
+    REGISTRY[qid] = q.model_dump()
+    return q
 
 
 def generate_diagnostic_quiz(
     concept_id: str,
     count: int = 3,
     question_types: list[str] | None = None,
+    user_id: str = "default",
 ) -> list[QuizQuestion]:
     """Generate diagnostic assessment items strictly from vectorless chunks for concept_id.
     
-    Produces a balanced mix across question types (MCQ, Fill-in-the-Blanks, and Typed Q&A).
+    Produces a balanced mix across question types (MCQ, Fill-in-the-Blanks, Typed Q&A, and Numerical).
+    Guarantees non-duplicate question variants across repeated calls per user and concept.
     """
-    kb = store.require()
+    kb = store.require(user_id=user_id)
     by_id = {c["id"]: c for c in kb["concepts"]}
     concept = by_id.get(concept_id)
     if not concept:
         raise store.UserError(f"Concept '{concept_id}' not found.")
+
+    history_key = f"{user_id}:{concept_id}"
+    prior_served = SERVED_QUESTIONS.setdefault(history_key, [])
+    prior_sentences = SERVED_SENTENCES.setdefault(history_key, set())
+    offset = len(prior_served)
 
     # Determine desired question types
     if question_types:
@@ -53,14 +279,14 @@ def generate_diagnostic_quiz(
         # Default single question to MCQ for legacy compatibility
         target_types = ["mcq"]
     else:
-        # Balanced rotation: mcq -> fill_in_the_blanks -> typed_qa
+        # Standard balanced rotation: mcq -> fill_in_the_blanks -> typed_qa
         cycle_types = ["mcq", "fill_in_the_blanks", "typed_qa"]
         target_types = [cycle_types[i % len(cycle_types)] for i in range(count)]
 
     # 1. Retrieve vectorless chunks for this concept
-    chunks = GLOBAL_INDEX.retrieve_chunks(concept_id, max_chunks=3)
-    if not chunks:
-        all_chunks = kb["index"].chunks
+    chunks = GLOBAL_INDEX.retrieve_chunks(concept_id, max_chunks=3, user_id=user_id)
+    if not chunks and "index" in kb and kb["index"]:
+        all_chunks = getattr(kb["index"], "chunks", [])
         chunks = [
             type("ChunkMeta", (), {
                 "chunk_id": str(all_chunks[j]["id"]),
@@ -79,51 +305,71 @@ def generate_diagnostic_quiz(
 
     # 2. Try LLM generation for diverse question types if enabled
     if llm.enabled():
-        ctx_text = "\n\n".join(f"[Page {c.page_number}] {c.text}" for c in chunks)
+        ctx_text = "\n\n".join(f"[{getattr(c, 'locator_label', None) or f'Page {c.page_number}'}] {c.text}" for c in chunks)
         system_prompt = (
             "You are a psychometric assessment designer. Generate diverse diagnostic assessment items "
-            "strictly grounded in the provided textbook context. Support three question types:\n"
+            "strictly grounded in the provided textbook context. Support four question types:\n"
             "  - 'mcq': Multiple-choice with 4 plausible options\n"
             "  - 'fill_in_the_blanks': A cloze sentence containing '_____' with 'target_blank_answer'\n"
             "  - 'typed_qa': An open-ended question testing conceptual mechanisms, with a 'rubric' and 'key_terms'\n"
+            "  - 'numerical': A parameter calculation question with 'given_parameters', 'formula_hint', 'correct_numeric_answer', and 'step_by_step_solution'\n"
             "Reply strictly with a valid JSON array only."
         )
+        avoid_clause = ""
+        if prior_served:
+            recent_list = "\n".join(f"- {q}" for q in prior_served[-5:])
+            avoid_clause = f"\nIMPORTANT: Do NOT repeat or duplicate these recently served questions:\n{recent_list}\nGenerate a fresh question with a different focus."
+
         user_prompt = (
             f"Concept to test: {concept['name']}\n"
             f"Textbook Context:\n{ctx_text}\n\n"
-            f"Generate {count} questions matching this balanced sequence of types: {target_types}.\n"
+            f"Generate {count} questions matching this balanced sequence of types: {target_types}.{avoid_clause}\n"
             f"JSON Schema:\n"
             f'[\n'
             f'  {{\n'
-            f'    "question_type": "mcq" | "fill_in_the_blanks" | "typed_qa",\n'
-            f'    "question_text": "<clear prompt or cloze sentence with _____>",\n'
+            f'    "question_type": "mcq" | "fill_in_the_blanks" | "typed_qa" | "numerical",\n'
+            f'    "question_text": "<clear prompt, cloze sentence, or numerical problem>",\n'
             f'    "options": ["<option 0>", "<option 1>", "<option 2>", "<option 3>"] (only for mcq, [] otherwise),\n'
             f'    "correct_option_idx": <0-3> (only for mcq, 0 otherwise),\n'
             f'    "target_blank_answer": "<exact missing term>" (only for fill_in_the_blanks, "" otherwise),\n'
             f'    "rubric": "<evaluation criteria for typed_qa>" (only for typed_qa, "" otherwise),\n'
             f'    "key_terms": ["<term 1>", "<term 2>"] (only for typed_qa, [] otherwise),\n'
+            f'    "given_parameters": {{"param1": 1.0}} (only for numerical, null otherwise),\n'
+            f'    "formula_hint": "<formula hint>" (only for numerical, null otherwise),\n'
+            f'    "correct_numeric_answer": <float> (only for numerical, null otherwise),\n'
+            f'    "tolerance": 0.05,\n'
+            f'    "unit_or_format": "Round to 2 decimal places",\n'
+            f'    "step_by_step_solution": "<step-by-step solution>" (only for numerical, null otherwise),\n'
             f'    "explanation": "<grounded explanation citing (p. X)>",\n'
             f'    "source_page": <int page number>\n'
             f'  }}\n'
-            f']'
+            f']\n'
+            f'Respond with ONLY a valid JSON array of objects.'
         )
 
         try:
             raw = llm.complete(system_prompt, user_prompt, max_tokens=1400)
             if raw:
-                clean_json = raw.strip()
-                if "```json" in clean_json:
-                    clean_json = clean_json.split("```json", 1)[1].split("```", 1)[0].strip()
-                elif "```" in clean_json:
-                    clean_json = clean_json.split("```", 1)[1].split("```", 1)[0].strip()
-                
-                arr = json.loads(re.search(r"\[.*\]", clean_json, re.S).group(0))
+                clean_json = llm.extract_json_payload(raw)
+                arr = json.loads(clean_json)
                 for item in arr:
                     q_type = str(item.get("question_type", "mcq")).lower()
-                    if q_type not in ("mcq", "fill_in_the_blanks", "typed_qa"):
+                    if q_type not in ("mcq", "fill_in_the_blanks", "typed_qa", "numerical"):
                         q_type = "mcq"
 
                     qid = f"diag_{uuid.uuid4().hex[:8]}"
+                    params = item.get("given_parameters")
+                    formula_hint = item.get("formula_hint")
+                    correct_num = item.get("correct_numeric_answer")
+                    if correct_num is not None:
+                        try:
+                            correct_num = float(correct_num)
+                        except Exception:
+                            correct_num = None
+                    step_sol = item.get("step_by_step_solution")
+                    tol = float(item.get("tolerance", 0.05))
+                    unit_fmt = str(item.get("unit_or_format", "Round to 2 decimal places"))
+
                     q = QuizQuestion(
                         question_id=qid,
                         concept_id=concept_id,
@@ -136,6 +382,12 @@ def generate_diagnostic_quiz(
                         key_terms=[str(t).strip() for t in item.get("key_terms", [])],
                         explanation=str(item.get("explanation", f"Grounded in page {item.get('source_page', chunks[0].page_number)}")),
                         source_page=int(item.get("source_page", chunks[0].page_number)),
+                        given_parameters=params,
+                        formula_hint=formula_hint,
+                        correct_numeric_answer=correct_num,
+                        tolerance=tol,
+                        unit_or_format=unit_fmt,
+                        step_by_step_solution=step_sol,
                     )
                     questions.append(q)
                     REGISTRY[qid] = q.model_dump()
@@ -150,7 +402,11 @@ def generate_diagnostic_quiz(
         other_concepts = [c["name"] for c in kb["concepts"] if c["id"] != concept_id]
         distractor_pool = other_concepts if len(other_concepts) >= 3 else ["Optimization", "Overfitting", "Gradient", "Loss"]
 
-        for idx, chunk in enumerate(chunks):
+        # Rotate starting chunk to ensure varied context across calls
+        chunk_start = offset % max(len(chunks), 1)
+        ordered_chunks = chunks[chunk_start:] + chunks[:chunk_start]
+
+        for chunk in ordered_chunks:
             if len(questions) >= count:
                 break
             
@@ -159,13 +415,25 @@ def generate_diagnostic_quiz(
             if not matched_sentences:
                 matched_sentences = [chunk_sentences[0]] if chunk_sentences else [chunk.text[:120]]
 
-            for sent in matched_sentences:
+            # Filter out sentences already used for this concept
+            fresh_sentences = [s for s in matched_sentences if s not in prior_sentences]
+            if not fresh_sentences:
+                # If all available sentences have been used, cycle afresh
+                prior_sentences.clear()
+                fresh_sentences = matched_sentences
+
+            # Rotate starting sentence
+            sent_start = offset % max(len(fresh_sentences), 1)
+            ordered_sentences = fresh_sentences[sent_start:] + fresh_sentences[:sent_start]
+
+            for sent in ordered_sentences:
                 if len(questions) >= count:
                     break
 
                 desired_type = target_types[len(questions) % len(target_types)]
                 qid = f"diag_{uuid.uuid4().hex[:8]}"
 
+                loc = getattr(chunk, "locator_label", None) or f"Page {chunk.page_number}"
                 if desired_type == "fill_in_the_blanks":
                     masked_text = pat.sub("_____", sent) if pat.search(sent) else f"{sent.rsplit(' ', 3)[0]} _____."
                     q = QuizQuestion(
@@ -178,7 +446,7 @@ def generate_diagnostic_quiz(
                         target_blank_answer=concept["name"],
                         rubric=f"Accepts '{concept['name']}' or exact canonical concept variations.",
                         key_terms=[concept["name"].lower()],
-                        explanation=f"Correct keyword is '{concept['name']}'. Source sentence: {sent} (p. {chunk.page_number})",
+                        explanation=f"Correct keyword is '{concept['name']}'. Source sentence: {sent} (p. {chunk.page_number}) [{loc}]",
                         source_page=chunk.page_number,
                     )
                 elif desired_type == "typed_qa":
@@ -192,7 +460,14 @@ def generate_diagnostic_quiz(
                         target_blank_answer="",
                         rubric=f"Must explain the functional role, definition, and behavior of {concept['name']}.",
                         key_terms=[concept["name"].lower()] + [t.lower() for t in tokens(concept.get("definition", "")) if len(t) > 4][:4],
-                        explanation=f"Textbook definition: {chunk.text[:220]}... (p. {chunk.page_number})",
+                        explanation=f"Textbook definition: {chunk.text[:220]}... (p. {chunk.page_number}) [{loc}]",
+                        source_page=chunk.page_number,
+                    )
+                elif desired_type == "numerical":
+                    q = generate_numerical_question(
+                        concept_id=concept_id,
+                        concept_name=concept.get("name", ""),
+                        user_id=user_id,
                         source_page=chunk.page_number,
                     )
                 else:  # MCQ
@@ -211,12 +486,14 @@ def generate_diagnostic_quiz(
                         target_blank_answer="",
                         rubric="",
                         key_terms=[],
-                        explanation=f"{sent} (p. {chunk.page_number})",
+                        explanation=f"{sent} (p. {chunk.page_number}) [{loc}]",
                         source_page=chunk.page_number,
                     )
 
                 questions.append(q)
                 REGISTRY[qid] = q.model_dump()
+                prior_served.append(q.question_text)
+                prior_sentences.add(sent)
 
     return questions
 
@@ -343,13 +620,53 @@ def evaluate_submission(sub: QuizSubmission) -> QuizResult:
         )
 
         reasoning_depth = eval_result.reasoning_depth_level
-        is_correct = (is_conceptually_sound and reasoning_depth in ("DEVELOPING", "DEEP_CONCEPTUAL") and not eval_result.remedial_recommended)
-        score = eval_result.semantic_comprehension_score if is_correct else min(eval_result.semantic_comprehension_score, 0.4)
+        if is_conceptually_sound and reasoning_depth in ("DEVELOPING", "DEEP_CONCEPTUAL"):
+            is_correct = True
+            score = max(eval_result.semantic_comprehension_score, 0.85 if reasoning_depth == "DEEP_CONCEPTUAL" else 0.70)
+        else:
+            is_correct = False
+            score = min(eval_result.semantic_comprehension_score, 0.4)
         reasoning_clarity = score
         misconceptions = eval_result.misconceptions_detected
 
         if not is_correct and not misconceptions:
             misconceptions.append(f"Incomplete explanation of {sub.concept_id} mechanism on [Page {source_page}]")
+
+    # ── Type 4: Numerical Calculation ─────────────────────────────────────────
+    elif q_type == "numerical":
+        target_num = q_data.get("correct_numeric_answer")
+        tolerance = float(q_data.get("tolerance", 0.05))
+        step_solution = q_data.get("step_by_step_solution", "")
+        unit = q_data.get("unit_or_format", "Round to 2 decimal places")
+        correct_answer_display = f"{target_num} (±{tolerance})" if target_num is not None else ""
+
+        user_val = sub.numeric_answer
+        if user_val is None:
+            raw = (sub.typed_answer or sub.student_reasoning or "").strip()
+            match = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", raw)
+            if match:
+                try:
+                    user_val = float(match.group(0))
+                except ValueError:
+                    user_val = None
+
+        user_answer_str = str(user_val) if user_val is not None else (sub.typed_answer or "No answer provided")
+        if user_val is not None and target_num is not None:
+            diff = abs(user_val - target_num)
+            is_correct = (diff <= tolerance)
+            score = 1.0 if is_correct else 0.0
+            reasoning_clarity = 1.0 if is_correct else 0.3
+            reasoning_depth = "DEEP_CONCEPTUAL" if is_correct else ("DEVELOPING" if diff <= tolerance * 2.5 else "SURFACE_ROTE")
+            if not is_correct:
+                misconceptions.append(
+                    f"Calculation error for {sub.concept_id}: expected {target_num} (±{tolerance}), received {user_answer_str} on [Page {source_page}]"
+                )
+        else:
+            is_correct = False
+            score = 0.0
+            reasoning_clarity = 0.0
+            reasoning_depth = "SURFACE_ROTE"
+            misconceptions.append(f"No valid numerical input could be parsed from submission for {sub.concept_id}.")
 
     # Authoritative multi-signal persistence
     evidence = (
@@ -358,7 +675,7 @@ def evaluate_submission(sub: QuizSubmission) -> QuizResult:
     )
 
     effective_reasoning = (
-        user_answer_str if q_type in ("fill_in_the_blanks", "typed_qa")
+        user_answer_str if q_type in ("fill_in_the_blanks", "typed_qa", "numerical")
         else (sub.student_reasoning or evidence)
     )
 
@@ -385,17 +702,18 @@ def evaluate_submission(sub: QuizSubmission) -> QuizResult:
         misconceptions=misconceptions,
         reasoning_clarity=reasoning_clarity,
         reasoning_depth_level=reasoning_depth,
+        step_by_step_solution=q_data.get("step_by_step_solution"),
     )
 
 
 # ── Compatibility Adapters for Frontend ─────────────────────────────────────
 RECENT_QUESTIONS: dict = {}
 
-def next_question(concept_id: str | None = None) -> dict:
-    """Legacy and modern next_question adapter for the frontend."""
-    kb = store.require()
+def next_question(concept_id: str | None = None, user_id: str = "default") -> dict:
+    """Legacy and modern next_question adapter for the frontend with non-duplicate generation."""
+    kb = store.require(user_id=user_id)
     target = concept_id or kb["concepts"][0]["id"]
-    qs = generate_diagnostic_quiz(target, count=1)
+    qs = generate_diagnostic_quiz(target, count=1, user_id=user_id)
     if not qs:
         raise store.UserError("Unable to build quiz question.")
     q = qs[0]
@@ -405,29 +723,48 @@ def next_question(concept_id: str | None = None) -> dict:
     RECENT_QUESTIONS[q.question_id] = {
         "correct": q.correct_option_idx,
         "conceptId": q.concept_id,
+        "concept_id": q.concept_id,
         "questionType": q.question_type,
+        "question_type": q.question_type,
         "targetBlankAnswer": q.target_blank_answer,
         "rubric": q.rubric,
         "explanation": q.explanation,
         "source_page": q.source_page,
+        "given_parameters": q.given_parameters,
+        "formula_hint": q.formula_hint,
+        "correct_numeric_answer": q.correct_numeric_answer,
+        "tolerance": q.tolerance,
+        "unit_or_format": q.unit_or_format,
+        "step_by_step_solution": q.step_by_step_solution,
     }
 
     return {
         "id": q.question_id,
+        "question_id": q.question_id,
         "conceptId": q.concept_id,
+        "concept_id": q.concept_id,
         "conceptName": c_name,
+        "concept_name": c_name,
         "questionType": q.question_type,
+        "question_type": q.question_type,
         "question": q.question_text,
+        "question_text": q.question_text,
         "options": q.options,
         "correct": q.correct_option_idx,
+        "correct_option_idx": q.correct_option_idx,
         "targetBlankAnswer": q.target_blank_answer,
         "rubric": q.rubric,
         "explanation": q.explanation,
         "sourcePage": q.source_page,
+        "source_page": q.source_page,
+        "givenParameters": q.given_parameters,
+        "formulaHint": q.formula_hint,
+        "unitOrFormat": q.unit_or_format,
+        "stepByStepSolution": q.step_by_step_solution,
     }
 
 
-def evaluate_answer(student_answer: str, concept_id: str, question_text: str = "", ground_truth: str = "") -> dict:
+def evaluate_answer(student_answer: str, concept_id: str, question_text: str = "", ground_truth: str = "", user_id: str = "default") -> dict:
     """Evaluate free-form student text."""
     raw_ans = (student_answer or "").strip()
     if not raw_ans:
@@ -439,8 +776,9 @@ def evaluate_answer(student_answer: str, concept_id: str, question_text: str = "
         }
 
     concept_obj = None
-    if store.KB.get("ready"):
-        for c in store.KB.get("concepts", []):
+    kb = store.get_kb(user_id)
+    if kb.get("ready"):
+        for c in kb.get("concepts", []):
             if c.get("id") == concept_id or c.get("name", "").lower() == concept_id.lower():
                 concept_obj = c
                 break

@@ -12,11 +12,11 @@ def _lesson(c, chunks, use_llm):
             return t
     return " ".join(sentences(chunks[ids[0]]["text"])[:2])
 
-def recommend() -> dict:
-    kb = store.KB
+def recommend(user_id: str = "default") -> dict:
+    kb = store.get_kb(user_id)
     if not kb.get("ready"):
         return {"actions": [], "ready": False}
-    snap, by = {s["id"]: s for s in mastery.snapshot()}, {c["id"]: c for c in kb["concepts"]}
+    snap, by = {s["id"]: s for s in mastery.snapshot(user_id)}, {c["id"]: c for c in kb["concepts"]}
     pre, chunks = mastery.prereqs(kb["edges"]), kb["index"].chunks
     actions, llm_budget = [], 3
     for cid in mastery.ranked(kb["concepts"], kb["edges"]):

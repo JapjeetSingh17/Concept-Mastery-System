@@ -48,6 +48,12 @@ CREATE TABLE IF NOT EXISTS user_concept_mastery (
     audit_trail         TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (user_id, concept_id)
 );
+CREATE TABLE IF NOT EXISTS user_lifecycle (
+    user_id                     TEXT PRIMARY KEY,
+    lifecycle_state             TEXT NOT NULL DEFAULT 'AWAITING_UPLOAD',
+    diagnostic_completed_at     TEXT,
+    updated_at                  TEXT
+);
 """
 
 
@@ -162,7 +168,7 @@ def get_db():
 
 def init_db():
     with get_db() as conn:
-        conn.execute(_CREATE_TABLE_SQL)
+        conn.executescript(_CREATE_TABLE_SQL)
         # Migrate schema if table existed from an earlier version
         cols = [col[1] for col in conn.execute("PRAGMA table_info(user_concept_mastery)").fetchall()]
         if "prereq_health" not in cols:
@@ -326,21 +332,12 @@ Quiz Attempt:
 - Is Correct: {latest_item.get('is_correct', True)}
 - Student Reasoning: "{student_reasoning}"
 
-Respond strictly with a single JSON object."""
+Respond strictly with a single JSON object containing exact keys:
+"concept_id", "epistemic_status" ("UNKNOWN"|"WEAK"|"STRONG"), "semantic_comprehension_score" (float 0.0 to 1.0), "misconceptions_detected" (list of strings), "reasoning_depth_level" ("SURFACE_ROTE"|"DEVELOPING"|"DEEP_CONCEPTUAL"), "remedial_recommended" (boolean), "explainable_audit_trail" (string)."""
         try:
             raw_response = llm.complete(system=EPISTEMIC_JUDGE_SYSTEM, user=user_prompt, max_tokens=1000)
             if raw_response:
-                clean_json = raw_response.strip()
-                if "```json" in clean_json:
-                    clean_json = clean_json.split("```json", 1)[1].split("```", 1)[0].strip()
-                elif "```" in clean_json:
-                    clean_json = clean_json.split("```", 1)[1].split("```", 1)[0].strip()
-                
-                # Robust extraction of the innermost JSON object
-                json_match = re.search(r"\{.*\}", clean_json, re.DOTALL)
-                if json_match:
-                    clean_json = json_match.group(0)
-                
+                clean_json = llm.extract_json_payload(raw_response)
                 parsed = json.loads(clean_json)
                 
                 # Enforce architectural safety constraints on LLM outputs
@@ -353,8 +350,8 @@ Respond strictly with a single JSON object."""
                         "Compromised foundation: Prerequisite concept in DAG is marked WEAK."
                     ]
                 
-                # Check for sustained demonstration without misconceptions
-                has_misconceptions = bool(parsed.get("misconceptions_detected"))
+                # Check for sustained demonstration without active misconceptions
+                has_misconceptions = bool(parsed.get("misconceptions_detected")) and not latest_item.get("is_correct", False)
                 llm_score = float(parsed.get("semantic_comprehension_score", score))
                 if (
                     status == "WEAK"
@@ -362,22 +359,30 @@ Respond strictly with a single JSON object."""
                     and not lucky_guess
                     and not has_misconceptions
                     and attempt_count >= 2
-                    and (llm_score >= 0.68 or score >= 0.68)
+                    and (llm_score >= 0.65 or score >= 0.65)
                 ):
                     status = "STRONG"
                     parsed["remedial_recommended"] = False
                 
+                audit_trail = parsed.get(
+                    "explainable_audit_trail",
+                    f"Attempt #{attempt_count} on {question_id} [Page {page_ref}]: Evaluated by AI Judge."
+                )
+                if lucky_guess and "lucky" not in audit_trail.lower():
+                    audit_trail = f"Lucky guess detected: {audit_trail}"
+
+                final_score = float(parsed.get("semantic_comprehension_score", score))
+                if status == "STRONG":
+                    final_score = max(final_score, score, 0.70)
+
                 return MasteryEvaluationResult(
                     concept_id=concept_id,
                     epistemic_status=status,
-                    semantic_comprehension_score=float(parsed.get("semantic_comprehension_score", 0.5)),
+                    semantic_comprehension_score=final_score,
                     misconceptions_detected=parsed.get("misconceptions_detected", []),
                     reasoning_depth_level=parsed.get("reasoning_depth_level", "DEVELOPING"),
                     remedial_recommended=bool(parsed.get("remedial_recommended", status == "WEAK")),
-                    explainable_audit_trail=parsed.get(
-                        "explainable_audit_trail",
-                        f"Attempt #{attempt_count} on {question_id} [Page {page_ref}]: Evaluated by AI Judge."
-                    ),
+                    explainable_audit_trail=audit_trail,
                 )
         except Exception as e:
             logger.warning(f"LLM-as-a-Judge semantic parsing failed ({e}), falling back to deterministic evaluator.")
@@ -482,7 +487,7 @@ def record_quiz(
     page_ref: int = 1,
 ) -> dict:
     """Update multi-signal mastery using the Semantic LLM-as-a-Judge evaluator."""
-    kb = store.KB
+    kb = store.get_kb(user_id)
     edges = kb.get("edges", [])
 
     with get_db() as conn:
@@ -568,7 +573,7 @@ def record_quiz(
 
 def record_dialogue(user_id: str, concept_id: str, clarity_score: float):
     """Record Socratic dialogue clarity score (0.0 to 1.0) and re-evaluate mastery."""
-    kb = store.KB
+    kb = store.get_kb(user_id)
     edges = kb.get("edges", [])
 
     with get_db() as conn:
@@ -599,6 +604,82 @@ def record_dialogue(user_id: str, concept_id: str, clarity_score: float):
         d["reasoning_depth"] = eval_result.reasoning_depth_level
         d["audit_trail"] = eval_result.explainable_audit_trail
         _save_row(conn, d)
+
+
+def record_active_recall(
+    user_id: str,
+    concept_id: str,
+    retrieval_score: float,
+    reasoning_depth: str = "DEVELOPING",
+    retained_concepts: list[str] | None = None,
+    missed_gaps: list[str] | None = None,
+    verification_correct: bool = True,
+    evidence_text: str = "",
+) -> dict:
+    """Record active recall evaluation and update student epistemic mastery."""
+    kb = store.get_kb(user_id)
+    edges = kb.get("edges", [])
+
+    with get_db() as conn:
+        d = _get_row(conn, concept_id, user_id)
+        d["attempt_count"] += 1
+        d["quiz_total"] += 1
+        if verification_correct:
+            d["quiz_correct"] += 1
+            d["a"] += 1.0
+        else:
+            d["b"] += 1.0
+
+        now_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        d["last_attempted_at"] = now_str
+        d["prereq_health"] = compute_prereq_health(concept_id, edges, conn, user_id)
+
+        # Build prerequisite context map
+        prereq_ids = [a for a, b in edges if b == concept_id]
+        prereq_ctx = {
+            pid: {"status": _get_row(conn, pid, user_id)["state"]}
+            for pid in prereq_ids
+        }
+
+        # Lookup concept definition
+        c_def = ""
+        for c in kb.get("concepts", []):
+            if c.get("id") == concept_id:
+                c_def = c.get("definition", "")
+                break
+
+        # Blend retrieval score with quiz accuracy
+        quiz_acc = d["quiz_correct"] / d["quiz_total"] if d["quiz_total"] > 0 else 0.5
+        effective_score = round(0.7 * retrieval_score + 0.3 * (1.0 if verification_correct else 0.0), 3)
+
+        eval_result = evaluate_mastery_semantic(
+            concept_id=concept_id,
+            concept_definition=c_def,
+            quiz_results=[{
+                "is_correct": verification_correct,
+                "quiz_accuracy": quiz_acc,
+                "student_reasoning": f"Active recall score: {retrieval_score:.2f}. Retained: {retained_concepts or []}. Depth: {reasoning_depth}",
+                "evidence_text": evidence_text or f"Active Recall: Retrieval Score {retrieval_score:.2f}",
+            }],
+            dialogue_context=d["dialogue_score"],
+            prerequisite_context=prereq_ctx,
+            attempt_count=d["attempt_count"],
+        )
+
+        d["mastery_score"] = max(eval_result.semantic_comprehension_score, effective_score) if eval_result.epistemic_status == "STRONG" else eval_result.semantic_comprehension_score
+        d["state"] = eval_result.epistemic_status
+        d["reasoning_depth"] = eval_result.reasoning_depth_level
+        d["misconceptions"] = json.dumps(missed_gaps or eval_result.misconceptions_detected)
+        d["audit_trail"] = evidence_text or eval_result.explainable_audit_trail
+
+        notes = json.loads(d.get("evidence_notes", "[]"))
+        notes.append(d["audit_trail"])
+        d["evidence_notes"] = json.dumps(notes[-15:])
+
+        _save_row(conn, d)
+
+    STATE[concept_id] = {"a": d["a"], "b": d["b"], "n": d["attempt_count"]}
+    return d
 
 
 def get_record(user_id: str, concept_id: str) -> MasteryRecord:
@@ -659,8 +740,8 @@ def load(user_id: str = "default"):
 
 def snapshot(user_id: str = "default") -> list[dict]:
     """Snapshot format consumed by frontend dashboards."""
-    kb = store.KB
-    if not kb.get("ready"):
+    kb = store.get_kb(user_id)
+    if not kb.get("ready") or not kb.get("concepts"):
         return []
 
     results = []

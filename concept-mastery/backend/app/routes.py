@@ -10,24 +10,44 @@ Endpoints:
   - All existing routes preserved for seamless SPA frontend compatibility.
 """
 
+import logging
+import time
 from pathlib import Path
-from fastapi import APIRouter, UploadFile, File, HTTPException, Request
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Request, Depends
 from pydantic import BaseModel
 
 from . import config
 from .core import store
-from .pipelines import ingest, tutor, quiz, mastery, recommend, loop
+from .core.auth import get_current_user, create_access_token, verify_google_credential
+from .pipelines import ingest, tutor, quiz, mastery, recommend, loop, concepts, active_recall
 from .pipelines.concepts import export_graph
 from .models.schemas import (
     UploadResponse,
     GraphExport,
     QuizSubmission,
+    BaselineSubmissionRequest,
     TutorChatRequest,
     TutorChatResponse,
     LearnerDashboard,
     LoopActionResponse,
     IngestStatusResponse,
+    IngestUrlRequest,
+    StudyMaterialMetadata,
+    StudyMaterialPreview,
+    MaterialsListResponse,
+    User,
+    UserLoginLog,
+    GoogleAuthRequest,
+    AuthTokenResponse,
+    ActiveRecallStartRequest,
+    ActiveRecallStudyCard,
+    ActiveRecallEvaluateRequest,
+    ActiveRecallResult,
+    ActiveRecallHistoryItem,
 )
+from .pipelines.ingest import UniversalMaterialIngestor
+
+logger = logging.getLogger("concept_mastery.routes")
 
 router = APIRouter(prefix="/api")
 
@@ -36,7 +56,74 @@ router = APIRouter(prefix="/api")
 
 @router.get("/health")
 def health():
-    return {"ok": True, "service": "concept-mastery-platform", "version": "2.0.0"}
+    return {
+        "ok": True,
+        "service": "concept-mastery-platform",
+        "version": "2.0.0",
+        "google_client_id": config.GOOGLE_CLIENT_ID,
+        "google_auth_configured": bool(config.GOOGLE_CLIENT_ID)
+    }
+
+
+# ── Authentication & Student Profiles ─────────────────────────────────────
+
+@router.get("/auth/config")
+def get_auth_config():
+    """Return public OAuth configuration for frontend initialization."""
+    return {
+        "google_client_id": config.GOOGLE_CLIENT_ID,
+        "google_auth_configured": bool(config.GOOGLE_CLIENT_ID)
+    }
+
+@router.post("/auth/google", response_model=AuthTokenResponse)
+@router.post("/auth/google/", response_model=AuthTokenResponse)
+def post_auth_google(req: GoogleAuthRequest, request: Request):
+    """Verify Google ID Token credential, upsert student account, log session, and issue session JWT."""
+    idinfo = verify_google_credential(req.credential)
+    user_id = idinfo["sub"]
+    email = idinfo["email"]
+    full_name = idinfo.get("name", "")
+    picture_url = idinfo.get("picture", "")
+
+    user_dict = store.upsert_user(
+        user_id=user_id,
+        email=email,
+        full_name=full_name,
+        picture_url=picture_url
+    )
+
+    client_ip = request.client.host if request.client else None
+    user_agent = request.headers.get("User-Agent")
+    store.record_login_log(user_id=user_id, ip_address=client_ip, user_agent=user_agent)
+
+    token = create_access_token({"sub": user_id, "email": email, "name": full_name, "picture": picture_url})
+    return AuthTokenResponse(
+        access_token=token,
+        token_type="bearer",
+        user=User(**user_dict)
+    )
+
+
+@router.get("/auth/me")
+@router.get("/auth/me/")
+def get_auth_me(current_user: User = Depends(get_current_user)):
+    """Return profile and active session for the authenticated student."""
+    logs = store.get_user_login_logs(current_user.user_id, limit=5)
+    return {
+        "authenticated": True,
+        "user": current_user,
+        "recent_logins": logs
+    }
+
+
+@router.get("/auth/logs")
+@router.get("/auth/logs/")
+def get_auth_logs(current_user: User = Depends(get_current_user)):
+    """Return full login activity trail for the active student."""
+    return {
+        "user_id": current_user.user_id,
+        "logs": store.get_user_login_logs(current_user.user_id)
+    }
 
 
 # ── 1. Document Ingestion & Vectorless Index ───────────────────────────────
@@ -146,22 +233,33 @@ def post_ingest_sample():
 
 @router.get("/concepts/graph")
 @router.get("/concepts/graph/")
-def get_concepts_graph(user_id: str = "default"):
+def get_concepts_graph(user_id: str = "default", current_user: User = Depends(get_current_user)):
     """Return full DAG nodes, directed edges, and user mastery states."""
-    snap = mastery.snapshot(user_id)
+    uid = current_user.user_id if current_user and current_user.user_id != "default" and user_id == "default" else user_id
+    kb = store.get_kb(uid)
+    mats = store.list_study_materials(uid)
+    if not mats and not kb.get("ready"):
+        return {"nodes": [], "edges": [], "learning_path": []}
+    if not kb.get("ready") or not kb.get("concepts"):
+        return {"nodes": [], "edges": [], "learning_path": []}
+    snap = mastery.snapshot(uid)
     mastery_map = {s["id"]: s["state"] for s in snap}
-    return export_graph(mastery_map)
+    return export_graph(mastery_map, user_id=uid)
 
 
 @router.get("/graph")
-def get_graph():
+def get_graph(user_id: str = "default", current_user: User = Depends(get_current_user)):
     """Legacy graph endpoint for existing frontend view."""
-    kb = store.KB
+    uid = current_user.user_id if current_user and current_user.user_id != "default" and user_id == "default" else user_id
+    mats = store.list_study_materials(uid)
+    if not mats:
+        return {"nodes": [], "edges": []}
+    kb = store.get_kb(uid)
     if not kb.get("ready"):
         return {"nodes": [], "edges": []}
     return {
-        "nodes": [{k: c[k] for k in ("id", "name", "x", "y")} for c in kb["concepts"]],
-        "edges": kb["edges"]
+        "nodes": [{k: c[k] for k in ("id", "name", "x", "y")} for c in kb.get("concepts", [])],
+        "edges": kb.get("edges", [])
     }
 
 
@@ -169,12 +267,13 @@ def get_graph():
 
 @router.post("/tutor/chat", response_model=TutorChatResponse)
 @router.post("/tutor/chat/", response_model=TutorChatResponse)
-def post_tutor_chat(req: TutorChatRequest):
+def post_tutor_chat(req: TutorChatRequest, current_user: User = Depends(get_current_user)):
     """Grounded Socratic conversational endpoint with two-layer anti-hallucination guardrails."""
+    uid = current_user.user_id if current_user and current_user.user_id != "default" and req.user_id == "default" else req.user_id
     return tutor.chat(
         message=req.message,
         concept_id=req.concept_id,
-        user_id=req.user_id,
+        user_id=uid,
     )
 
 
@@ -206,17 +305,49 @@ def post_web_search(req: WebSearchRequest):
 
 @router.post("/quiz/submit")
 @router.post("/quiz/submit/")
-def post_quiz_submit(sub: QuizSubmission):
+def post_quiz_submit(sub: QuizSubmission, current_user: User = Depends(get_current_user)):
     """Submit quiz option + reasoning, trigger LangGraph evaluation, return next adaptive action."""
+    if sub.user_id == "default" and current_user and current_user.user_id != "default":
+        sub.user_id = current_user.user_id
     return loop.submit_quiz_answer(sub)
 
 
 class LegacyQuizReq(BaseModel):
     conceptId: str | None = None
+    concept_id: str | None = None
+    user_id: str | None = None
 
 @router.post("/quiz/next")
-def legacy_quiz_next(body: LegacyQuizReq):
-    return quiz.next_question(body.conceptId)
+@router.post("/quiz/next/")
+def legacy_quiz_next(body: LegacyQuizReq = LegacyQuizReq(), current_user: User = Depends(get_current_user)):
+    """Generate fresh non-duplicate question variants for Concept Check."""
+    uid = current_user.user_id if current_user and current_user.user_id != "default" else (body.user_id if body and body.user_id else "default")
+    cid = body.conceptId or body.concept_id
+    try:
+        return quiz.next_question(cid, user_id=uid)
+    except store.UserError as ue:
+        raise HTTPException(status_code=400, detail=str(ue))
+
+
+class RemedialQuizReq(BaseModel):
+    conceptId: str | None = None
+    concept_id: str | None = None
+    user_id: str | None = "default"
+
+@router.post("/quiz/remedial")
+@router.post("/quiz/remedial/", include_in_schema=False)
+def post_quiz_remedial(body: RemedialQuizReq = RemedialQuizReq(), current_user: User = Depends(get_current_user)):
+    """Generate a targeted remedial quiz for the student's top WEAK prerequisite root cause."""
+    uid = current_user.user_id if current_user and current_user.user_id != "default" else (body.user_id if body and body.user_id else "default")
+    cid = body.conceptId or body.concept_id
+    try:
+        res = loop.generate_remedial_quiz(user_id=uid, target_concept_id=cid)
+        if "question" not in res or not isinstance(res["question"], dict):
+            res["question"] = dict(res)
+        res["ok"] = True
+        return res
+    except store.UserError as ue:
+        raise HTTPException(status_code=400, detail=str(ue))
 
 
 class LegacyAnswer(BaseModel):
@@ -226,9 +357,12 @@ class LegacyAnswer(BaseModel):
     selectedIndex: int | None = None
     studentReasoning: str | None = None
     typedAnswer: str | None = None
+    numericAnswer: float | None = None
+    numeric_answer: float | None = None
 
 @router.post("/quiz/answer")
 def legacy_quiz_answer(body: LegacyAnswer):
+    num_val = body.numericAnswer if body.numericAnswer is not None else body.numeric_answer
     sub = QuizSubmission(
         user_id="default",
         question_id=body.questionId or "legacy_q",
@@ -236,6 +370,7 @@ def legacy_quiz_answer(body: LegacyAnswer):
         selected_option_idx=body.selectedIndex,
         typed_answer=body.typedAnswer or "",
         student_reasoning=body.studentReasoning or (body.typedAnswer or ""),
+        numeric_answer=num_val,
     )
     res = loop.submit_quiz_answer(sub)
     q_data = quiz.REGISTRY.get(sub.question_id, quiz.RECENT_QUESTIONS.get(sub.question_id, {}))
@@ -251,6 +386,7 @@ def legacy_quiz_answer(body: LegacyAnswer):
         "correct_answer_display": res.get("correct_answer_display", ""),
         "user_answer": res.get("user_answer", ""),
         "reasoning_depth_level": res.get("reasoning_depth_level", "DEVELOPING"),
+        "step_by_step_solution": res.get("step_by_step_solution") or q_data.get("step_by_step_solution"),
     }
 
 
@@ -270,23 +406,148 @@ def legacy_quiz_evaluate(body: LegacyEvaluateReq):
     )
 
 
+# ── 4.5 Active Recall Pipeline ─────────────────────────────────────────────
+
+@router.post("/active-recall/start", response_model=ActiveRecallStudyCard)
+@router.post("/active-recall/start/", response_model=ActiveRecallStudyCard)
+def post_active_recall_start(req: ActiveRecallStartRequest, current_user: User = Depends(get_current_user)):
+    """Initialize an Active Recall study session with grounded Study Card & verification question."""
+    uid = current_user.user_id if current_user and current_user.user_id != "default" and req.user_id == "default" else req.user_id
+    try:
+        return active_recall.start_session(
+            user_id=uid,
+            concept_id=req.concept_id,
+            timer_seconds=req.timer_seconds,
+        )
+    except store.UserError as ue:
+        raise HTTPException(status_code=400, detail=str(ue))
+    except Exception as e:
+        logger.error(f"Failed to start active recall session: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to start active recall session: {e}")
+
+
+@router.post("/active-recall/evaluate", response_model=ActiveRecallResult)
+@router.post("/active-recall/evaluate/", response_model=ActiveRecallResult)
+def post_active_recall_evaluate(req: ActiveRecallEvaluateRequest, current_user: User = Depends(get_current_user)):
+    """Evaluate student active recall retrieval text & verification answer using AI Mastery Judge."""
+    uid = current_user.user_id if current_user and current_user.user_id != "default" and req.user_id == "default" else req.user_id
+    try:
+        return active_recall.evaluate_session(
+            user_id=uid,
+            session_id=req.session_id,
+            concept_id=req.concept_id,
+            recall_text=req.recall_text,
+            verification_answer=req.verification_answer,
+        )
+    except store.UserError as ue:
+        raise HTTPException(status_code=400, detail=str(ue))
+    except Exception as e:
+        logger.error(f"Failed to evaluate active recall session: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to evaluate active recall session: {e}")
+
+
+@router.get("/active-recall/history", response_model=list[ActiveRecallHistoryItem])
+@router.get("/active-recall/history/", response_model=list[ActiveRecallHistoryItem])
+def get_active_recall_history(user_id: str = "default", current_user: User = Depends(get_current_user)):
+    """Retrieve active recall session history for active learner."""
+    uid = current_user.user_id if current_user and current_user.user_id != "default" and user_id == "default" else user_id
+    return active_recall.get_history(user_id=uid)
+
+
 # ── 5. Epistemic Mastery Engine & Learner Dashboard ────────────────────────
 
 @router.get("/dashboard/{user_id}", response_model=LearnerDashboard)
 @router.get("/dashboard/{user_id}/", response_model=LearnerDashboard)
-def get_user_dashboard(user_id: str):
+def get_user_dashboard(user_id: str, current_user: User = Depends(get_current_user)):
     """Return explainable learner dashboard with UNKNOWN, WEAK, and STRONG concept buckets."""
-    return mastery.get_dashboard(user_id)
+    uid = user_id if user_id != "default" else (current_user.user_id if current_user else "default")
+    kb = store.get_kb(uid)
+    if not kb.get("ready") or not kb.get("concepts"):
+        return LearnerDashboard(
+            user_id=uid,
+            strong=[],
+            weak=[],
+            unknown=[],
+            overall_score=0.0,
+            total_concepts=0,
+            summary="No study materials uploaded yet. Upload a document or URL to begin."
+        )
+    return mastery.get_dashboard(uid)
 
 
 @router.get("/mastery")
-def get_mastery():
-    return {"concepts": mastery.snapshot()}
+@router.get("/mastery/")
+def get_mastery(user_id: str = "default", current_user: User = Depends(get_current_user)):
+    """Return concepts mastery snapshot scoped to the authenticated student."""
+    uid = current_user.user_id if current_user and current_user.user_id != "default" and user_id == "default" else (current_user.user_id if current_user else user_id)
+    mats = store.list_study_materials(uid)
+    if not mats:
+        return {"concepts": []}
+    return {"concepts": mastery.snapshot(uid)}
 
 
 @router.get("/mastery/dashboard")
-def get_mastery_dashboard():
-    return mastery.get_dashboard("default").model_dump()
+@router.get("/mastery/dashboard/")
+def get_mastery_dashboard(user_id: str = "default", current_user: User = Depends(get_current_user)):
+    """Return dashboard scoped to authenticated student with status_counts and overall_mastery."""
+    uid = current_user.user_id if current_user and current_user.user_id != "default" and user_id == "default" else (current_user.user_id if current_user else user_id)
+    mats = store.list_study_materials(uid)
+    if not mats:
+        return {
+            "overall_mastery": 0,
+            "concepts": [],
+            "status_counts": {"strong": 0, "weak": 0, "unknown": 0},
+            "overall_score": 0.0,
+            "total_concepts": 0,
+            "strong": [],
+            "weak": [],
+            "unknown": [],
+            "summary": "No study materials uploaded yet. Upload a document or URL to begin."
+        }
+    dash = mastery.get_dashboard(uid)
+    snap = mastery.snapshot(uid)
+    res = dash.model_dump()
+    res["overall_mastery"] = dash.overall_score
+    res["concepts"] = snap
+    res["status_counts"] = {
+        "strong": len(dash.strong),
+        "weak": len(dash.weak),
+        "unknown": len(dash.unknown)
+    }
+    return res
+
+
+
+
+
+@router.get("/diagnostic/baseline")
+@router.get("/diagnostic/baseline/")
+@router.post("/diagnostic/baseline")
+@router.post("/diagnostic/baseline/")
+def get_or_post_diagnostic_baseline(user_id: str = "default", current_user: User = Depends(get_current_user)):
+    """Generate calibrated 6-question baseline test sampling root and foundational nodes from DAG."""
+    uid = current_user.user_id if current_user and current_user.user_id != "default" and user_id == "default" else (current_user.user_id if current_user else user_id)
+    try:
+        return loop.generate_baseline_diagnostic(user_id=uid)
+    except store.UserError as ue:
+        raise HTTPException(status_code=400, detail=str(ue))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate baseline diagnostic: {e}")
+
+
+@router.post("/diagnostic/baseline/evaluate")
+@router.post("/diagnostic/baseline/evaluate/")
+@router.post("/diagnostic/baseline/submit")
+@router.post("/diagnostic/baseline/submit/")
+def post_diagnostic_baseline_evaluate(body: BaselineSubmissionRequest, current_user: User = Depends(get_current_user)):
+    """Evaluate baseline diagnostic answers and transition learner lifecycle to ACTIVE_LEARNING."""
+    uid = current_user.user_id if current_user and current_user.user_id != "default" and body.user_id == "default" else (current_user.user_id if current_user else body.user_id)
+    try:
+        return loop.evaluate_baseline_diagnostic(user_id=uid, submissions=body.submissions)
+    except store.UserError as ue:
+        raise HTTPException(status_code=400, detail=str(ue))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to evaluate baseline diagnostic: {e}")
 
 
 @router.post("/mastery/reset")
@@ -305,9 +566,13 @@ class StartSessionReq(BaseModel):
 
 @router.post("/loop/start")
 @router.post("/loop/start/")
-def post_loop_start(body: StartSessionReq | None = None):
+def post_loop_start(body: StartSessionReq | None = None, current_user: User = Depends(get_current_user)):
     """Initialize or advance the closed-loop learning session for a student."""
-    uid = body.user_id if body else "default"
+    uid = "default"
+    if body and body.user_id != "default":
+        uid = body.user_id
+    elif current_user and current_user.user_id != "default":
+        uid = current_user.user_id
     return loop.start_session(uid)
 
 
@@ -319,3 +584,273 @@ def post_loop_next_action():
 @router.post("/recommend")
 def post_recommend():
     return recommend.recommend()
+
+
+# ── Closed-Loop Status, Diagnostic & Active Recall ─────────────────────────
+
+class DiagnosticSubmitReq(BaseModel):
+    user_id: str = "default"
+    answers: list[dict] = []
+
+
+@router.get("/loop/status")
+@router.get("/loop/status/", include_in_schema=False)
+def get_loop_status(user_id: str = "default", current_user: User = Depends(get_current_user)):
+    """Return closed-loop learning state, baseline diagnostic status, and concept count."""
+    uid = user_id if user_id != "default" else (current_user.user_id if current_user and current_user.user_id != "default" else "default")
+    kb = store.get_kb(uid)
+    concepts_list = kb.get("concepts", []) if (kb and kb.get("ready")) else []
+    if not concepts_list:
+        return {
+            "ok": True,
+            "loop_state": "UNINITIALIZED",
+            "state": "AWAITING_UPLOAD",
+            "message": "Upload your study material to begin.",
+            "material_ready": False,
+            "concepts_count": 0,
+            "baseline_completed": False,
+            "total_attempts": 0,
+        }
+
+    snap = mastery.snapshot(uid)
+    total_attempts = sum(c.get("attempts", 0) for c in snap)
+    lifecycle = loop.get_lifecycle_state(uid)
+    baseline_done = (lifecycle == "ACTIVE_LEARNING" or total_attempts >= 3)
+    loop_state = "ACTIVE_LOOP" if baseline_done else "BASELINE_DIAGNOSTIC"
+    lifecycle_state = "ACTIVE_LEARNING" if baseline_done else lifecycle
+
+    return {
+        "ok": True,
+        "loop_state": loop_state,
+        "state": lifecycle_state,
+        "message": "Active learning session in progress." if baseline_done else "Baseline diagnostic required.",
+        "material_ready": True,
+        "concepts_count": len(concepts_list),
+        "baseline_completed": baseline_done,
+        "total_attempts": total_attempts,
+    }
+
+
+@router.post("/diagnostic/start")
+@router.post("/diagnostic/start/", include_in_schema=False)
+def post_diagnostic_start(body: dict | None = None, current_user: User = Depends(get_current_user)):
+    """Generate 6-question baseline diagnostic quiz covering the curriculum to baseline knowledge."""
+    uid = "default"
+    if body and "user_id" in body and body["user_id"] != "default":
+        uid = body["user_id"]
+    elif current_user and current_user.user_id != "default":
+        uid = current_user.user_id
+
+    kb = store.get_kb(uid)
+    concepts_list = kb.get("concepts", []) if (kb and kb.get("ready")) else []
+    if not concepts_list:
+        raise HTTPException(status_code=400, detail="No study materials indexed yet.")
+
+    path = concepts.get_learning_path(unmastered_only=False, user_id=uid) if hasattr(concepts, "get_learning_path") else [c["id"] for c in concepts_list]
+    target_cids = list(path[:6])
+    while len(target_cids) < 6 and concepts_list:
+        target_cids.append(concepts_list[len(target_cids) % len(concepts_list)]["id"])
+
+    questions = []
+    seen_qids = set()
+    for cid in target_cids:
+        try:
+            qs = quiz.generate_diagnostic_quiz(cid, count=1)
+            for q in qs:
+                if q.question_id not in seen_qids:
+                    seen_qids.add(q.question_id)
+                    qd = q.model_dump()
+                    c_meta = next((c for c in concepts_list if c["id"] == cid), {})
+                    qd["conceptName"] = c_meta.get("name", cid)
+                    qd["conceptId"] = cid
+                    questions.append(qd)
+                    if len(questions) >= 6:
+                        break
+        except Exception:
+            pass
+        if len(questions) >= 6:
+            break
+
+    return {
+        "ok": True,
+        "questions": questions,
+        "count": len(questions),
+    }
+
+
+@router.post("/diagnostic/submit")
+@router.post("/diagnostic/submit/", include_in_schema=False)
+def post_diagnostic_submit(body: DiagnosticSubmitReq, current_user: User = Depends(get_current_user)):
+    """Grade baseline diagnostic submissions, update epistemic beliefs, and unlock active loop."""
+    uid = body.user_id if body.user_id != "default" else (current_user.user_id if current_user and current_user.user_id != "default" else "default")
+    results = []
+    correct_count = 0
+
+    for a in body.answers:
+        sub = QuizSubmission(
+            user_id=uid,
+            question_id=a.get("question_id", a.get("id", "diag_sub")),
+            concept_id=a.get("concept_id", a.get("conceptId", "")),
+            selected_option_idx=a.get("selected_option_idx", a.get("selectedIndex")),
+            typed_answer=a.get("typed_answer", a.get("typedAnswer", "")),
+            student_reasoning=a.get("student_reasoning", a.get("studentReasoning", "")),
+            numeric_answer=a.get("numeric_answer", a.get("numericAnswer")),
+        )
+        try:
+            res = loop.submit_quiz_answer(sub)
+            results.append(res)
+            if res.get("is_correct"):
+                correct_count += 1
+        except Exception:
+            pass
+
+    total = max(len(body.answers), 1)
+    score_pct = round((correct_count / total) * 100)
+    return {
+        "ok": True,
+        "score": score_pct,
+        "correct_count": correct_count,
+        "total": len(body.answers),
+        "baseline_completed": True,
+        "results": results,
+    }
+
+
+# ── 7. Universal Multi-Format Study Materials & Interactive Preview ──────────
+
+@router.post("/materials/ingest-file")
+@router.post("/materials/ingest-file/")
+async def post_materials_ingest_file(
+    files: list[UploadFile] = File(default=[]),
+    file: UploadFile | None = File(default=None),
+    user_id: str = Form("default"),
+    title: str | None = Form(None),
+    current_user: User = Depends(get_current_user),
+):
+    """Ingest multi-format study material (.pdf, .pptx, .md, .txt, .docx, .mp3, .wav, .m4a, .webm)."""
+    uid = user_id if user_id != "default" else (current_user.user_id if current_user and current_user.user_id != "default" else "default")
+    all_uploads: list[UploadFile] = list(files or [])
+    if file:
+        all_uploads.append(file)
+
+    if not all_uploads:
+        raise HTTPException(status_code=400, detail="No study material file provided.")
+
+    allowed_exts = {".pdf", ".pptx", ".ppt", ".md", ".txt", ".docx", ".mp3", ".wav", ".m4a", ".webm"}
+    ingested_materials = []
+
+    for f in all_uploads:
+        if not f.filename:
+            continue
+        ext = Path(f.filename).suffix.lower()
+        if ext not in allowed_exts:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported format '{ext}'. Supported: PDF, PPTX, MD, TXT, DOCX, MP3, WAV, M4A, WEBM."
+            )
+        dest = config.UPLOAD_DIR / Path(f.filename).name
+        content = await f.read()
+        dest.write_bytes(content)
+
+        try:
+            mat_res = UniversalMaterialIngestor.ingest_file(
+                path=dest,
+                user_id=uid,
+                title=title or Path(f.filename).stem.replace("_", " ").title()
+            )
+            ingested_materials.append(mat_res)
+        except store.UserError as ue:
+            raise HTTPException(status_code=400, detail=str(ue))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to ingest file '{f.filename}': {e}")
+
+    active_kb = store.get_kb(uid)
+    return {
+        "ok": True,
+        "count": len(ingested_materials),
+        "materials": ingested_materials,
+        "active_kb": {
+            "ready": active_kb.get("ready", False),
+            "title": active_kb.get("file", ""),
+            "pages": active_kb.get("pages", 0),
+            "concepts": len(active_kb.get("concepts", [])),
+        }
+    }
+
+
+@router.post("/materials/ingest-url")
+@router.post("/materials/ingest-url/")
+async def post_materials_ingest_url(req: IngestUrlRequest, current_user: User = Depends(get_current_user)):
+    """Ingest educational websites (GeeksforGeeks, docs) or YouTube video lectures with timestamped transcripts."""
+    url = req.url.strip()
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise HTTPException(status_code=400, detail="URL must begin with http:// or https://")
+
+    uid = req.user_id if req.user_id != "default" else (current_user.user_id if current_user and current_user.user_id != "default" else "default")
+    try:
+        mat_res = UniversalMaterialIngestor.ingest_url(
+            url=url,
+            source_type=req.source_type,
+            user_id=uid,
+            title=req.title
+        )
+    except store.UserError as ue:
+        raise HTTPException(status_code=400, detail=str(ue))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to ingest URL '{url}': {e}")
+
+    active_kb = store.get_kb(uid)
+    return {
+        "ok": True,
+        "material": mat_res,
+        "active_kb": {
+            "ready": active_kb.get("ready", False),
+            "title": active_kb.get("file", ""),
+            "pages": active_kb.get("pages", 0),
+            "concepts": len(active_kb.get("concepts", [])),
+        }
+    }
+
+
+@router.get("/materials", response_model=MaterialsListResponse)
+@router.get("/materials/", response_model=MaterialsListResponse)
+def get_study_materials(user_id: str = "default", current_user: User = Depends(get_current_user)):
+    """List all ingested study materials for the learner with metadata badges."""
+    uid = user_id if user_id != "default" else (current_user.user_id if current_user and current_user.user_id != "default" else "default")
+    materials = store.list_study_materials(user_id=uid)
+    models = [StudyMaterialMetadata(**m) for m in materials]
+    return MaterialsListResponse(
+        materials=models,
+        total_materials=len(models),
+        total_chunks=sum(m.chunk_count for m in models),
+        total_concepts=sum(m.concept_count for m in models),
+    )
+
+
+@router.get("/materials/{material_id}/preview", response_model=StudyMaterialPreview)
+@router.get("/materials/{material_id}/preview/", response_model=StudyMaterialPreview)
+def get_study_material_preview(material_id: str, current_user: User = Depends(get_current_user)):
+    """Return structured preview payload (pages, slides, timestamps, or reader view) for interactive inspection."""
+    mat = store.get_study_material(material_id)
+    if not mat:
+        raise HTTPException(status_code=404, detail=f"Study material '{material_id}' not found.")
+    return StudyMaterialPreview(**mat)
+
+
+@router.delete("/materials/{material_id}")
+@router.delete("/materials/{material_id}/")
+def delete_study_material(material_id: str, user_id: str = "default", current_user: User = Depends(get_current_user)):
+    """Delete a study material and automatically rebuild the unified index and Prerequisite DAG."""
+    uid = user_id if user_id != "default" else (current_user.user_id if current_user and current_user.user_id != "default" else "default")
+    try:
+        res = UniversalMaterialIngestor.delete_material(material_id=material_id, user_id=uid)
+        return {
+            "ok": True,
+            "deleted_material_id": material_id,
+            "rebuilt_kb": res
+        }
+    except store.UserError as ue:
+        raise HTTPException(status_code=404, detail=str(ue))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete material: {e}")
+

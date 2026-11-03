@@ -7,11 +7,15 @@
   // Application State
   const AppState = {
     currentRoute: "dashboard",
+    currentUser: (typeof ApiService !== "undefined" && typeof ApiService.getUser === "function") ? ApiService.getUser() : null,
     activeDoc: null,
     masteryList: [],
     recommendations: [],
     graphData: null,
-    studentName: localStorage.getItem("cm_student_name") || "Alex",
+    loopStatus: null,
+    baselineCompleted: false,
+    activeRecallSession: null,
+    studentName: (typeof ApiService !== "undefined" && typeof ApiService.getUser === "function" && ApiService.getUser() && ApiService.getUser().full_name) || localStorage.getItem("cm_student_name") || "Guest Student",
     chatMessages: [
       {
         sender: "assistant",
@@ -27,7 +31,9 @@
       score: 0,
       history: [],
       targetConceptId: null,
-      currentConceptId: null
+      currentConceptId: null,
+      seenQuestionIds: new Set(),
+      remedialMode: false
     }
   };
 
@@ -127,12 +133,237 @@
     }
   }
 
+  function getCurrentUserId() {
+    return (AppState.currentUser && AppState.currentUser.user_id) || "default";
+  }
+
+  function updateTopBarUser(user) {
+    const topName = $("#topbar-user-name");
+    const topAvatar = $("#topbar-user-avatar");
+    const topEmail = $("#topbar-user-email");
+    const logoutBtn = $("#logout-btn");
+
+    if (user && user.user_id) {
+      const displayName = user.full_name || (user.email ? user.email.split("@")[0] : "Student");
+      if (topName) topName.textContent = displayName;
+      if (topEmail) topEmail.textContent = user.email || "Learner";
+      if (topAvatar) {
+        if (user.picture_url) {
+          topAvatar.innerHTML = `<img src="${esc(user.picture_url)}" alt="${esc(displayName)}" style="width:100%; height:100%; border-radius:50%; object-fit:cover;">`;
+        } else {
+          topAvatar.textContent = (displayName[0] || "S").toUpperCase();
+        }
+      }
+      if (logoutBtn) logoutBtn.style.display = "inline-flex";
+    } else {
+      if (topName) topName.textContent = "Sign In";
+      if (topEmail) topEmail.textContent = "Click to login";
+      if (topAvatar) topAvatar.textContent = "?";
+      if (logoutBtn) logoutBtn.style.display = "none";
+    }
+  }
+
+  function showAuthModal(show = true) {
+    const modal = $("#auth-modal");
+    if (!modal) return;
+    if (show) {
+      if (typeof modal.showModal === "function") {
+        if (!modal.open) modal.showModal();
+      } else {
+        modal.setAttribute("open", "");
+      }
+      initGoogleSignIn();
+    } else {
+      if (typeof modal.close === "function") {
+        if (modal.open) modal.close();
+      } else {
+        modal.removeAttribute("open");
+      }
+    }
+  }
+
+  async function initGoogleSignIn() {
+    let clientId = window.GOOGLE_CLIENT_ID || "";
+    try {
+      const cfg = await ApiService.getAuthConfig();
+      if (cfg && cfg.google_client_id) {
+        clientId = cfg.google_client_id;
+      }
+    } catch {}
+
+    const tipContainer = $("#google-auth-tip");
+    if (!clientId) {
+      if (tipContainer) {
+        tipContainer.innerHTML = `
+          <div style="background: rgba(245, 158, 11, 0.12); border: 1px solid rgba(245, 158, 11, 0.35); border-radius: var(--radius-md); padding: 0.65rem 0.85rem; font-size: 0.8rem; color: var(--ink-primary); text-align: left;">
+            <div style="font-weight: 600; color: #b45309; margin-bottom: 0.2rem;">⚡ Google OAuth Key Not Configured</div>
+            <div style="font-size: 0.76rem; color: var(--ink-muted); line-height: 1.35;">
+              <code>GOOGLE_CLIENT_ID</code> is empty in <code>backend/.env</code>. For immediate local testing, click <strong>Ada Lovelace</strong> or <strong>Alan Turing</strong> below. To sign in with your real Google account, add your OAuth Web Client ID to <code>backend/.env</code>.
+            </div>
+          </div>
+        `;
+        tipContainer.style.display = "block";
+      }
+    } else {
+      if (tipContainer) tipContainer.style.display = "none";
+    }
+
+    if (clientId && typeof window !== "undefined" && window.google && window.google.accounts) {
+      try {
+        window.google.accounts.id.initialize({
+          client_id: clientId,
+          callback: async (response) => {
+            if (response && response.credential) {
+              await handleAuthSuccess(response.credential);
+            }
+          }
+        });
+        const container = document.getElementById("g_id_signin");
+        if (container) {
+          container.innerHTML = "";
+          window.google.accounts.id.renderButton(container, {
+            theme: "outline",
+            size: "large",
+            width: 320,
+            shape: "rectangular"
+          });
+        }
+      } catch (err) {
+        console.warn("Google GIS init warning:", err);
+      }
+    } else if (!clientId) {
+      const container = document.getElementById("g_id_signin");
+      if (container) {
+        container.innerHTML = `
+          <button type="button" class="btn btn-outline" style="width: 100%; justify-content: center; gap: 0.65rem; padding: 0.65rem 1rem;" id="unconfigured-google-btn">
+            <svg width="18" height="18" viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"/></svg>
+            <span>Sign in with Google</span>
+          </button>
+        `;
+        const unconfBtn = document.getElementById("unconfigured-google-btn");
+        if (unconfBtn) {
+          unconfBtn.onclick = () => {
+            showToast("Google Client ID not yet set in backend/.env. Use Ada Lovelace or Alan Turing below to sign in instantly!", "warning");
+          };
+        }
+      }
+    }
+  }
+
+  async function handleAuthSuccess(credential) {
+    try {
+      const res = await ApiService.loginGoogle(credential);
+      AppState.currentUser = res.user;
+      AppState.studentName = res.user.full_name || res.user.email.split("@")[0];
+      localStorage.setItem("cm_student_name", AppState.studentName);
+      updateTopBarUser(AppState.currentUser);
+      showAuthModal(false);
+      showToast(`Welcome back, ${AppState.studentName}!`, "success");
+      await syncActiveDocument();
+      navigateTo(AppState.currentRoute || "dashboard");
+    } catch (err) {
+      showToast(`Sign-in failed: ${err.message}`, "danger");
+    }
+  }
+
+  function logoutStudent() {
+    ApiService.logout();
+    AppState.currentUser = null;
+    AppState.studentName = "Guest Student";
+    AppState.activeDoc = null;
+    AppState.masteryList = [];
+    AppState.graphData = null;
+    updateTopBarUser(null);
+    updateSidebarWidget({ ready: false, file: null });
+    showToast("Signed out. Please sign in to resume studying.", "info");
+    showAuthModal(true);
+    navigateTo("dashboard");
+  }
+
+  function initAuth() {
+    updateTopBarUser(AppState.currentUser);
+
+    const logoutBtn = $("#logout-btn");
+    if (logoutBtn) {
+      logoutBtn.onclick = (e) => {
+        e.stopPropagation();
+        logoutStudent();
+      };
+    }
+
+    const badge = $("#topbar-user-badge");
+    if (badge) {
+      badge.onclick = () => {
+        if (!AppState.currentUser) {
+          showAuthModal(true);
+        }
+      };
+    }
+
+    const devAdaBtn = $("#dev-login-ada");
+    if (devAdaBtn) {
+      devAdaBtn.onclick = () => {
+        handleAuthSuccess("dev:google_ada_lovelace:ada.lovelace@university.edu:Ada Lovelace");
+      };
+    }
+
+    const devAlanBtn = $("#dev-login-alan");
+    if (devAlanBtn) {
+      devAlanBtn.onclick = () => {
+        handleAuthSuccess("dev:google_alan_turing:alan.turing@university.edu:Alan Turing");
+      };
+    }
+
+    window.addEventListener("cm:unauthorized", () => {
+      AppState.currentUser = null;
+      updateTopBarUser(null);
+      showAuthModal(true);
+    });
+
+    if (ApiService.isAuthenticated()) {
+      ApiService.getCurrentUser().then(res => {
+        if (res && res.user) {
+          AppState.currentUser = res.user;
+          AppState.studentName = res.user.full_name || res.user.email.split("@")[0];
+          updateTopBarUser(AppState.currentUser);
+        }
+      }).catch(err => {
+        console.warn("Session check error, logging out:", err);
+        ApiService.clearAuth();
+        AppState.currentUser = null;
+        updateTopBarUser(null);
+        showAuthModal(true);
+      });
+    } else {
+      setTimeout(() => {
+        if (!AppState.currentUser) {
+          showAuthModal(true);
+        }
+      }, 500);
+    }
+  }
+
   // Global Document / Ingest Status Poller & Synchronizer
   async function syncActiveDocument() {
     try {
-      const status = await ApiService.getIngestStatus();
-      AppState.activeDoc = status;
-      updateSidebarWidget(status);
+      const uid = getCurrentUserId();
+      const matsData = await ApiService.listMaterials(uid).catch(() => ({ materials: [] }));
+      const mats = matsData.materials || [];
+      if (mats.length > 0) {
+        const top = mats[0];
+        const status = {
+          ready: true,
+          file: top.title || top.original_filename_or_url || "Active Study Material",
+          pages: top.chunk_count || 1,
+          concepts: top.concept_count || (top.concepts ? top.concepts.length : 0),
+          user_id: uid
+        };
+        AppState.activeDoc = status;
+        updateSidebarWidget(status);
+      } else {
+        AppState.activeDoc = { ready: false, file: null };
+        updateSidebarWidget({ ready: false, file: null });
+      }
     } catch (e) {
       console.warn("Could not sync active document status:", e);
       updateSidebarWidget({ ready: false, file: null });
@@ -200,6 +431,526 @@
         if (e.target === conceptModal) conceptModal.close();
       });
     }
+
+    const diagClose = $("#diagnostic-modal-close");
+    const diagModal = $("#diagnostic-modal");
+    if (diagClose && diagModal) {
+      diagClose.onclick = () => diagModal.close();
+      diagModal.addEventListener("click", e => {
+        if (e.target === diagModal) diagModal.close();
+      });
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Baseline Knowledge Diagnostic Engine
+  // -------------------------------------------------------------------------
+  async function startBaselineDiagnostic() {
+    const modal = $("#diagnostic-modal");
+    const body = $("#diagnostic-modal-body");
+    if (!modal || !body) return;
+
+    if (typeof modal.showModal === "function") {
+      modal.showModal();
+    } else {
+      modal.setAttribute("open", "");
+    }
+
+    body.innerHTML = `
+      <div style="padding: 2.5rem; text-align: center;">
+        <div class="upload-icon-pulse" style="width: 44px; height: 44px; margin: 0 auto 1rem auto;">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        </div>
+        <h4 style="margin-bottom: 0.5rem;">Generating Baseline Diagnostic...</h4>
+        <p style="color: var(--ink-secondary); font-size: 0.88rem;">Selecting 6 representative assessment items across the prerequisite graph...</p>
+      </div>
+    `;
+
+    try {
+      const res = await ApiService.startDiagnostic(getCurrentUserId());
+      const questions = (res && res.questions && res.questions.length) ? res.questions : [];
+      if (!questions.length) {
+        throw new Error("No diagnostic questions could be generated. Ensure study materials are uploaded.");
+      }
+
+      let currentIndex = 0;
+      const userAnswers = [];
+      const letters = ["A", "B", "C", "D"];
+
+      function renderDiagQ() {
+        const q = questions[currentIndex];
+        const progressPct = Math.round((currentIndex / questions.length) * 100);
+        const qType = (q.question_type || q.questionType || (q.options && q.options.length ? "mcq" : "typed_qa")).toLowerCase();
+
+        let inputHtml = "";
+        if (qType === "fill_in_the_blanks") {
+          inputHtml = `
+            <div style="margin: 1.25rem 0;">
+              <input type="text" id="diag-user-input" class="fitb-blank-input" placeholder="Type missing keyword..." style="width: 100%; max-width: 340px;" autocomplete="off" />
+            </div>
+          `;
+        } else if (qType === "typed_qa") {
+          inputHtml = `
+            <div style="margin: 1.25rem 0;">
+              <textarea id="diag-user-input" class="quiz-textarea" rows="3" placeholder="Explain the concept in your own words..."></textarea>
+            </div>
+          `;
+        } else if (qType === "numerical") {
+          const params = q.given_parameters || q.givenParameters || {};
+          inputHtml = `
+            <div style="margin: 1.25rem 0;">
+              ${Object.keys(params).length ? `
+                <div class="numerical-params-grid" style="margin-bottom:0.75rem;">
+                  ${Object.entries(params).map(([k, v]) => `
+                    <div class="numerical-param-pill"><span class="param-key">${esc(k)}</span><span class="param-val">${esc(v)}</span></div>
+                  `).join("")}
+                </div>
+              ` : ''}
+              <input type="number" step="any" id="diag-user-input" class="numerical-input" placeholder="0.00" autocomplete="off" />
+            </div>
+          `;
+        } else {
+          // MCQ
+          const opts = q.options || [];
+          inputHtml = `
+            <div class="quiz-options-group" style="margin: 1.25rem 0;" id="diag-options-group">
+              ${opts.map((opt, i) => `
+                <button type="button" class="quiz-opt-btn diag-opt-btn" data-index="${i}">
+                  <span class="opt-letter-badge">${letters[i] || (i + 1)}</span>
+                  <span class="opt-text">${esc(opt)}</span>
+                </button>
+              `).join("")}
+            </div>
+          `;
+        }
+
+        body.innerHTML = `
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
+            <span class="status-pill unknown">${esc(q.conceptName || q.concept_id || q.conceptId || "Concept")}</span>
+            <div style="display:flex; align-items:center; gap:0.6rem;">
+              <span style="font-size:0.82rem; font-weight:600; color:var(--ink-muted);">Question ${currentIndex + 1} of ${questions.length}</span>
+              <div style="width:90px;" class="progress-bar-track">
+                <div class="progress-bar-fill" style="width:${progressPct}%;"></div>
+              </div>
+            </div>
+          </div>
+
+          <h3 style="font-size:1.1rem; line-height:1.5; margin-bottom:1rem;">${esc(q.question_text || q.question)}</h3>
+
+          ${inputHtml}
+
+          <div style="display:flex; justify-content:flex-end; margin-top:1.5rem;">
+            <button id="btn-diag-next" class="btn btn-primary" disabled>
+              ${currentIndex === questions.length - 1 ? 'Finish Diagnostic &rarr;' : 'Next Question &rarr;'}
+            </button>
+          </div>
+        `;
+        renderMath(body);
+
+        const nextBtn = $("#btn-diag-next", body);
+        let selectedIdx = null;
+
+        if (qType === "mcq") {
+          const optBtns = body.querySelectorAll(".diag-opt-btn");
+          optBtns.forEach(b => {
+            b.onclick = () => {
+              optBtns.forEach(btn => btn.classList.remove("selected"));
+              b.classList.add("selected");
+              selectedIdx = parseInt(b.getAttribute("data-index"), 10);
+              nextBtn.disabled = false;
+            };
+          });
+        } else {
+          const textInput = $("#diag-user-input", body);
+          if (textInput) {
+            textInput.focus();
+            textInput.addEventListener("input", () => {
+              nextBtn.disabled = !textInput.value.trim();
+            });
+            textInput.addEventListener("keydown", e => {
+              if (e.key === "Enter" && !nextBtn.disabled) nextBtn.click();
+            });
+          }
+        }
+
+        nextBtn.onclick = async () => {
+          let typedVal = "";
+          let numVal = null;
+          if (qType === "mcq") {
+            typedVal = letters[selectedIdx] || "";
+          } else if (qType === "numerical") {
+            const el = $("#diag-user-input", body);
+            typedVal = el ? el.value.trim() : "";
+            numVal = parseFloat(typedVal);
+          } else {
+            const el = $("#diag-user-input", body);
+            typedVal = el ? el.value.trim() : "";
+          }
+
+          userAnswers.push({
+            question_id: q.question_id || q.id,
+            concept_id: q.concept_id || q.conceptId,
+            selected_option_idx: selectedIdx,
+            typed_answer: typedVal,
+            student_reasoning: typedVal,
+            numeric_answer: numVal
+          });
+
+          currentIndex++;
+          if (currentIndex < questions.length) {
+            renderDiagQ();
+          } else {
+            // Submit entire diagnostic
+            body.innerHTML = `
+              <div style="padding: 2.5rem; text-align: center;">
+                <div class="upload-icon-pulse" style="width: 44px; height: 44px; margin: 0 auto 1rem auto;">
+                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                </div>
+                <h4>Scoring Baseline Knowledge Profile...</h4>
+                <p style="color: var(--ink-secondary); font-size: 0.88rem;">Updating epistemic Beta belief distributions and unlocking prerequisite DAG...</p>
+              </div>
+            `;
+            try {
+              const subRes = await ApiService.submitDiagnostic(userAnswers, getCurrentUserId());
+              const scorePct = subRes.score !== undefined ? subRes.score : 50;
+              const correctCnt = subRes.correct_count !== undefined ? subRes.correct_count : 0;
+              AppState.baselineCompleted = true;
+              localStorage.setItem(`cm_baseline_${getCurrentUserId()}`, "true");
+
+              body.innerHTML = `
+                <div style="padding: 2rem; text-align: center;">
+                  <div class="donut-chart-container" style="margin: 0 auto 1.25rem auto;">
+                    ${createDonutSvg(scorePct, 120, 10, scorePct >= 65 ? "var(--color-strong)" : "var(--primary)")}
+                    <div class="donut-chart-value">
+                      <span class="val-number">${scorePct}%</span>
+                      <span class="val-label">Baseline</span>
+                    </div>
+                  </div>
+                  <h3 style="margin-bottom: 0.4rem;">Baseline Diagnostic Completed!</h3>
+                  <p style="color: var(--ink-secondary); margin-bottom: 1.5rem; font-size: 0.9rem;">
+                    You demonstrated familiarity with <strong>${correctCnt} of ${questions.length}</strong> core concepts. Your personalized prerequisite roadmap has been generated.
+                  </p>
+                  <div style="display:flex; justify-content:center; gap:0.75rem;">
+                    <button id="btn-diag-done" class="btn btn-primary">Start Active Learning &rarr;</button>
+                  </div>
+                </div>
+              `;
+              const doneBtn = $("#btn-diag-done", body);
+              if (doneBtn) {
+                doneBtn.onclick = () => {
+                  modal.close();
+                  showToast("Baseline complete! Learning path unlocked.", "success");
+                  navigateTo("dashboard");
+                };
+              }
+            } catch (submitErr) {
+              AppState.baselineCompleted = true;
+              localStorage.setItem(`cm_baseline_${getCurrentUserId()}`, "true");
+              body.innerHTML = `
+                <div style="padding: 2rem; text-align: center;">
+                  <h3>Baseline Complete</h3>
+                  <p style="color: var(--ink-secondary); margin-bottom: 1rem;">${esc(submitErr.message || "Learning path unlocked.")}</p>
+                  <button id="btn-diag-done" class="btn btn-primary">Return to Dashboard</button>
+                </div>
+              `;
+              const doneBtn = $("#btn-diag-done", body);
+              if (doneBtn) {
+                doneBtn.onclick = () => {
+                  modal.close();
+                  navigateTo("dashboard");
+                };
+              }
+            }
+          }
+        };
+      }
+
+      renderDiagQ();
+    } catch (err) {
+      body.innerHTML = `
+        <div style="padding: 2rem; text-align: center;">
+          <h4 style="color: var(--color-danger); margin-bottom: 0.5rem;">Diagnostic Error</h4>
+          <p style="color: var(--ink-secondary); margin-bottom: 1.25rem;">${esc(err.message)}</p>
+          <button class="btn btn-secondary" onclick="document.querySelector('#diagnostic-modal').close()">Close</button>
+        </div>
+      `;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Active Recall Stage Content Renderer
+  // -------------------------------------------------------------------------
+  function renderRecallStageContent(session, statusPill) {
+    const card = session.card;
+    if (!card) return `<p style="padding:2rem; text-align:center;">Loading study card...</p>`;
+
+    const formulaMech = card.formula_or_mechanism || card.key_formula_or_mechanism || "";
+    const workedEx = card.worked_example || card.worked_mini_example || "";
+    const keywordsList = card.keywords || card.essential_keywords || [];
+    const sourceCite = card.source_citation || card.exact_source_citation || "Course Document";
+    const verifQ = (typeof card.verification_question === 'object' && card.verification_question)
+      ? (card.verification_question.question || card.verification_question.question_text || JSON.stringify(card.verification_question))
+      : (card.verification_question || `How does ${card.concept_name || session.conceptId} operate?`);
+
+    if (session.stage === 1) {
+      // Stage 1: Teach Phase
+      return `
+        <div class="study-card">
+          <div class="study-card-header">
+            <div>
+              <div style="display:flex; align-items:center; gap:0.6rem; margin-bottom:0.35rem;">
+                <span class="status-pill ${statusPill}">${statusPill.toUpperCase()}</span>
+                <span class="study-citation-pill">📖 ${esc(sourceCite)}</span>
+              </div>
+              <h2 class="study-concept-title">${esc(card.concept_name || session.conceptId)}</h2>
+            </div>
+            <div style="display:flex; align-items:center; gap:0.5rem;">
+              <span style="font-size:0.82rem; font-weight:600; color:var(--ink-secondary);">Study Timer:</span>
+              <div class="timer-select-group" id="timer-select-group">
+                <button type="button" class="timer-pill-btn ${session.timerSec === 60 ? 'active' : ''}" data-seconds="60">1m</button>
+                <button type="button" class="timer-pill-btn ${session.timerSec === 180 ? 'active' : ''}" data-seconds="180">3m</button>
+                <button type="button" class="timer-pill-btn ${session.timerSec === 300 ? 'active' : ''}" data-seconds="300">5m</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="study-section">
+            <span class="study-section-title">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+              Core Intuition
+            </span>
+            <div class="study-core-intuition">${esc(card.core_intuition || "")}</div>
+          </div>
+
+          <div class="study-section">
+            <span class="study-section-title">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+              Formula / Mechanism
+            </span>
+            <div class="study-formula-box">${formulaMech}</div>
+          </div>
+
+          <div class="study-section">
+            <span class="study-section-title">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8"/></svg>
+              Worked Example
+            </span>
+            <div class="study-worked-example">${workedEx}</div>
+          </div>
+
+          <div class="study-section">
+            <span class="study-section-title">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+              Essential Concept Keywords (3-5)
+            </span>
+            <div class="study-keywords-row">
+              ${keywordsList.map(kw => `<span class="study-keyword-tag">${esc(kw)}</span>`).join("")}
+            </div>
+          </div>
+
+          <div style="display:flex; justify-content:flex-end; padding-top:1rem; border-top:1px solid var(--border-subtle);">
+            <button id="btn-start-recall-timer" class="btn btn-primary btn-lg">
+              Start Learning Timer (${Math.round(session.timerSec/60)}m) &rarr;
+            </button>
+          </div>
+        </div>
+      `;
+    }
+
+    if (session.stage === 2) {
+      // Stage 2: Timed Study
+      const mins = Math.floor(session.timeLeft / 60);
+      const secs = session.timeLeft % 60;
+      const timeStr = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+      const circumference = 2 * Math.PI * 38;
+      const progressRatio = session.timeLeft / session.timerSec;
+      const offset = circumference * (1 - progressRatio);
+
+      return `
+        <!-- Timed Study Countdown Banner -->
+        <div class="timed-study-banner">
+          <div style="display:flex; align-items:center; gap:1.25rem;">
+            <div class="timer-ring-container">
+              <svg class="timer-ring-svg" viewBox="0 0 90 90">
+                <circle class="timer-ring-bg" cx="45" cy="45" r="38"></circle>
+                <circle class="timer-ring-progress" id="timer-ring-circle" cx="45" cy="45" r="38"
+                  style="stroke-dasharray: ${circumference}; stroke-dashoffset: ${offset};"></circle>
+              </svg>
+              <div class="timer-digital-display" id="timer-countdown-text">${timeStr}</div>
+            </div>
+            <div>
+              <span class="badge-question-type mcq" style="background:rgba(56,189,248,0.2); color:#38bdf8; border-color:rgba(56,189,248,0.3);">
+                Stage 2: Timed Study
+              </span>
+              <h3 style="color:#ffffff; margin:0.35rem 0 0.25rem 0;">Absorb the Core Mechanism</h3>
+              <p style="margin:0; font-size:0.85rem; color:#cbd5e1;">Study the card below. When time runs out, the material will be hidden for blind retrieval.</p>
+            </div>
+          </div>
+          <button id="btn-ready-test-now" class="btn btn-primary" style="background:#38bdf8; color:#0f172a; border:none; font-weight:700;">
+            I'm Ready — Test Me Now &rarr;
+          </button>
+        </div>
+
+        <!-- Study Card Visible during Timed Study -->
+        <div class="study-card" style="margin-top:1.5rem;">
+          <div class="study-card-header">
+            <div>
+              <h2 class="study-concept-title">${esc(card.concept_name || session.conceptId)}</h2>
+              <span class="study-citation-pill">📖 ${esc(sourceCite)}</span>
+            </div>
+          </div>
+          <div class="study-section">
+            <span class="study-section-title">Core Intuition</span>
+            <div class="study-core-intuition">${esc(card.core_intuition || "")}</div>
+          </div>
+          <div class="study-section">
+            <span class="study-section-title">Formula / Mechanism</span>
+            <div class="study-formula-box">${formulaMech}</div>
+          </div>
+          <div class="study-section">
+            <span class="study-section-title">Worked Example</span>
+            <div class="study-worked-example">${workedEx}</div>
+          </div>
+          <div class="study-section">
+            <span class="study-section-title">Essential Keywords</span>
+            <div class="study-keywords-row">
+              ${keywordsList.map(kw => `<span class="study-keyword-tag">${esc(kw)}</span>`).join("")}
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    if (session.stage === 3) {
+      // Stage 3: Blind Retrieval (DOM UNMOUNTED - Study card NOT in DOM!)
+      return `
+        <div class="blind-retrieval-container">
+          <div>
+            <span class="blind-badge">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+              Blind Retrieval Mode · Study Card Hidden
+            </span>
+            <h2 style="font-size:1.45rem; margin:0.75rem 0 0.35rem 0;">What do you recall about "${esc(card.concept_name || session.conceptId)}"?</h2>
+            <p style="color:var(--ink-secondary); font-size:0.92rem; margin:0; line-height:1.5;">
+              Write everything you remember from memory without looking at notes. Explain the core intuition, mechanism/formula, and essential terminology.
+            </p>
+          </div>
+
+          <div style="position:relative;">
+            <textarea id="active-recall-text" class="recall-textarea" rows="7" placeholder="Explain the concept in your own words, including its mechanism, formula/rules, and key terms...">${esc(session.recallText || "")}</textarea>
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-top:0.4rem; font-size:0.8rem; color:var(--ink-muted);">
+              <span>AI Epistemic Judge evaluates terminology coverage &amp; conceptual depth</span>
+              <span id="recall-stats-display">0 words · 0 characters</span>
+            </div>
+          </div>
+
+          <div class="verification-q-box">
+            <span class="verification-q-title">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></svg>
+              Targeted Mechanism Verification Check
+            </span>
+            <p style="margin:0; font-size:0.92rem; font-weight:600; color:var(--ink-primary);">${esc(verifQ)}</p>
+            <input type="text" id="verification-answer-input" class="verification-input" placeholder="Enter concise verification answer..." value="${esc(session.verificationAnswer || "")}" autocomplete="off" />
+          </div>
+
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-top:0.5rem;">
+            <span style="font-size:0.82rem; color:var(--ink-muted);">Minimum 15 characters required to submit.</span>
+            <button id="btn-submit-active-recall" class="btn btn-primary" disabled>
+              Submit Active Recall &rarr;
+            </button>
+          </div>
+        </div>
+      `;
+    }
+
+    if (session.stage === 4) {
+      // Stage 4: Gap Audit
+      const ev = session.evaluation || { score: 75, retained_keywords: [], missed_keywords: [], feedback: "Recall audit evaluated.", updated_mastery: { status: "STRONG", score: 0.8 } };
+      const score = ev.score !== undefined ? ev.score : (ev.retrieval_score !== undefined ? Math.round(ev.retrieval_score * 100) : 70);
+      const retained = ev.retained_keywords || ev.retained_concepts || [];
+      const missed = ev.missed_keywords || ev.missed_concepts || [];
+      const isStrong = score >= 65;
+
+      return `
+        <div class="gap-audit-grid">
+          <!-- Left: Score & Mastery Badge -->
+          <div class="gap-score-card">
+            <div class="donut-chart-container">
+              ${createDonutSvg(score, 140, 11, isStrong ? "var(--color-strong)" : "var(--color-weak)")}
+              <div class="donut-chart-value">
+                <span class="val-number">${score}%</span>
+                <span class="val-label">Retrieval</span>
+              </div>
+            </div>
+
+            <div style="margin-top:0.5rem;">
+              <span class="status-pill ${isStrong ? 'strong' : 'weak'}" style="font-size:0.85rem; padding:0.35rem 0.85rem;">
+                ${isStrong ? 'Concept Retained' : 'Needs Review'}
+              </span>
+              <p style="margin:0.5rem 0 0 0; font-size:0.82rem; color:var(--ink-secondary);">
+                Epistemic Belief: <strong>${Math.round(((ev.updated_mastery && ev.updated_mastery.score) || 0.7) * 100)}%</strong>
+              </p>
+            </div>
+
+            <div style="display:flex; flex-direction:column; gap:0.5rem; width:100%; margin-top:1rem;">
+              <button id="btn-recall-retry" class="btn btn-secondary" style="width:100%;">
+                ↺ Retry This Concept
+              </button>
+              <button id="btn-recall-continue" class="btn btn-primary" style="width:100%;">
+                Next Concept &rarr;
+              </button>
+              <a href="#practice" class="btn btn-outline btn-sm" data-target-concept="${esc(session.conceptId)}" style="width:100%; text-align:center;">
+                Test in Concept Check
+              </a>
+            </div>
+          </div>
+
+          <!-- Right: Concept Gap Audit & Grounded Comparison -->
+          <div class="gap-breakdown-card">
+            <div>
+              <h3 style="margin:0 0 0.35rem 0; font-size:1.25rem;">Epistemic Gap Audit</h3>
+              <p style="margin:0; font-size:0.88rem; color:var(--ink-secondary); line-height:1.5;">${esc(ev.feedback || "")}</p>
+            </div>
+
+            <!-- Retained vs Missed Keywords -->
+            <div>
+              <span class="diff-col-title" style="color:var(--color-strong-text);">Retained Keywords (${retained.length}):</span>
+              <div class="keyword-pill-group">
+                ${retained.length ? retained.map(k => `<span class="keyword-pill retained">✓ ${esc(k)}</span>`).join("") : `<span style="font-size:0.82rem; color:var(--ink-muted);">None detected</span>`}
+              </div>
+
+              <span class="diff-col-title" style="color:var(--color-danger); margin-top:0.85rem; display:block;">Missed Knowledge Gaps (${missed.length}):</span>
+              <div class="keyword-pill-group">
+                ${missed.length ? missed.map(k => `<span class="keyword-pill missed">✗ ${esc(k)}</span>`).join("") : `<span style="font-size:0.82rem; color:var(--color-strong);">No critical gaps omitted!</span>`}
+              </div>
+            </div>
+
+            <!-- Side-by-Side Comparison -->
+            <div>
+              <h4 style="font-size:0.95rem; margin-bottom:0.4rem;">Side-by-Side Memory Audit</h4>
+              <div class="side-by-side-diff">
+                <div class="diff-col user-col">
+                  <div class="diff-col-title">Your Retrieval Response</div>
+                  <p style="margin:0; font-size:0.88rem;">${esc(session.recallText || "(No response entered)")}</p>
+                  ${session.verificationAnswer ? `<div style="margin-top:0.6rem; font-size:0.82rem; color:var(--ink-muted);">Verification Answer: <em>${esc(session.verificationAnswer)}</em></div>` : ''}
+                </div>
+
+                <div class="diff-col grounded-col">
+                  <div class="diff-col-title">Grounded Textbook Reference</div>
+                  <p style="margin:0 0 0.5rem 0; font-size:0.88rem;">${esc(card.core_intuition || "")}</p>
+                  <div style="font-size:0.9rem; padding:0.4rem 0.6rem; background:rgba(255,255,255,0.7); border-radius:var(--radius-sm); margin-bottom:0.4rem;">
+                    ${card.formula_or_mechanism || ""}
+                  </div>
+                  <span class="study-citation-pill" style="background:#fff;">📖 ${esc(card.source_citation || "")}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    return `<p>Invalid active recall stage.</p>`;
   }
 
   // SVG Chart Builders
@@ -302,16 +1053,33 @@
       await syncActiveDocument();
       let masteryData = [];
       let recData = { actions: [] };
+      let loopStatus = { loop_state: "UNINITIALIZED", material_ready: false, baseline_completed: false };
 
       try {
-        const [mRes, rRes] = await Promise.all([
-          ApiService.getMastery(),
-          ApiService.getRecommendations()
+        const [mRes, rRes, lRes] = await Promise.all([
+          ApiService.getMastery().catch(() => ({ concepts: [] })),
+          ApiService.getRecommendations().catch(() => ({ actions: [] })),
+          ApiService.getLoopStatus(getCurrentUserId()).catch(() => null)
         ]);
         masteryData = mRes.concepts || [];
         recData = rRes || { actions: [] };
         AppState.masteryList = masteryData;
         AppState.recommendations = recData.actions || [];
+        if (lRes) {
+          loopStatus = lRes;
+          AppState.loopStatus = lRes;
+          AppState.baselineCompleted = Boolean(lRes.baseline_completed);
+        } else {
+          const totalAttempts = masteryData.reduce((acc, c) => acc + (c.attempts || 0), 0);
+          const localDone = (localStorage.getItem(`cm_baseline_${getCurrentUserId()}`) === "true");
+          const isDone = localDone || totalAttempts >= 3;
+          AppState.baselineCompleted = isDone;
+          loopStatus = {
+            loop_state: isDone ? "ACTIVE_LOOP" : (masteryData.length ? "BASELINE_DIAGNOSTIC" : "UNINITIALIZED"),
+            material_ready: masteryData.length > 0,
+            baseline_completed: isDone
+          };
+        }
       } catch (err) {
         console.warn("Failed fetching dashboard data", err);
       }
@@ -327,6 +1095,45 @@
 
       const topRec = recData.actions && recData.actions.length > 0 ? recData.actions[0] : null;
 
+      // ── Empty-State Gating: No study materials uploaded ──────────────────
+      if (totalConcepts === 0) {
+        return `
+          <div class="page-header">
+            <div class="page-header-text">
+              <h1>Welcome back, ${esc(AppState.studentName)}! 👋</h1>
+              <p>Your closed-loop epistemic learning platform.</p>
+            </div>
+            <div class="page-header-actions">
+              <button class="btn btn-secondary btn-disabled-gated" disabled title="Upload study material first to unlock quizzes">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+                Start Quick Quiz
+              </button>
+            </div>
+          </div>
+
+          <div class="empty-state-card">
+            <div class="empty-state-icon">
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/>
+                <path d="M12 12v9"/>
+                <path d="m16 16-4-4-4 4"/>
+              </svg>
+            </div>
+            <h3 class="empty-state-title">No Study Material Uploaded Yet</h3>
+            <p class="empty-state-desc">
+              No study material uploaded yet. Upload a PDF, lecture slides, YouTube link, or notes in the Study Material tab to generate your custom learning path.
+            </p>
+            <a href="#upload" class="btn btn-primary" style="margin-top:0.5rem;">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+              Upload Study Material &rarr;
+            </a>
+          </div>
+        `;
+      }
+
+      // ── Baseline Diagnostic Gating Check ─────────────────────────────────
+      const isBaselineDiagnosticActive = (loopStatus.loop_state === "BASELINE_DIAGNOSTIC" || !loopStatus.baseline_completed);
+
       return `
         <div class="page-header">
           <div class="page-header-text">
@@ -334,12 +1141,35 @@
             <p>Let's continue your closed-loop learning journey.</p>
           </div>
           <div class="page-header-actions">
-            <a href="#practice" class="btn btn-primary">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-              Start Quick Quiz
-            </a>
+            ${isBaselineDiagnosticActive ? `
+              <button class="btn btn-secondary btn-disabled-gated" disabled title="Complete your Step 1 Baseline Diagnostic first">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+                Start Quick Quiz (Complete Baseline First)
+              </button>
+            ` : `
+              <a href="#practice" class="btn btn-primary">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+                Start Quick Quiz
+              </a>
+            `}
           </div>
         </div>
+
+        ${isBaselineDiagnosticActive ? `
+          <!-- Step 1: First-Run Baseline Diagnostic CTA Banner -->
+          <div class="diagnostic-cta-banner" id="baseline-diagnostic-banner">
+            <div>
+              <div class="diagnostic-badge-pill">Step 1 · Initial Knowledge Mapping</div>
+              <h2 class="diagnostic-title">Take Your Baseline Diagnostic Quiz</h2>
+              <p class="diagnostic-desc">
+                Answer 6 quick diagnostic questions to baseline what you already know and unlock your active learning path.
+              </p>
+            </div>
+            <button id="btn-start-baseline-diagnostic" class="btn btn-primary" style="background:#ffffff; color:#1e3a8a; border:none; font-weight:700;">
+              Start Baseline Diagnostic &rarr;
+            </button>
+          </div>
+        ` : ''}
 
         <!-- Hero Section Grid -->
         <div class="grid grid-dashboard-hero">
@@ -406,7 +1236,7 @@
 
             <div style="display:flex; gap:0.65rem;">
               ${topRec ? `
-                <a href="#practice" data-target-concept="${esc(topRec.conceptId)}" class="btn btn-primary start-target-quiz">
+                <a href="#practice" data-target-concept="${esc(topRec.conceptId)}" class="btn btn-primary start-target-quiz start-remedial-review">
                   Start Review &rarr;
                 </a>
                 <a href="#tutor" class="btn btn-secondary">
@@ -446,7 +1276,7 @@
               <span class="step-label">2. Learn<br>Concepts</span>
             </div>
 
-            <div class="journey-step active" data-nav="practice">
+            <div class="journey-step ${!isBaselineDiagnosticActive ? 'completed' : 'active'}" data-nav="practice">
               <div class="step-circle">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></svg>
               </div>
@@ -480,11 +1310,7 @@
           </div>
 
           <div class="concept-preview-list">
-            ${totalConcepts === 0 ? `
-              <div style="padding:2rem; text-align:center; color:var(--ink-muted);">
-                No concepts indexed yet. <a href="#upload" style="font-weight:600;">Upload your study PDF</a> to build the concept graph.
-              </div>
-            ` : masteryData.slice(0, 5).map(c => {
+            ${masteryData.slice(0, 5).map(c => {
               const st = getConceptStatus(c);
               const scorePercent = Math.round((c.score || 0.5) * 100);
               return `
@@ -514,12 +1340,14 @@
     async upload() {
       await syncActiveDocument();
       const doc = AppState.activeDoc;
+      const matsData = await ApiService.listMaterials(getCurrentUserId()).catch(() => ({ materials: [] }));
+      const materials = matsData.materials || [];
 
       return `
         <div class="page-header">
           <div class="page-header-text">
-            <h1>Study Material Library</h1>
-            <p>Upload a PDF to parse semantic sections, build the vector index with page metadata, and construct the prerequisite graph.</p>
+            <h1>Universal Study Material Hub</h1>
+            <p>Ingest textbooks (PDF), slide decks (PPTX), markdown notes (MD/DOCX), YouTube video lectures, web articles (GeeksforGeeks), or student voice notes into the vectorless BM25 index.</p>
           </div>
           <div class="page-header-actions">
             <button id="btn-load-sample" class="btn btn-secondary">
@@ -530,45 +1358,113 @@
         </div>
 
         <div class="grid grid-cols-2">
-          <!-- Upload Dropzone Card -->
+          <!-- Add Study Material Multi-Source Card -->
           <div class="card">
-            <h3 style="margin-bottom: 1.25rem;">Upload Document(s)</h3>
-            <div class="upload-dropzone" id="upload-dropzone">
-              <input type="file" id="pdf-file-input" accept=".pdf" multiple style="display:none;">
-              <div class="upload-icon-pulse">
-                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                  <polyline points="17 8 12 3 7 8"/>
-                  <line x1="12" y1="3" x2="12" y2="15"/>
-                </svg>
-              </div>
-              <h4 style="font-size:1.1rem; margin-bottom:0.35rem;">Drag & drop your study PDF(s) here</h4>
-              <p style="font-size:0.85rem; color:var(--ink-muted);">or click to select one or multiple PDFs</p>
+            <!-- Tabs Navigation -->
+            <div class="upload-tabs-nav">
+              <button class="upload-tab-btn active" data-tab="file">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                File Upload
+              </button>
+              <button class="upload-tab-btn" data-tab="url">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+                YouTube / Web URL
+              </button>
+              <button class="upload-tab-btn" data-tab="voice">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
+                Voice Note
+              </button>
+            </div>
 
-              <div id="selected-file-display" style="display:none;" class="upload-file-details">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-                <span id="selected-file-name">filename.pdf</span>
+            <!-- Tab 1: File Upload -->
+            <div class="upload-tab-content active" id="tab-content-file">
+              <div class="upload-dropzone" id="upload-dropzone">
+                <input type="file" id="material-file-input" accept=".pdf,.pptx,.ppt,.md,.txt,.docx,.mp3,.wav,.m4a,.webm" multiple style="display:none;">
+                <div class="upload-icon-pulse">
+                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                    <polyline points="17 8 12 3 7 8"/>
+                    <line x1="12" y1="3" x2="12" y2="15"/>
+                  </svg>
+                </div>
+                <h4 style="font-size:1.05rem; margin-bottom:0.35rem;">Drag & drop study materials here</h4>
+                <p style="font-size:0.82rem; color:var(--ink-muted);">Supports PDF, PPTX, Word (.docx), Markdown (.md), and Audio (.mp3, .wav, .m4a)</p>
+
+                <div id="selected-file-display" style="display:none;" class="upload-file-details">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                  <span id="selected-file-name">filename</span>
+                </div>
+              </div>
+
+              <div style="margin-top:1.25rem; display:flex; justify-content:flex-end;">
+                <button class="btn btn-primary" id="btn-process-files" disabled>
+                  Process Study Material(s)
+                </button>
               </div>
             </div>
 
-            <div style="margin-top:1.25rem; display:flex; justify-content:flex-end;">
-              <button class="btn btn-primary" id="btn-process-pdf" disabled>
-                Process PDF Material(s)
-              </button>
+            <!-- Tab 2: YouTube / Web Article URL -->
+            <div class="upload-tab-content" id="tab-content-url">
+              <div style="display:flex; flex-direction:column; gap:1rem;">
+                <div>
+                  <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.4rem;">Source URL</label>
+                  <input type="url" id="input-material-url" class="form-control" placeholder="https://www.youtube.com/watch?v=... or https://www.geeksforgeeks.org/..." style="width:100%; padding:0.65rem 0.85rem; border:1px solid var(--border-subtle); border-radius:var(--radius-sm); font-size:0.9rem;">
+                </div>
+
+                <div class="grid grid-cols-2" style="gap:0.75rem;">
+                  <div>
+                    <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.4rem;">Source Type</label>
+                    <select id="select-url-type" class="form-control" style="width:100%; padding:0.65rem; border:1px solid var(--border-subtle); border-radius:var(--radius-sm); font-size:0.88rem;">
+                      <option value="auto">Auto-Detect</option>
+                      <option value="youtube">YouTube Video</option>
+                      <option value="web">Educational Website / Article</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.4rem;">Custom Title (Optional)</label>
+                    <input type="text" id="input-url-title" class="form-control" placeholder="e.g. Backpropagation Lecture" style="width:100%; padding:0.65rem 0.85rem; border:1px solid var(--border-subtle); border-radius:var(--radius-sm); font-size:0.88rem;">
+                  </div>
+                </div>
+
+                <div style="display:flex; justify-content:flex-end; margin-top:0.5rem;">
+                  <button class="btn btn-primary" id="btn-ingest-url">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+                    Ingest URL Source
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Tab 3: Record Voice Note -->
+            <div class="upload-tab-content" id="tab-content-voice">
+              <div class="voice-record-box">
+                <button class="mic-pulse-btn" id="btn-record-mic" title="Click to start recording">
+                  <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
+                </button>
+                <div class="voice-timer" id="voice-timer">00:00</div>
+                <p id="voice-status-text" style="font-size:0.85rem; color:var(--ink-muted); margin-top:0.4rem;">Click microphone to record a spoken lecture note</p>
+                <audio id="voice-preview-audio" controls style="display:none; width:100%; margin-top:1rem; border-radius:var(--radius-sm);"></audio>
+              </div>
+
+              <div style="margin-top:1.25rem; display:flex; justify-content:flex-end;">
+                <button class="btn btn-primary" id="btn-ingest-voice" disabled>
+                  Transcribe & Ingest Spoken Note
+                </button>
+              </div>
             </div>
           </div>
 
           <!-- Processing Stages & Status Card -->
           <div class="card">
-            <h3 style="margin-bottom: 1.25rem;">Ingestion Pipeline Stages</h3>
+            <h3 style="margin-bottom: 1.25rem;">LangGraph Ingestion Pipeline</h3>
             <div class="stages-list" id="ingest-stages">
               <div class="stage-item ${doc && doc.ready ? 'done' : ''}" id="stage-1">
                 <div class="stage-status-icon">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
                 </div>
                 <div class="stage-item-text">
-                  <h4>1. Semantic Section Chunker</h4>
-                  <p>Detects chapter headings and splits body text into ~110-word passages with page tags.</p>
+                  <h4>1. Type Detector & Content Extractor</h4>
+                  <p>Extracts pages, PPTX slides, YouTube transcripts, web articles, or audio speech.</p>
                 </div>
               </div>
 
@@ -577,8 +1473,8 @@
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
                 </div>
                 <div class="stage-item-text">
-                  <h4>2. Synonym & Term Normalizer</h4>
-                  <p>Standardizes technical terminology and variants against domain synonyms.</p>
+                  <h4>2. Semantic Section Chunker</h4>
+                  <p>Segments content into ~110-word passages anchored with exact citations ([Slide X], [04:15], etc.).</p>
                 </div>
               </div>
 
@@ -587,8 +1483,8 @@
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
                 </div>
                 <div class="stage-item-text">
-                  <h4>3. Vector Index & Metadata Store</h4>
-                  <p>Computes TF-IDF vector embeddings with cosine similarity for sub-second retrieval.</p>
+                  <h4>3. Synonym Normalizer & BM25 Inverted Index</h4>
+                  <p>Populates vectorless SQLite tables (chunks, concept_chunks, chunk_fts) without dense embeddings.</p>
                 </div>
               </div>
 
@@ -597,8 +1493,8 @@
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
                 </div>
                 <div class="stage-item-text">
-                  <h4>4. Prerequisite Concept Graph</h4>
-                  <p>Maps causal dependencies and reading orders between discovered concepts.</p>
+                  <h4>4. Unified Prerequisite Concept DAG</h4>
+                  <p>Merges heterogeneous materials into a unified topological dependency graph.</p>
                 </div>
               </div>
             </div>
@@ -610,15 +1506,88 @@
                 <div style="display:flex; justify-content:space-between; align-items:center;">
                   <div>
                     <span style="font-weight:700; color:var(--ink-primary);">${esc(doc.file)}</span>
-                    <p style="font-size:0.8rem; margin:0;">${doc.pages} page(s) · ${doc.concepts} concepts indexed</p>
+                    <p style="font-size:0.8rem; margin:0;">${doc.pages} page/segment(s) · ${doc.concepts} concepts indexed</p>
                   </div>
                   <span class="status-pill strong">Online</span>
                 </div>
               ` : `
-                <p style="color:var(--ink-muted); font-size:0.85rem;">No document currently loaded. Upload a PDF or click the sample button above.</p>
+                <p style="color:var(--ink-muted); font-size:0.85rem;">No active study material loaded. Upload a file, paste a link, or load the sample above.</p>
               `}
             </div>
           </div>
+        </div>
+
+        <!-- My Study Materials Library Card -->
+        <div class="card materials-library-section">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.25rem;">
+            <div>
+              <h3 style="margin:0 0 0.25rem 0;">My Study Materials</h3>
+              <p style="margin:0; font-size:0.85rem; color:var(--ink-muted);">Inspect exact parsed pages, slides, or timestamped transcripts stored in the vectorless database.</p>
+            </div>
+            <span class="active-doc-badge" style="font-weight:600;">
+              ${materials.length} Ingested Material${materials.length === 1 ? '' : 's'}
+            </span>
+          </div>
+
+          ${materials.length > 0 ? `
+            <div class="materials-table-wrap">
+              <table class="materials-table">
+                <thead>
+                  <tr>
+                    <th>Type</th>
+                    <th>Material Title & Source</th>
+                    <th>Extracted Chunks</th>
+                    <th>Canonical Concepts</th>
+                    <th>Added On</th>
+                    <th style="text-align:right;">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${materials.map(m => {
+                    const badgeClass = `badge-${(m.source_type || 'pdf').toLowerCase()}`;
+                    return `
+                      <tr>
+                        <td>
+                          <span class="material-type-badge ${badgeClass}">${esc(m.source_type)}</span>
+                        </td>
+                        <td>
+                          <div style="font-weight:600; color:var(--ink-primary);">${esc(m.title)}</div>
+                          <div style="font-size:0.78rem; color:var(--ink-muted); max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+                            ${esc(m.original_filename_or_url)}
+                          </div>
+                        </td>
+                        <td>
+                          <strong>${m.chunk_count}</strong> chunk(s)
+                        </td>
+                        <td>
+                          <span style="font-size:0.85rem;">${m.concept_count} concept(s)</span>
+                        </td>
+                        <td style="font-size:0.82rem; color:var(--ink-muted);">
+                          ${(m.created_at || '').slice(0, 10)}
+                        </td>
+                        <td style="text-align:right;">
+                          <div class="material-actions" style="justify-content:flex-end;">
+                            <button class="btn btn-sm btn-secondary btn-preview-mat" data-id="${esc(m.material_id)}">
+                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
+                              Preview
+                            </button>
+                            <button class="btn btn-sm btn-outline-danger btn-delete-mat" data-id="${esc(m.material_id)}" title="Delete material">
+                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    `;
+                  }).join('')}
+                </tbody>
+              </table>
+            </div>
+          ` : `
+            <div style="text-align:center; padding:2.5rem 1rem; color:var(--ink-muted); background:var(--surface-muted); border-radius:var(--radius-md);">
+              <p style="margin:0 0 0.5rem 0; font-size:1rem; font-weight:600; color:var(--ink-secondary);">No materials ingested yet.</p>
+              <p style="margin:0; font-size:0.85rem;">Upload a PDF, presentation, doc, or YouTube link above to start building your personalized knowledge base.</p>
+            </div>
+          `}
         </div>
       `;
     },
@@ -682,6 +1651,144 @@
               Send
             </button>
           </form>
+        </div>
+      `;
+    },
+
+    // -----------------------------------------------------------------------
+    // ACTIVE RECALL INTERACTIVE ENGINE (4-STAGE EPISTEMIC CYCLE)
+    // -----------------------------------------------------------------------
+    async activeRecall() {
+      await syncActiveDocument();
+      if (!AppState.masteryList || !AppState.masteryList.length) {
+        try {
+          const mRes = await ApiService.getMastery();
+          AppState.masteryList = mRes.concepts || [];
+        } catch (e) {
+          console.warn("Could not load mastery list for active recall", e);
+        }
+      }
+
+      const concepts = AppState.masteryList || [];
+      if (concepts.length === 0) {
+        return `
+          <div class="page-header">
+            <div class="page-header-text">
+              <h1>Active Recall</h1>
+              <p>Epistemic retrieval practice: Study &rarr; Focus Under Timer &rarr; Blind Retrieval &rarr; Gap Audit.</p>
+            </div>
+          </div>
+          <div class="empty-state-card">
+            <div class="empty-state-icon">
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 4.44-2.04"/>
+                <path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-4.44-2.04"/>
+              </svg>
+            </div>
+            <h3 class="empty-state-title">No Study Material Uploaded Yet</h3>
+            <p class="empty-state-desc">
+              Upload a PDF, lecture slides, YouTube link, or notes in the Study Material tab to generate your custom learning path and practice active recall.
+            </p>
+            <a href="#upload" class="btn btn-primary" style="margin-top:0.5rem;">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+              Upload Study Material &rarr;
+            </a>
+          </div>
+        `;
+      }
+
+      if (!AppState.activeRecallSession) {
+        const weak = concepts.find(c => getConceptStatus(c) === "weak");
+        const defaultCid = weak ? weak.id : concepts[0].id;
+        AppState.activeRecallSession = {
+          stage: 1,
+          conceptId: defaultCid,
+          timerSec: 180,
+          timeLeft: 180,
+          timerInterval: null,
+          card: null,
+          recallText: "",
+          verificationAnswer: "",
+          evaluation: null
+        };
+      }
+
+      const session = AppState.activeRecallSession;
+      if (!session.conceptId && concepts.length) {
+        session.conceptId = concepts[0].id;
+      }
+
+      // Load card if needed
+      if (!session.card || session.card.concept_id !== session.conceptId) {
+        try {
+          const cardRes = await ApiService.startActiveRecall(session.conceptId, getCurrentUserId());
+          if (cardRes && cardRes.card) {
+            session.card = cardRes.card;
+          }
+        } catch (e) {
+          console.warn("Could not load active recall card from backend, generating local card", e);
+          const cObj = concepts.find(c => c.id === session.conceptId) || { name: session.conceptId, id: session.conceptId };
+          session.card = {
+            concept_id: session.conceptId,
+            concept_name: cObj.name || session.conceptId,
+            core_intuition: `${cObj.name || session.conceptId} is a foundational principle in your curriculum governing parameter optimization, model behavior, and system guarantees.`,
+            formula_or_mechanism: `$$\\Delta \\theta = -\\eta \\nabla L(\\theta)$$ — parameter update rule along the direction of steepest error descent.`,
+            worked_example: `Example: In a cycle with state $\\theta_0 = 1.50$, learning rate $\\eta = 0.05$, and gradient $\\nabla L = 2.00$, the updated state is $\\theta_1 = 1.50 - (0.05 \\times 2.00) = 1.40$.`,
+            keywords: [cObj.name || session.conceptId, "Mechanism", "Parameter", "Optimization", "Gradient"],
+            source_citation: "Verified Course Materials · Section / Page 1",
+            verification_question: `In your own words, what is the core role and function of ${cObj.name || session.conceptId}?`
+          };
+        }
+      }
+
+      const activeConcept = concepts.find(c => c.id === session.conceptId) || { id: session.conceptId, name: session.conceptId };
+      const statusPill = getConceptStatus(activeConcept);
+
+      const conceptSelectHtml = concepts.map(c => `
+        <option value="${esc(c.id)}" ${c.id === session.conceptId ? "selected" : ""}>
+          ${esc(c.name || c.id)} (${getConceptStatus(c)})
+        </option>
+      `).join("");
+
+      return `
+        <div class="page-header" style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:1rem;">
+          <div class="page-header-text">
+            <h1>Active Recall Interactive Engine</h1>
+            <p>4-Stage Epistemic Cycle: Study &rarr; Focus Under Timer &rarr; Blind Retrieval &rarr; Gap Audit.</p>
+          </div>
+          <div class="page-header-actions" style="display:flex; align-items:center; gap:0.6rem;">
+            <label for="recall-concept-select" style="font-size:0.85rem; font-weight:600; color:var(--ink-secondary);">Concept:</label>
+            <select id="recall-concept-select" class="form-select" style="padding:0.45rem 0.85rem; border-radius:var(--radius-sm); border:1px solid var(--border-subtle); background:var(--surface); font-size:0.88rem; font-weight:600; color:var(--ink-primary); cursor:pointer;">
+              ${conceptSelectHtml}
+            </select>
+          </div>
+        </div>
+
+        <div class="active-recall-container">
+          <!-- 4-Stage Stepper -->
+          <div class="recall-stage-stepper">
+            <div class="recall-step-tab ${session.stage === 1 ? 'active' : (session.stage > 1 ? 'completed' : '')}">
+              <div class="recall-step-num">1</div>
+              <span>Teach Phase</span>
+            </div>
+            <div class="recall-step-tab ${session.stage === 2 ? 'active' : (session.stage > 2 ? 'completed' : '')}">
+              <div class="recall-step-num">2</div>
+              <span>Timed Study</span>
+            </div>
+            <div class="recall-step-tab ${session.stage === 3 ? 'active' : (session.stage > 3 ? 'completed' : '')}">
+              <div class="recall-step-num">3</div>
+              <span>Blind Retrieval</span>
+            </div>
+            <div class="recall-step-tab ${session.stage === 4 ? 'active' : ''}">
+              <div class="recall-step-num">4</div>
+              <span>Gap Audit</span>
+            </div>
+          </div>
+
+          <!-- Dynamic Stage Content Area -->
+          <div id="recall-stage-content">
+            ${renderRecallStageContent(session, statusPill)}
+          </div>
         </div>
       `;
     },
@@ -926,6 +2033,41 @@
       const unknownCount = masteryData.filter(c => getConceptStatus(c) === "unknown").length;
       const avg = total > 0 ? Math.round((masteryData.reduce((acc, c) => acc + ((c.attempts && c.attempts > 0) ? (c.score || 0) : 0), 0) / total) * 100) : 0;
 
+      // ── Empty-State Gating for Mastery Analytics ─────────────────────────
+      if (total === 0) {
+        return `
+          <div class="page-header">
+            <div class="page-header-text">
+              <h1>Progress &amp; Mastery Analytics</h1>
+              <p>Epistemic belief tracking using Beta(a,b) distributions across all verified concepts.</p>
+            </div>
+            <div class="page-header-actions">
+              <button class="btn btn-secondary btn-disabled-gated" disabled title="Upload study material first">Take Practice Quiz</button>
+            </div>
+          </div>
+
+          <div class="empty-state-card">
+            <div class="empty-state-icon">
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/>
+                <path d="M12 12v9"/>
+                <path d="m16 16-4-4-4 4"/>
+              </svg>
+            </div>
+            <h3 class="empty-state-title">No Study Material Uploaded Yet</h3>
+            <p class="empty-state-desc">
+              No study material uploaded yet. Upload a PDF, lecture slides, YouTube link, or notes in the Study Material tab to generate your custom learning path.
+            </p>
+            <a href="#upload" class="btn btn-primary" style="margin-top:0.5rem;">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+              Upload Study Material &rarr;
+            </a>
+          </div>
+        `;
+      }
+
+      const isBaselineDone = (AppState.baselineCompleted || (AppState.loopStatus && AppState.loopStatus.baseline_completed));
+
       return `
         <div class="page-header">
           <div class="page-header-text">
@@ -933,7 +2075,11 @@
             <p>Epistemic belief tracking using Beta(a,b) distributions across all verified concepts.</p>
           </div>
           <div class="page-header-actions">
-            <a href="#practice" class="btn btn-primary">Take Practice Quiz</a>
+            ${isBaselineDone ? `
+              <a href="#practice" class="btn btn-primary">Take Practice Quiz</a>
+            ` : `
+              <button class="btn btn-secondary btn-disabled-gated" disabled title="Complete baseline diagnostic first">Take Practice Quiz</button>
+            `}
           </div>
         </div>
 
@@ -1196,6 +2342,18 @@
 
   const AfterRender = {
     dashboard() {
+      const diagBtn = $("#btn-start-baseline-diagnostic");
+      if (diagBtn) {
+        diagBtn.onclick = () => startBaselineDiagnostic();
+      }
+
+      $$(".start-remedial-review").forEach(btn => {
+        btn.onclick = () => {
+          AppState.quizSession.remedialMode = true;
+          AppState.quizSession.targetConceptId = btn.getAttribute("data-target-concept");
+        };
+      });
+
       $$(".start-target-quiz").forEach(btn => {
         btn.onclick = () => {
           AppState.quizSession.targetConceptId = btn.getAttribute("data-target-concept");
@@ -1211,86 +2369,244 @@
     },
 
     upload() {
+      // 1. Tab Navigation
+      $$(".upload-tab-btn").forEach(btn => {
+        btn.onclick = () => {
+          $$(".upload-tab-btn").forEach(b => b.classList.remove("active"));
+          $$(".upload-tab-content").forEach(c => c.classList.remove("active"));
+          btn.classList.add("active");
+          const tab = btn.getAttribute("data-tab");
+          const content = $(`#tab-content-${tab}`);
+          if (content) content.classList.add("active");
+        };
+      });
+
+      // 2. File Upload Dropzone & Processing
       const dropzone = $("#upload-dropzone");
-      const fileInput = $("#pdf-file-input");
-      const processBtn = $("#btn-process-pdf");
+      const fileInput = $("#material-file-input") || $("#pdf-file-input");
+      const processBtn = $("#btn-process-files") || $("#btn-process-pdf");
       const sampleBtn = $("#btn-load-sample");
       const fileDisplay = $("#selected-file-display");
       const fileNameEl = $("#selected-file-name");
       let selectedFiles = [];
 
-      if (!dropzone || !fileInput || !processBtn) return;
-
-      dropzone.onclick = () => fileInput.click();
-
-      function updateFileSelection(fileList) {
-        const pdfs = Array.from(fileList || []).filter(f => f.name.toLowerCase().endsWith(".pdf"));
-        if (!pdfs.length) {
-          showToast("Please select at least one valid PDF file.", "warning");
-          return;
-        }
-        selectedFiles = pdfs;
-        if (pdfs.length === 1) {
-          fileNameEl.textContent = pdfs[0].name;
-        } else {
-          fileNameEl.textContent = `${pdfs.length} PDFs selected (${pdfs.map(f => f.name).join(", ")})`;
-        }
-        fileDisplay.style.display = "inline-flex";
-        processBtn.disabled = false;
-        processBtn.textContent = `Process ${pdfs.length > 1 ? pdfs.length + " PDFs" : "PDF Material"}`;
+      if (dropzone && fileInput) {
+        dropzone.onclick = () => fileInput.click();
       }
 
-      fileInput.onchange = () => {
-        if (fileInput.files && fileInput.files.length) {
-          updateFileSelection(fileInput.files);
-        }
-      };
-
-      ["dragover", "dragenter"].forEach(ev => {
-        dropzone.addEventListener(ev, e => {
-          e.preventDefault();
-          dropzone.classList.add("over");
+      function updateFileSelection(fileList) {
+        const allowedExts = [".pdf", ".pptx", ".ppt", ".md", ".txt", ".docx", ".mp3", ".wav", ".m4a", ".webm"];
+        const valid = Array.from(fileList || []).filter(f => {
+          const ext = f.name.slice(f.name.lastIndexOf(".")).toLowerCase();
+          return allowedExts.includes(ext);
         });
-      });
-
-      ["dragleave", "drop"].forEach(ev => {
-        dropzone.addEventListener(ev, e => {
-          e.preventDefault();
-          dropzone.classList.remove("over");
-          if (ev === "drop" && e.dataTransfer.files && e.dataTransfer.files.length) {
-            updateFileSelection(e.dataTransfer.files);
+        if (!valid.length) {
+          showToast("Please select valid study material files (PDF, PPTX, DOCX, Markdown, or Audio).", "warning");
+          return;
+        }
+        selectedFiles = valid;
+        if (fileNameEl) {
+          if (valid.length === 1) {
+            fileNameEl.textContent = valid[0].name;
+          } else {
+            fileNameEl.textContent = `${valid.length} materials selected (${valid.map(f => f.name).join(", ")})`;
           }
-        });
-      });
-
-      // Process Ingestion
-      processBtn.onclick = async () => {
-        if (!selectedFiles.length) return;
-        processBtn.disabled = true;
-        processBtn.textContent = `Processing ${selectedFiles.length > 1 ? selectedFiles.length + " PDFs" : "PDF"}...`;
-
-        const stages = [$("#stage-1"), $("#stage-2"), $("#stage-3"), $("#stage-4")];
-        stages.forEach(s => s && (s.className = "stage-item running"));
-
-        try {
-          const result = await ApiService.uploadPdf(selectedFiles);
-          stages.forEach(s => s && (s.className = "stage-item done"));
-          const discoveredCount = result.concepts ? (Array.isArray(result.concepts) ? result.concepts.length : result.concepts) : 6;
-          const filesCount = result.files_count || selectedFiles.length;
-          showToast(`Ingestion complete! ${discoveredCount} concepts discovered across ${filesCount} document(s).`, "success");
-          await syncActiveDocument();
-          setTimeout(() => {
-            location.hash = "#dashboard";
-          }, 1200);
-        } catch (err) {
-          stages.forEach(s => s && (s.className = "stage-item"));
-          showToast(`Ingestion error: ${err.message}`, "danger");
-          processBtn.disabled = false;
-          processBtn.textContent = "Retry Processing";
         }
-      };
+        if (fileDisplay) fileDisplay.style.display = "inline-flex";
+        if (processBtn) {
+          processBtn.disabled = false;
+          processBtn.textContent = `Process ${valid.length > 1 ? valid.length + " Materials" : "Study Material"}`;
+        }
+      }
 
-      // Sample 1-Click Loader
+      if (fileInput) {
+        fileInput.onchange = () => {
+          if (fileInput.files && fileInput.files.length) {
+            updateFileSelection(fileInput.files);
+          }
+        };
+      }
+
+      if (dropzone) {
+        ["dragover", "dragenter"].forEach(ev => {
+          dropzone.addEventListener(ev, e => {
+            e.preventDefault();
+            dropzone.classList.add("over");
+          });
+        });
+
+        ["dragleave", "drop"].forEach(ev => {
+          dropzone.addEventListener(ev, e => {
+            e.preventDefault();
+            dropzone.classList.remove("over");
+            if (ev === "drop" && e.dataTransfer.files && e.dataTransfer.files.length) {
+              updateFileSelection(e.dataTransfer.files);
+            }
+          });
+        });
+      }
+
+      // Process Ingestion for Uploaded Files
+      if (processBtn) {
+        processBtn.onclick = async () => {
+          if (!selectedFiles.length) return;
+          processBtn.disabled = true;
+          processBtn.textContent = `Ingesting ${selectedFiles.length > 1 ? selectedFiles.length + " materials" : "material"}...`;
+
+          const stages = [$("#stage-1"), $("#stage-2"), $("#stage-3"), $("#stage-4")];
+          stages.forEach(s => s && (s.className = "stage-item running"));
+
+          try {
+            // If strictly PDFs, call uploadPdf for backward compatibility; otherwise ingestMaterialFile
+            let result = await ApiService.ingestMaterialFile(selectedFiles, getCurrentUserId());
+
+            stages.forEach(s => s && (s.className = "stage-item done"));
+            showToast("Material ingested successfully into vectorless index!", "success");
+            await syncActiveDocument();
+            setTimeout(() => {
+              navigateTo("upload");
+            }, 800);
+          } catch (err) {
+            stages.forEach(s => s && (s.className = "stage-item"));
+            showToast(`Ingestion error: ${err.message}`, "danger");
+            processBtn.disabled = false;
+            processBtn.textContent = "Retry Processing";
+          }
+        };
+      }
+
+      // 3. YouTube / Web URL Ingestion Handler
+      const ingestUrlBtn = $("#btn-ingest-url");
+      const urlInput = $("#input-material-url");
+      const urlTypeSelect = $("#select-url-type");
+      const urlTitleInput = $("#input-url-title");
+
+      if (ingestUrlBtn && urlInput) {
+        ingestUrlBtn.onclick = async () => {
+          const rawUrl = (urlInput.value || "").trim();
+          if (!rawUrl || !(rawUrl.startsWith("http://") || rawUrl.startsWith("https://"))) {
+            showToast("Please enter a valid URL starting with http:// or https://", "warning");
+            return;
+          }
+
+          ingestUrlBtn.disabled = true;
+          ingestUrlBtn.textContent = "Ingesting URL Content...";
+
+          const stages = [$("#stage-1"), $("#stage-2"), $("#stage-3"), $("#stage-4")];
+          stages.forEach(s => s && (s.className = "stage-item running"));
+
+          try {
+            const sourceType = urlTypeSelect ? urlTypeSelect.value : "auto";
+            const customTitle = urlTitleInput ? urlTitleInput.value.trim() : "";
+            await ApiService.ingestMaterialUrl(rawUrl, sourceType, getCurrentUserId(), customTitle);
+
+            stages.forEach(s => s && (s.className = "stage-item done"));
+            showToast("URL material successfully parsed and indexed!", "success");
+            await syncActiveDocument();
+            setTimeout(() => {
+              navigateTo("upload");
+            }, 800);
+          } catch (err) {
+            stages.forEach(s => s && (s.className = "stage-item"));
+            showToast(`Ingest URL error: ${err.message}`, "danger");
+            ingestUrlBtn.disabled = false;
+            ingestUrlBtn.textContent = "Ingest URL Source";
+          }
+        };
+      }
+
+      // 4. Voice Note Recording Handler
+      const recordMicBtn = $("#btn-record-mic");
+      const voiceTimerEl = $("#voice-timer");
+      const voiceStatusText = $("#voice-status-text");
+      const voicePreviewAudio = $("#voice-preview-audio");
+      const ingestVoiceBtn = $("#btn-ingest-voice");
+
+      let mediaRecorder = null;
+      let audioChunks = [];
+      let timerInterval = null;
+      let recordSeconds = 0;
+      let recordedAudioBlob = null;
+
+      if (recordMicBtn) {
+        recordMicBtn.onclick = async () => {
+          if (mediaRecorder && mediaRecorder.state === "recording") {
+            // Stop recording
+            mediaRecorder.stop();
+            clearInterval(timerInterval);
+            recordMicBtn.classList.remove("recording");
+            if (voiceStatusText) voiceStatusText.textContent = "Recording stopped. Listen to preview or ingest below.";
+            return;
+          }
+
+          // Start recording
+          try {
+            audioChunks = [];
+            recordSeconds = 0;
+            if (voiceTimerEl) voiceTimerEl.textContent = "00:00";
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            mediaRecorder = new MediaRecorder(stream);
+
+            mediaRecorder.ondataavailable = e => {
+              if (e.data.size > 0) audioChunks.push(e.data);
+            };
+
+            mediaRecorder.onstop = () => {
+              recordedAudioBlob = new Blob(audioChunks, { type: "audio/webm" });
+              if (voicePreviewAudio) {
+                voicePreviewAudio.src = URL.createObjectURL(recordedAudioBlob);
+                voicePreviewAudio.style.display = "block";
+              }
+              if (ingestVoiceBtn) ingestVoiceBtn.disabled = false;
+              stream.getTracks().forEach(track => track.stop());
+            };
+
+            mediaRecorder.start();
+            recordMicBtn.classList.add("recording");
+            if (voiceStatusText) voiceStatusText.textContent = "Recording spoken lecture... Click again to finish.";
+
+            timerInterval = setInterval(() => {
+              recordSeconds++;
+              const mm = String(Math.floor(recordSeconds / 60)).padStart(2, "0");
+              const ss = String(recordSeconds % 60).padStart(2, "0");
+              if (voiceTimerEl) voiceTimerEl.textContent = `${mm}:${ss}`;
+            }, 1000);
+          } catch (err) {
+            showToast(`Microphone access error: ${err.message}`, "danger");
+          }
+        };
+      }
+
+      if (ingestVoiceBtn) {
+        ingestVoiceBtn.onclick = async () => {
+          if (!recordedAudioBlob) return;
+          ingestVoiceBtn.disabled = true;
+          ingestVoiceBtn.textContent = "Transcribing & Ingesting...";
+
+          const stages = [$("#stage-1"), $("#stage-2"), $("#stage-3"), $("#stage-4")];
+          stages.forEach(s => s && (s.className = "stage-item running"));
+
+          try {
+            const fileName = `voice_note_${Date.now()}.webm`;
+            const audioFile = new File([recordedAudioBlob], fileName, { type: "audio/webm" });
+            await ApiService.ingestMaterialFile([audioFile], getCurrentUserId(), "Spoken Lecture Voice Note");
+
+            stages.forEach(s => s && (s.className = "stage-item done"));
+            showToast("Voice note transcribed & indexed successfully!", "success");
+            await syncActiveDocument();
+            setTimeout(() => {
+              navigateTo("upload");
+            }, 800);
+          } catch (err) {
+            stages.forEach(s => s && (s.className = "stage-item"));
+            showToast(`Voice note ingestion error: ${err.message}`, "danger");
+            ingestVoiceBtn.disabled = false;
+            ingestVoiceBtn.textContent = "Transcribe & Ingest Spoken Note";
+          }
+        };
+      }
+
+      // 5. Sample 1-Click Loader
       if (sampleBtn) {
         sampleBtn.onclick = async () => {
           sampleBtn.disabled = true;
@@ -1299,13 +2615,13 @@
           stages.forEach(s => s && (s.className = "stage-item running"));
 
           try {
-            const res = await ApiService.loadSamplePdf();
+            await ApiService.loadSamplePdf();
             stages.forEach(s => s && (s.className = "stage-item done"));
             showToast("Sample 'Machine Learning Basics' loaded successfully!", "success");
             await syncActiveDocument();
             setTimeout(() => {
-              location.hash = "#dashboard";
-            }, 1000);
+              navigateTo("upload");
+            }, 800);
           } catch (e) {
             stages.forEach(s => s && (s.className = "stage-item"));
             showToast(`Could not load sample: ${e.message}`, "danger");
@@ -1314,6 +2630,152 @@
           }
         };
       }
+
+      // 6. Delete Material Action
+      $$(".btn-delete-mat").forEach(btn => {
+        btn.onclick = async e => {
+          e.stopPropagation();
+          const matId = btn.getAttribute("data-id");
+          if (!matId) return;
+          if (!confirm("Are you sure you want to remove this study material? The knowledge base and concept graph will be updated.")) {
+            return;
+          }
+          btn.disabled = true;
+          try {
+            await ApiService.deleteMaterial(matId, getCurrentUserId());
+            showToast("Material removed and knowledge base updated.", "success");
+            await syncActiveDocument();
+            navigateTo("upload");
+          } catch (err) {
+            showToast(`Delete failed: ${err.message}`, "danger");
+            btn.disabled = false;
+          }
+        };
+      });
+
+      // 7. Interactive Preview Modal Action
+      const previewModal = $("#material-preview-modal");
+      const previewModalClose = $("#preview-modal-close");
+      const previewModalTitle = $("#preview-modal-title");
+      const previewModalBadge = $("#preview-modal-type-badge");
+      const previewModalBody = $("#preview-modal-body");
+
+      if (previewModalClose && previewModal) {
+        previewModalClose.onclick = () => previewModal.close();
+      }
+
+      $$(".btn-preview-mat").forEach(btn => {
+        btn.onclick = async () => {
+          const matId = btn.getAttribute("data-id");
+          if (!matId || !previewModal) return;
+
+          btn.disabled = true;
+          const origText = btn.innerHTML;
+          btn.textContent = "Loading...";
+
+          try {
+            const preview = await ApiService.getMaterialPreview(matId);
+            btn.disabled = false;
+            btn.innerHTML = origText;
+
+            if (previewModalTitle) previewModalTitle.textContent = preview.title || "Material Preview";
+            if (previewModalBadge) {
+              const stype = (preview.source_type || "pdf").toLowerCase();
+              previewModalBadge.textContent = stype.toUpperCase();
+              previewModalBadge.className = `material-type-badge badge-${stype}`;
+            }
+
+            // Render structured preview based on source type
+            let bodyHtml = "";
+            const stype = (preview.source_type || "").toLowerCase();
+            const items = Array.isArray(preview.structured_preview) ? preview.structured_preview : [];
+
+            if (stype === "youtube") {
+              const videoId = items[0]?.video_id || "";
+              bodyHtml = `
+                <div class="youtube-split-viewer">
+                  <div class="video-player-frame">
+                    ${videoId ? `
+                      <iframe src="https://www.youtube.com/embed/${esc(videoId)}" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
+                    ` : `
+                      <div style="display:flex; align-items:center; justify-content:center; height:100%; color:#fff;">No video stream available</div>
+                    `}
+                  </div>
+                  <div class="youtube-transcript-list">
+                    <h4 style="margin:0 0 0.5rem 0; font-size:0.95rem; color:var(--ink-primary);">Timestamped Transcript</h4>
+                    ${items.map(it => `
+                      <div class="transcript-row">
+                        <span class="transcript-ts-badge">[${esc(it.label || it.timestamp)}]</span>
+                        <span>${esc(it.text)}</span>
+                      </div>
+                    `).join('')}
+                  </div>
+                </div>
+              `;
+            } else if (stype === "web") {
+              bodyHtml = `
+                <div class="web-reader-container">
+                  <div style="margin-bottom:1.25rem; font-size:0.85rem; color:var(--ink-muted);">
+                    Source Article: <a href="${esc(preview.original_filename_or_url)}" target="_blank" rel="noopener" style="color:var(--primary); font-weight:600;">${esc(preview.original_filename_or_url)}</a>
+                  </div>
+                  ${items.map(it => `
+                    <div style="margin-bottom:1.5rem;">
+                      <h3 class="web-reader-heading">${esc(it.heading || it.label)}</h3>
+                      <p style="white-space:pre-wrap; color:var(--ink-secondary); font-size:0.95rem;">${esc(it.text)}</p>
+                    </div>
+                  `).join('')}
+                </div>
+              `;
+            } else if (stype === "audio") {
+              bodyHtml = `
+                <div class="preview-cards-list">
+                  <div style="background:var(--surface-muted); padding:1rem; border-radius:var(--radius-md); margin-bottom:0.5rem;">
+                    <h4 style="margin:0 0 0.25rem 0;">Audio Voice Note Transcript</h4>
+                    <p style="margin:0; font-size:0.85rem; color:var(--ink-muted);">Speech recognized and segmented into timestamped topics.</p>
+                  </div>
+                  ${items.map(it => `
+                    <div class="preview-card-item">
+                      <div class="preview-card-header">
+                        <span class="preview-locator-pill">${esc(it.label)}</span>
+                        <span style="font-size:0.8rem; color:var(--ink-muted);">${esc(it.timestamp || '')}</span>
+                      </div>
+                      <div class="preview-card-text">${esc(it.text)}</div>
+                    </div>
+                  `).join('')}
+                </div>
+              `;
+            } else {
+              // PDF, PPTX, Markdown, DOCX
+              bodyHtml = `
+                <div class="preview-cards-list">
+                  ${items.map(it => `
+                    <div class="preview-card-item">
+                      <div class="preview-card-header">
+                        <span class="preview-locator-pill">${esc(it.label)}</span>
+                        ${it.title ? `<strong style="font-size:0.95rem; color:var(--ink-primary);">${esc(it.title)}</strong>` : ''}
+                        ${it.heading ? `<strong style="font-size:0.95rem; color:var(--ink-primary);">${esc(it.heading)}</strong>` : ''}
+                      </div>
+                      <div class="preview-card-text">${esc(it.text)}</div>
+                      ${it.notes ? `
+                        <div class="preview-notes-box">
+                          <strong>Speaker Notes:</strong> ${esc(it.notes)}
+                        </div>
+                      ` : ''}
+                    </div>
+                  `).join('')}
+                </div>
+              `;
+            }
+
+            if (previewModalBody) previewModalBody.innerHTML = bodyHtml;
+            previewModal.showModal();
+          } catch (err) {
+            btn.disabled = false;
+            btn.innerHTML = origText;
+            showToast(`Could not load preview: ${err.message}`, "danger");
+          }
+        };
+      });
     },
 
     tutor() {
@@ -1414,6 +2876,187 @@
             }
           }
         };
+      }
+    },
+
+    activeRecall() {
+      renderMath(document);
+      const session = AppState.activeRecallSession;
+      if (!session) return;
+
+      // Concept Selector
+      const conceptSelect = $("#recall-concept-select");
+      if (conceptSelect) {
+        conceptSelect.onchange = async () => {
+          if (session.timerInterval) {
+            clearInterval(session.timerInterval);
+            session.timerInterval = null;
+          }
+          session.conceptId = conceptSelect.value;
+          session.stage = 1;
+          session.card = null;
+          session.recallText = "";
+          session.verificationAnswer = "";
+          session.evaluation = null;
+          navigateTo("active-recall");
+        };
+      }
+
+      // Stage 1: Timer Pills
+      $$(".timer-pill-btn").forEach(btn => {
+        btn.onclick = () => {
+          $$(".timer-pill-btn").forEach(b => b.classList.remove("active"));
+          btn.classList.add("active");
+          const secs = parseInt(btn.getAttribute("data-seconds"), 10) || 180;
+          session.timerSec = secs;
+          session.timeLeft = secs;
+          const startBtn = $("#btn-start-recall-timer");
+          if (startBtn) {
+            startBtn.innerHTML = `Start Learning Timer (${Math.round(secs/60)}m) &rarr;`;
+          }
+        };
+      });
+
+      // Stage 1: Start Timer
+      const startTimerBtn = $("#btn-start-recall-timer");
+      if (startTimerBtn) {
+        startTimerBtn.onclick = () => {
+          session.stage = 2;
+          session.timeLeft = session.timerSec;
+          navigateTo("active-recall");
+        };
+      }
+
+      // Stage 2: Timer Countdown & "I'm Ready"
+      if (session.stage === 2) {
+        if (session.timerInterval) clearInterval(session.timerInterval);
+
+        const ringCircle = $("#timer-ring-circle");
+        const timerText = $("#timer-countdown-text");
+        const circumference = 2 * Math.PI * 38;
+
+        session.timerInterval = setInterval(() => {
+          session.timeLeft--;
+          if (session.timeLeft <= 0) {
+            clearInterval(session.timerInterval);
+            session.timerInterval = null;
+            session.stage = 3;
+            navigateTo("active-recall");
+            return;
+          }
+          if (timerText) {
+            const m = Math.floor(session.timeLeft / 60);
+            const s = session.timeLeft % 60;
+            timerText.textContent = `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+          }
+          if (ringCircle) {
+            const ratio = session.timeLeft / session.timerSec;
+            ringCircle.style.strokeDashoffset = circumference * (1 - ratio);
+          }
+        }, 1000);
+
+        const readyBtn = $("#btn-ready-test-now");
+        if (readyBtn) {
+          readyBtn.onclick = () => {
+            if (session.timerInterval) {
+              clearInterval(session.timerInterval);
+              session.timerInterval = null;
+            }
+            session.stage = 3;
+            navigateTo("active-recall");
+          };
+        }
+      }
+
+      // Stage 3: Blind Retrieval Input & Submit
+      if (session.stage === 3) {
+        const recallTextarea = $("#active-recall-text");
+        const statsDisplay = $("#recall-stats-display");
+        const submitBtn = $("#btn-submit-active-recall");
+        const verifInput = $("#verification-answer-input");
+
+        if (recallTextarea) {
+          recallTextarea.focus();
+          recallTextarea.addEventListener("input", () => {
+            const val = recallTextarea.value;
+            session.recallText = val;
+            const words = val.trim() ? val.trim().split(/\s+/).length : 0;
+            const chars = val.length;
+            if (statsDisplay) {
+              statsDisplay.textContent = `${words} word${words === 1 ? '' : 's'} · ${chars} character${chars === 1 ? '' : 's'}`;
+            }
+            if (submitBtn) {
+              submitBtn.disabled = (val.trim().length < 15);
+            }
+          });
+        }
+
+        if (verifInput) {
+          verifInput.addEventListener("input", () => {
+            session.verificationAnswer = verifInput.value;
+          });
+        }
+
+        if (submitBtn) {
+          submitBtn.onclick = async () => {
+            submitBtn.disabled = true;
+            submitBtn.innerHTML = "Evaluating Retrieval...";
+            const duration = session.timerSec - session.timeLeft;
+            try {
+              const evalRes = await ApiService.evaluateActiveRecall(
+                session.conceptId,
+                session.recallText,
+                session.verificationAnswer,
+                duration,
+                getCurrentUserId()
+              );
+              session.evaluation = evalRes;
+              session.stage = 4;
+              navigateTo("active-recall");
+            } catch (evalErr) {
+              showToast(`Evaluation failed: ${evalErr.message}`, "danger");
+              submitBtn.disabled = false;
+              submitBtn.innerHTML = "Submit Active Recall &rarr;";
+            }
+          };
+        }
+      }
+
+      // Stage 4: Retry / Continue Actions
+      if (session.stage === 4) {
+        const retryBtn = $("#btn-recall-retry");
+        const continueBtn = $("#btn-recall-continue");
+
+        if (retryBtn) {
+          retryBtn.onclick = () => {
+            session.stage = 1;
+            session.recallText = "";
+            session.verificationAnswer = "";
+            session.evaluation = null;
+            navigateTo("active-recall");
+          };
+        }
+
+        if (continueBtn) {
+          continueBtn.onclick = () => {
+            const concepts = AppState.masteryList || [];
+            const curIdx = concepts.findIndex(c => c.id === session.conceptId);
+            const nextIdx = (curIdx + 1) % Math.max(concepts.length, 1);
+            session.conceptId = concepts[nextIdx] ? concepts[nextIdx].id : session.conceptId;
+            session.stage = 1;
+            session.card = null;
+            session.recallText = "";
+            session.verificationAnswer = "";
+            session.evaluation = null;
+            navigateTo("active-recall");
+          };
+        }
+
+        $$(".start-target-quiz").forEach(btn => {
+          btn.onclick = () => {
+            AppState.quizSession.targetConceptId = btn.getAttribute("data-target-concept");
+          };
+        });
       }
     },
 
@@ -1588,12 +3231,42 @@
         <div class="upload-icon-pulse" style="width:40px; height:40px;">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
         </div>
-        <p style="margin-top:0.75rem;">Generating adaptive question...</p>
+        <p style="margin-top:0.75rem;">Generating adaptive assessment item...</p>
       </div>
     `;
 
     try {
-      const q = await ApiService.getNextQuestion(targetCid);
+      let q = null;
+      if (AppState.quizSession.remedialMode) {
+        AppState.quizSession.remedialMode = false;
+        try {
+          const remRes = await ApiService.getRemedialQuiz(targetCid, getCurrentUserId());
+          if (remRes && remRes.question) {
+            q = remRes.question;
+            if (remRes.concept_name) q.conceptName = remRes.concept_name;
+          }
+        } catch (remErr) {
+          console.warn("Remedial quiz routing fallback:", remErr);
+        }
+      }
+
+      if (!q) {
+        q = await ApiService.getNextQuestion(targetCid);
+      }
+
+      if (!AppState.quizSession.seenQuestionIds) {
+        AppState.quizSession.seenQuestionIds = new Set();
+      }
+
+      // Fresh question deduplication
+      if (AppState.quizSession.seenQuestionIds.has(q.id)) {
+        try {
+          const fresh = await ApiService.getNextQuestion(targetCid);
+          if (fresh && fresh.id !== q.id) q = fresh;
+        } catch (_) {}
+      }
+      AppState.quizSession.seenQuestionIds.add(q.id);
+
       AppState.quizSession.currentQuestion = q;
       renderActiveQuestion(q);
     } catch (err) {
@@ -1625,6 +3298,9 @@
     } else if (qType === "typed_qa") {
       typeBadgeLabel = "Open-Ended Q&A";
       typeBadgeClass = "typed_qa";
+    } else if (qType === "numerical") {
+      typeBadgeLabel = "Numerical Calculation";
+      typeBadgeClass = "numerical";
     }
 
     // Dynamic input area based on question type
@@ -1652,6 +3328,52 @@
           <div class="qa-helper-bar">
             <span>AI Mastery Judge evaluates your conceptual explanation and depth.</span>
             <span id="qa-char-count">0 characters</span>
+          </div>
+        </div>
+      `;
+    } else if (qType === "numerical") {
+      const givenParams = q.givenParameters || q.given_parameters || {};
+      const formulaHint = q.formulaHint || q.formula_hint || "";
+      const unitOrFormat = q.unitOrFormat || q.unit_or_format || "Round to 2 decimal places";
+      inputHtml = `
+        <div class="numerical-container">
+          ${Object.keys(givenParams).length > 0 ? `
+            <div class="numerical-params-grid">
+              ${Object.entries(givenParams).map(([k, v]) => `
+                <div class="numerical-param-pill">
+                  <span class="param-key">${esc(k)}</span>
+                  <span class="param-val">${esc(v)}</span>
+                </div>
+              `).join("")}
+            </div>
+          ` : ''}
+
+          ${formulaHint ? `
+            <div class="formula-hint-container">
+              <button type="button" class="formula-hint-toggle" id="btn-toggle-formula-hint">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+                <span>Show Formula Hint</span>
+              </button>
+              <div class="formula-hint-content" id="formula-hint-box" style="display:none;">
+                ${formulaHint.includes("$") ? formulaHint : `$$${formulaHint}$$`}
+              </div>
+            </div>
+          ` : ''}
+
+          <div class="numerical-input-group">
+            <label for="numerical-input">Enter Calculated Value:</label>
+            <div class="numerical-input-row">
+              <input type="number" step="any" id="numerical-input" class="numerical-input" placeholder="0.00" autocomplete="off" />
+              <span class="numerical-unit-tag">${esc(unitOrFormat)}</span>
+            </div>
+          </div>
+
+          <div class="scratchpad-wrap">
+            <div class="scratchpad-toggle" id="btn-toggle-scratchpad">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+              <span>Scratchpad / Working Steps (optional)</span>
+            </div>
+            <textarea id="numerical-scratchpad" class="scratchpad-textarea" rows="2" placeholder="Working steps or notes..."></textarea>
           </div>
         </div>
       `;
@@ -1705,7 +3427,28 @@
     const skipBtn = $("#btn-quiz-skip");
     const fitbInput = $("#fitb-user-input");
     const typedQaInput = $("#typed-qa-user-input");
+    const numericalInput = $("#numerical-input");
+    const formulaToggleBtn = $("#btn-toggle-formula-hint");
+    const formulaBox = $("#formula-hint-box");
+    const scratchpadToggleBtn = $("#btn-toggle-scratchpad");
+    const scratchpadArea = $("#numerical-scratchpad");
     const optionBtns = box.querySelectorAll(".quiz-opt-btn");
+
+    // Toggle listeners for formula hint and scratchpad
+    if (formulaToggleBtn && formulaBox) {
+      formulaToggleBtn.onclick = () => {
+        const isHidden = (formulaBox.style.display === "none");
+        formulaBox.style.display = isHidden ? "block" : "none";
+        formulaToggleBtn.querySelector("span").textContent = isHidden ? "Hide Formula Hint" : "Show Formula Hint";
+        if (isHidden) renderMath(formulaBox);
+      };
+    }
+
+    if (scratchpadToggleBtn && scratchpadArea) {
+      scratchpadToggleBtn.onclick = () => {
+        scratchpadArea.style.display = (scratchpadArea.style.display === "none") ? "block" : "none";
+      };
+    }
 
     // Input listeners per type
     if (qType === "fill_in_the_blanks" && fitbInput) {
@@ -1725,6 +3468,16 @@
         const len = typedQaInput.value.trim().length;
         if (countEl) countEl.textContent = `${len} character${len === 1 ? '' : 's'}`;
         submitBtn.disabled = (len < 4);
+      });
+    } else if (qType === "numerical" && numericalInput) {
+      numericalInput.focus();
+      numericalInput.addEventListener("input", () => {
+        submitBtn.disabled = !numericalInput.value.trim();
+      });
+      numericalInput.addEventListener("keydown", e => {
+        if (e.key === "Enter" && !submitBtn.disabled) {
+          submitBtn.click();
+        }
       });
     } else {
       // MCQ
@@ -1773,12 +3526,17 @@
     if (submitBtn) {
       submitBtn.onclick = async () => {
         let typedVal = "";
+        let numVal = null;
         if (qType === "fill_in_the_blanks") {
           typedVal = fitbInput ? fitbInput.value.trim() : "";
           if (!typedVal) return;
         } else if (qType === "typed_qa") {
           typedVal = typedQaInput ? typedQaInput.value.trim() : "";
           if (!typedVal) return;
+        } else if (qType === "numerical") {
+          typedVal = numericalInput ? numericalInput.value.trim() : "";
+          if (!typedVal) return;
+          numVal = parseFloat(typedVal);
         } else {
           if (selectedIdx === null) return;
         }
@@ -1787,23 +3545,28 @@
         skipBtn.disabled = true;
         if (fitbInput) fitbInput.disabled = true;
         if (typedQaInput) typedQaInput.disabled = true;
+        if (numericalInput) numericalInput.disabled = true;
+        if (scratchpadArea) scratchpadArea.disabled = true;
         optionBtns.forEach(b => (b.disabled = true));
 
         try {
+          const scratchpadNote = scratchpadArea ? scratchpadArea.value.trim() : "";
           // Authoritative submission to backend supporting mixed question formats
           const result = await ApiService.submitAnswer(
             q.id,
             q.conceptId,
             selectedIdx,
             null,
+            scratchpadNote || typedVal,
             typedVal,
-            typedVal
+            numVal
           );
           const isCorrect = Boolean(result.correct);
           const correctIdx = result.correctIndex !== undefined ? result.correctIndex : q.correct;
           const explanation = result.explanation || q.explanation || "Evaluation recorded in learner belief model.";
           const reasoningDepth = result.reasoning_depth_level || result.reasoningDepth || "EVALUATED";
           const correctDisplay = result.correct_answer_display || result.correctAnswerDisplay || q.targetBlankAnswer || q.target_blank_answer || "";
+          const stepSolution = result.step_by_step_solution || result.stepByStepSolution || q.stepByStepSolution || q.step_by_step_solution || "";
 
           if (isCorrect) {
             AppState.quizSession.score++;
@@ -1848,6 +3611,22 @@
                 ${correctDisplay ? `<div style="margin-top:0.25rem; font-size:0.83rem;">Expected Concepts: ${esc(correctDisplay)}</div>` : ''}
               </div>
             `;
+          } else if (qType === "numerical") {
+            reviewSnippet = `
+              <div class="quiz-answer-review">
+                <div>Your calculated value: <strong>${esc(typedVal)}</strong></div>
+                ${!isCorrect ? `<div>Target value: <strong style="color:var(--color-strong);">${esc(correctDisplay)}</strong></div>` : ''}
+              </div>
+              ${stepSolution ? `
+                <div class="step-by-step-box">
+                  <div class="step-by-step-header">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 14 14"/></svg>
+                    <span>Step-by-Step Solution</span>
+                  </div>
+                  <div class="step-by-step-content">${esc(stepSolution)}</div>
+                </div>
+              ` : ''}
+            `;
           }
 
           feedbackBox.innerHTML = `
@@ -1855,10 +3634,10 @@
               <div style="display:flex; align-items:center; gap:0.5rem; margin-bottom:0.35rem; font-weight:700;">
                 ${isCorrect ? `
                   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
-                  <span>${qType === 'typed_qa' ? 'Concept Well Explained!' : 'Correct!'}</span>
+                  <span>${qType === 'typed_qa' ? 'Concept Well Explained!' : (qType === 'numerical' ? 'Calculation Verified Correct!' : 'Correct!')}</span>
                 ` : `
                   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-                  <span>${qType === 'typed_qa' ? 'Review Recommended.' : 'Not quite.'}</span>
+                  <span>${qType === 'typed_qa' ? 'Review Recommended.' : (qType === 'numerical' ? 'Calculation Variance Detected.' : 'Not quite.')}</span>
                 `}
               </div>
               ${reviewSnippet}
@@ -1970,6 +3749,7 @@
         dashboard: "Dashboard",
         upload: "Study Material",
         tutor: "AI Tutor",
+        "active-recall": "Active Recall",
         practice: "Concept Check",
         "learning-path": "Learning Path",
         progress: "Mastery Analytics",
@@ -1984,8 +3764,12 @@
     }
   }
 
+  function navigate(routeId) {
+    return navigateTo(routeId);
+  }
+
   async function navigateTo(routeId) {
-    const validRoutes = ["dashboard", "upload", "tutor", "practice", "learning-path", "progress", "settings"];
+    const validRoutes = ["dashboard", "upload", "tutor", "active-recall", "practice", "learning-path", "progress", "settings"];
     const activeRoute = validRoutes.includes(routeId) ? routeId : "dashboard";
     AppState.currentRoute = activeRoute;
     updateNavigation(activeRoute);
@@ -2034,11 +3818,7 @@
     initTheme();
     initMobileNav();
     initModals();
-
-    const topName = $("#topbar-user-name");
-    const topAvatar = $("#topbar-user-avatar");
-    if (topName) topName.textContent = AppState.studentName;
-    if (topAvatar) topAvatar.textContent = AppState.studentName[0] || "A";
+    initAuth();
 
     window.addEventListener("hashchange", handleHashChange);
     

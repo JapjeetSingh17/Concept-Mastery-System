@@ -60,7 +60,23 @@ const ENDPOINTS = {
   masteryDashboard: { method: "GET",  path: "/api/mastery/dashboard" },
   masteryReset:     { method: "POST", path: "/api/mastery/reset" },
   loopNextAction:   { method: "POST", path: "/api/loop/next-action" },
-  recommend:        { method: "POST", path: "/api/recommend" }
+  recommend:        { method: "POST", path: "/api/recommend" },
+  materialsList:       { method: "GET",    path: "/api/materials" },
+  materialsIngestFile: { method: "POST",   path: "/api/materials/ingest-file" },
+  materialsIngestUrl:  { method: "POST",   path: "/api/materials/ingest-url" },
+  materialsPreview:    { method: "GET",    path: "/api/materials/{material_id}/preview" },
+  materialsDelete:     { method: "DELETE", path: "/api/materials/{material_id}" },
+  loopStatus:          { method: "GET",    path: "/api/loop/status" },
+  diagnosticStart:     { method: "POST",   path: "/api/diagnostic/start" },
+  diagnosticSubmit:    { method: "POST",   path: "/api/diagnostic/submit" },
+  quizRemedial:        { method: "POST",   path: "/api/quiz/remedial" },
+  activeRecallStart:   { method: "POST",   path: "/api/active-recall/start" },
+  activeRecallEvaluate:{ method: "POST",   path: "/api/active-recall/evaluate" },
+  activeRecallHistory: { method: "GET",    path: "/api/active-recall/history" },
+  authGoogle:          { method: "POST",   path: "/api/auth/google" },
+  authMe:              { method: "GET",    path: "/api/auth/me" },
+  authLogs:            { method: "GET",    path: "/api/auth/logs" },
+  authConfig:          { method: "GET",    path: "/api/auth/config" }
 };
 
 /**
@@ -78,12 +94,26 @@ async function callApi(endpointKey, payload = null, options = {}) {
   }
 
   const base = getEffectiveBase();
-  const cleanPath = ep.path.startsWith("/") ? ep.path : `/${ep.path}`;
-  const url = `${base}${cleanPath}`;
+  let cleanPath = ep.path.startsWith("/") ? ep.path : `/${ep.path}`;
+  if (options && options.pathParams) {
+    for (const [k, v] of Object.entries(options.pathParams)) {
+      cleanPath = cleanPath.replace(`{${k}}`, encodeURIComponent(v));
+    }
+  }
+  let url = `${base}${cleanPath}`;
+  if (options && options.params) {
+    const qs = new URLSearchParams(options.params).toString();
+    if (qs) url += (url.includes("?") ? "&" : "?") + qs;
+  }
   const fetchOpts = {
     method: ep.method,
     headers: {}
   };
+
+  const authToken = ApiService.getToken();
+  if (authToken) {
+    fetchOpts.headers["Authorization"] = `Bearer ${authToken}`;
+  }
 
   if (payload instanceof FormData) {
     fetchOpts.body = payload;
@@ -97,6 +127,13 @@ async function callApi(endpointKey, payload = null, options = {}) {
     response = await fetch(url, fetchOpts);
   } catch (netErr) {
     throw new Error(`Network error connecting to backend: ${netErr.message}`);
+  }
+
+  if (response.status === 401) {
+    ApiService.clearAuth();
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("cm:unauthorized"));
+    }
   }
 
   let data;
@@ -188,18 +225,56 @@ const ApiService = {
   },
 
   /**
-   * Submit quiz answer for authoritative backend evaluation (supports MCQ, FITB, and Typed Q&A)
+   * Submit quiz answer for authoritative backend evaluation (supports MCQ, FITB, Typed Q&A, and Numerical)
    */
-  async submitAnswer(questionId, conceptId, selectedIndex = null, correct = null, studentReasoning = "", typedAnswer = "") {
+  async submitAnswer(questionId, conceptId, selectedIndex = null, correct = null, studentReasoning = "", typedAnswer = "", numericAnswer = null) {
     const payload = {
       questionId,
       conceptId,
       selectedIndex: selectedIndex !== null ? selectedIndex : undefined,
       correct: correct !== null ? correct : undefined,
       studentReasoning: studentReasoning || undefined,
-      typedAnswer: typedAnswer || undefined
+      typedAnswer: typedAnswer || undefined,
+      numericAnswer: numericAnswer !== null && numericAnswer !== undefined ? numericAnswer : undefined,
+      numeric_answer: numericAnswer !== null && numericAnswer !== undefined ? numericAnswer : undefined
     };
     return callApi("quizAnswer", payload);
+  },
+
+  async getLoopStatus(userId = "default") {
+    return callApi("loopStatus", null, { params: { user_id: userId } });
+  },
+
+  async startDiagnostic(userId = "default") {
+    return callApi("diagnosticStart", { user_id: userId });
+  },
+
+  async submitDiagnostic(answers, userId = "default") {
+    return callApi("diagnosticSubmit", { user_id: userId, answers });
+  },
+
+  async getRemedialQuiz(conceptId = null, userId = "default") {
+    return callApi("quizRemedial", { concept_id: conceptId, conceptId, user_id: userId });
+  },
+
+  async startActiveRecall(conceptId, userId = "default") {
+    return callApi("activeRecallStart", { concept_id: conceptId, user_id: userId });
+  },
+
+  async evaluateActiveRecall(conceptId, recallText, verificationAnswer = "", studyDurationSeconds = 0, userId = "default") {
+    return callApi("activeRecallEvaluate", {
+      concept_id: conceptId,
+      recall_text: recallText,
+      verification_answer: verificationAnswer,
+      study_duration_seconds: studyDurationSeconds,
+      user_id: userId
+    });
+  },
+
+  async getActiveRecallHistory(conceptId = null, userId = "default") {
+    const params = { user_id: userId };
+    if (conceptId) params.concept_id = conceptId;
+    return callApi("activeRecallHistory", null, { params });
   },
 
   async getMastery() {
@@ -212,6 +287,113 @@ const ApiService = {
 
   async getRecommendations() {
     return callApi("recommend");
+  },
+
+  async listMaterials(userId = "default") {
+    return callApi("materialsList", null, { params: { user_id: userId } });
+  },
+
+  async ingestMaterialFile(files, userId = "default", title = "") {
+    const formData = new FormData();
+    const fileList = Array.isArray(files) ? files : [files];
+    fileList.forEach(f => formData.append("files", f));
+    if (userId) formData.append("user_id", userId);
+    if (title) formData.append("title", title);
+    return callApi("materialsIngestFile", formData);
+  },
+
+  async ingestMaterialUrl(url, sourceType = "auto", userId = "default", title = "") {
+    return callApi("materialsIngestUrl", {
+      url: url.trim(),
+      source_type: sourceType,
+      user_id: userId,
+      title: title || undefined
+    });
+  },
+
+  async getMaterialPreview(materialId) {
+    return callApi("materialsPreview", null, { pathParams: { material_id: materialId } });
+  },
+
+  async deleteMaterial(materialId, userId = "default") {
+    return callApi("materialsDelete", null, {
+      pathParams: { material_id: materialId },
+      params: { user_id: userId }
+    });
+  },
+
+  // ── Authentication & Session Management ─────────────────────────────────────
+
+  getToken() {
+    try {
+      return localStorage.getItem("cm_access_token") || "";
+    } catch {
+      return "";
+    }
+  },
+
+  setToken(token) {
+    try {
+      localStorage.setItem("cm_access_token", token);
+    } catch (e) {
+      console.warn("Could not set access token in localStorage", e);
+    }
+  },
+
+  getUser() {
+    try {
+      const u = localStorage.getItem("cm_user");
+      return u ? JSON.parse(u) : null;
+    } catch {
+      return null;
+    }
+  },
+
+  setUser(user) {
+    try {
+      localStorage.setItem("cm_user", JSON.stringify(user));
+    } catch (e) {
+      console.warn("Could not set user profile in localStorage", e);
+    }
+  },
+
+  clearAuth() {
+    try {
+      localStorage.removeItem("cm_access_token");
+      localStorage.removeItem("cm_user");
+    } catch {}
+  },
+
+  isAuthenticated() {
+    return Boolean(this.getToken());
+  },
+
+  async loginGoogle(credential) {
+    const res = await callApi("authGoogle", { credential });
+    if (res && res.access_token) {
+      this.setToken(res.access_token);
+      if (res.user) {
+        this.setUser(res.user);
+      }
+    }
+    return res;
+  },
+
+  async getCurrentUser() {
+    return callApi("authMe");
+  },
+
+  async getLoginLogs(limit = 10) {
+    return callApi("authLogs", null, { params: { limit } });
+  },
+
+  async getAuthConfig() {
+    return callApi("authConfig");
+  },
+
+  logout() {
+    this.clearAuth();
+    return true;
   },
 
   saveConfig(newConfig) {

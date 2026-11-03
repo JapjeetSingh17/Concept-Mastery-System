@@ -83,7 +83,7 @@ def _llm_extract_definitions_and_prereqs(chunks: list[dict], concept_names: list
     user_prompt = (
         f"Concepts to analyze: {json.dumps(concept_names)}\n\n"
         f"Context from study material:\n{ctx}\n\n"
-        f"Output JSON schema:\n"
+        f"Output JSON array with exact keys: concept, definition, prerequisites:\n"
         f'[\n  {{"concept": "<name>", "definition": "<concise definition under 25 words>", "prerequisites": ["<prereq concept>", ...]}}\n]'
     )
 
@@ -91,7 +91,8 @@ def _llm_extract_definitions_and_prereqs(chunks: list[dict], concept_names: list
         raw = llm.complete(system_prompt, user_prompt, max_tokens=800)
         if not raw:
             return {}
-        arr = json.loads(re.search(r"\[.*\]", raw, re.S).group(0))
+        clean_json = llm.extract_json_payload(raw)
+        arr = json.loads(clean_json)
         results = {}
         valid = {n.lower() for n in concept_names}
         for item in arr:
@@ -245,39 +246,55 @@ def build(chunks: list[dict]) -> tuple[list[dict], list[list[str]]]:
     return concepts, final_edges
 
 
-def get_prerequisites(concept_id: str) -> list[str]:
+def get_prerequisites(concept_id: str, user_id: str = "default") -> list[str]:
     """Return immediate prerequisite concept IDs for concept_id."""
+    kb = store.get_kb(user_id)
+    if kb.get("ready") and "edges" in kb:
+        return [a for a, b in kb.get("edges", []) if b == concept_id]
     if _GRAPH and concept_id in _GRAPH:
         return list(_GRAPH.predecessors(concept_id))
-    kb = store.KB
-    return [a for a, b in kb.get("edges", []) if b == concept_id]
+    return []
 
 
-def get_next_concepts(concept_id: str) -> list[str]:
+def get_next_concepts(concept_id: str, user_id: str = "default") -> list[str]:
     """Return concepts that directly depend on concept_id."""
+    kb = store.get_kb(user_id)
+    if kb.get("ready") and "edges" in kb:
+        return [b for a, b in kb.get("edges", []) if a == concept_id]
     if _GRAPH and concept_id in _GRAPH:
         return list(_GRAPH.successors(concept_id))
-    kb = store.KB
-    return [b for a, b in kb.get("edges", []) if a == concept_id]
+    return []
 
 
-def get_learning_path(unmastered_only: bool = True, mastered_ids: set[str] | None = None) -> list[str]:
-    """Topological sort of concepts in the prerequisite DAG."""
-    if _GRAPH and len(_GRAPH) > 0:
+def get_learning_path(unmastered_only: bool = True, mastered_ids: set[str] | None = None, user_id: str = "default") -> list[str]:
+    """Topological sort of concepts in the prerequisite DAG for user_id."""
+    kb = store.get_kb(user_id)
+    if kb.get("ready") and kb.get("concepts"):
+        # Build DAG for this user's edges
+        G = nx.DiGraph()
+        for a, b in kb.get("edges", []):
+            G.add_edge(a, b)
+        for c in kb.get("concepts", []):
+            if c["id"] not in G:
+                G.add_node(c["id"])
+        try:
+            order = list(nx.topological_sort(G))
+        except Exception:
+            order = [c["id"] for c in kb.get("concepts", [])]
+    elif _GRAPH and len(_GRAPH) > 0:
         order = list(nx.topological_sort(_GRAPH))
     else:
-        kb = store.KB
-        order = [c["id"] for c in kb.get("concepts", [])]
+        order = []
 
     if unmastered_only and mastered_ids:
         order = [cid for cid in order if cid not in mastered_ids]
     return order
 
 
-def export_graph(user_mastery_map: dict[str, str] | None = None) -> dict:
-    """Export nodes and directed edges formatted for frontend rendering."""
-    kb = store.KB
-    if not kb.get("ready"):
+def export_graph(user_mastery_map: dict[str, str] | None = None, user_id: str = "default") -> dict:
+    """Export nodes and directed edges formatted for frontend rendering scoped to user_id."""
+    kb = store.get_kb(user_id)
+    if not kb.get("ready") or not kb.get("concepts"):
         return {"nodes": [], "edges": [], "learning_path": []}
 
     mastery = user_mastery_map or {}
@@ -290,7 +307,7 @@ def export_graph(user_mastery_map: dict[str, str] | None = None) -> dict:
             "id": cid,
             "name": c["name"],
             "definition": c.get("definition", f"Key topic covered on page {c.get('page', 1)}"),
-            "prerequisites": get_prerequisites(cid),
+            "prerequisites": get_prerequisites(cid, user_id=user_id),
             "source_pages": c.get("source_pages", [c.get("page", 1)]),
             "depth": c.get("depth", 0),
             "x": c.get("x", 0.0),
@@ -307,5 +324,5 @@ def export_graph(user_mastery_map: dict[str, str] | None = None) -> dict:
     return {
         "nodes": nodes,
         "edges": edges,
-        "learning_path": get_learning_path(),
+        "learning_path": get_learning_path(user_id=user_id),
     }
