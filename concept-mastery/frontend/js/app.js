@@ -62,16 +62,37 @@
     }[c]));
   }
 
-  // Trigger file download via temporary anchor
-  function triggerBrowserDownload(url, filename = "") {
+  // Trigger file download via Blob / temporary anchor
+  async function triggerBrowserDownload(url, filename = "") {
     if (!url) return;
-    const a = document.createElement("a");
-    a.href = url;
-    if (filename) a.download = filename;
-    a.target = "_blank";
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    const safeFilename = filename || url.split("/").pop().split("?")[0] || "download";
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.style.display = "none";
+      a.href = blobUrl;
+      a.download = safeFilename;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+        if (a.parentNode) document.body.removeChild(a);
+        URL.revokeObjectURL(blobUrl);
+      }, 1000);
+    } catch (err) {
+      console.warn("Direct blob download failed, falling back to anchor:", err);
+      const a = document.createElement("a");
+      a.style.display = "none";
+      a.href = url;
+      a.download = safeFilename;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+        if (a.parentNode) document.body.removeChild(a);
+      }, 500);
+    }
   }
 
   // Format grounded citation tags inside text
@@ -2811,7 +2832,7 @@
                   </div>
                 </div>
                 ${artUrl ? `
-                  <a href="${esc(artUrl)}" target="_blank" download class="btn btn-xs btn-primary" style="text-decoration:none;">
+                  <a href="${esc(artUrl)}" download class="btn btn-xs btn-primary" style="text-decoration:none;">
                     Download
                   </a>
                 ` : ''}
@@ -3382,7 +3403,7 @@
                         playerWrap.innerHTML = `
                           <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:0.4rem;">
                             <span style="font-weight:600; font-size:0.84rem; color:var(--ink-primary);">🎧 Deep Spoken Explanation (Section/Slide ${targetIndex + 1})</span>
-                            <a href="${esc(audioUrl)}" target="_blank" download class="btn btn-xs btn-outline">Save MP3</a>
+                            <a href="${esc(audioUrl)}" download class="btn btn-xs btn-outline">Save MP3</a>
                           </div>
                           <audio controls autoplay src="${esc(audioUrl)}" style="width:100%; height:36px;"></audio>
                         `;

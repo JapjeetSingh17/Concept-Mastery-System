@@ -660,6 +660,10 @@ def get_kb(user_id: str = "default") -> dict:
         UniversalMaterialIngestor.rebuild_unified_knowledge_base(user_id=user_id)
         return USER_KBS.get(user_id, {"ready": False, "file": None, "pages": 0, "index": None, "concepts": [], "edges": [], "user_id": user_id})
 
+    # If the user has explicitly empty or reset KB (e.g. via clear_kb), respect it
+    if user_id in USER_KBS and not USER_KBS[user_id].get("ready"):
+        return USER_KBS[user_id]
+
     # Test fixture fallback: if user has no materials of their own, but test fixture loaded KB into default/store.KB
     if USER_KBS.get("default", {}).get("ready") and KB.get("ready"):
         return USER_KBS["default"]

@@ -248,7 +248,7 @@ def get_concepts_graph(user_id: str = "default", current_user: User = Depends(ge
     uid = current_user.user_id if current_user and current_user.user_id != "default" and user_id == "default" else user_id
     kb = store.get_kb(uid)
     mats = store.list_study_materials(uid)
-    if not mats and not kb.get("ready"):
+    if not mats and (uid != "default" or not kb.get("ready")):
         return {"nodes": [], "edges": [], "learning_path": []}
     if not kb.get("ready") or not kb.get("concepts"):
         return {"nodes": [], "edges": [], "learning_path": []}
@@ -868,7 +868,7 @@ def delete_study_material(material_id: str, user_id: str = "default", current_us
 # ── Multimodal Artifacts & Smart Study Notes ─────────────────────────────────
 
 @router.get("/artifacts/{filename}")
-def get_generated_artifact(filename: str):
+def get_generated_artifact(filename: str, download: Optional[bool] = None):
     """Serve generated .pdf, .pptx, .svg, and .mp3 files from config.GENERATED_ARTIFACTS_DIR."""
     safe_name = Path(filename).name
     file_path = (config.GENERATED_ARTIFACTS_DIR / safe_name).resolve()
@@ -885,6 +885,14 @@ def get_generated_artifact(filename: str):
         ".mp3": "audio/mpeg",
     }
     media_type = media_types.get(suffix, "application/octet-stream")
+    is_attachment = download is True or suffix in [".pdf", ".pptx"]
+    if is_attachment:
+        return FileResponse(
+            path=str(file_path),
+            media_type=media_type,
+            filename=safe_name,
+            content_disposition_type="attachment",
+        )
     return FileResponse(path=str(file_path), media_type=media_type)
 
 
