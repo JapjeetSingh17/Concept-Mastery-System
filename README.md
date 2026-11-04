@@ -66,11 +66,26 @@ A production-grade, closed-loop educational mastery platform that solves the fun
 
 ---
 
+## 🤖 Running with Google Antigravity
+
+This repository is optimized for development and pairing with **Google Antigravity**:
+
+- **Setup Guide**: [`antigravity-setup/README.md`](antigravity-setup/README.md) &mdash; Step-by-step setup after cloning onto your desktop.
+- **Copy-Paste Prompts**: [`antigravity-setup/PROMPTS.md`](antigravity-setup/PROMPTS.md) &mdash; Ready-to-use prompts to immediately ask Antigravity to run pre-flight checks, launch servers, run active recall sessions, and generate smart study notes.
+- **Automated Script**: Run `./antigravity-setup/setup.sh` inside the Antigravity terminal for 1-click venv creation and dependency installation.
+- **Native Agent Rules**: Pre-configured in [`.agent/rules/concept-mastery.md`](.agent/rules/concept-mastery.md).
+
+---
+
 ## Repository Structure
 
 ```text
 Concept-Mastery-System/
-├── Aggressive Test Suite.py     # 40-test system-level verification suite
+├── antigravity-setup/           # Google Antigravity onboarding & prompts
+│   ├── README.md                # Desktop & Antigravity setup instructions
+│   ├── PROMPTS.md               # Ready-to-use prompts for Antigravity agent
+│   └── setup.sh                 # One-click environment bootstrap script
+├── .agent/rules/                # Native Antigravity agent guidelines
 ├── screenshots/                 # UI screenshots of the platform
 └── concept-mastery/             # Full application stack
     ├── backend/                 # FastAPI backend application
@@ -90,8 +105,11 @@ Concept-Mastery-System/
     │   │   │   ├── ingest.py        # Universal multi-format document ingestor
     │   │   │   ├── loop.py          # Baseline diagnostic & LangGraph state machine
     │   │   │   ├── mastery.py       # Epistemic knowledge tracing engine
+    │   │   │   ├── notes.py         # Task-driven Smart Study Notes studio
     │   │   │   ├── quiz.py          # Numerical, MCQ, FITB & Q&A quiz generator
     │   │   │   ├── recommend.py     # Prerequisite-aware recommendation engine
+    │   │   │   ├── tools.py         # LangGraph SVG, PPTX, PDF & resource tools
+    │   │   │   ├── tts.py           # ElevenLabs Flash v2.5 deep voice synthesis
     │   │   │   └── tutor.py         # Two-layer Socratic grounded tutor
     │   │   ├── config.py        # Centralized configuration & environment loader
     │   │   ├── main.py          # FastAPI app entrypoint & static mount
@@ -103,6 +121,7 @@ Concept-Mastery-System/
     │   │   ├── test_numerical_and_active_recall.py # Numerical math & active recall tests
     │   │   ├── test_oauth_multi_tenancy.py     # Google OAuth & user isolation tests
     │   │   ├── test_openrouter_gateway.py      # Gateway failover & sanitizer tests
+    │   │   ├── test_tools_tts_and_notes.py     # LangGraph tools, ElevenLabs & notes tests
     │   │   └── test_universal_material_ingest.py # Multi-format loaders tests
     │   ├── final_100_test_cases.py  # 100-test end-to-end regression battery
     │   ├── requirements.txt     # Python backend dependencies
@@ -115,7 +134,7 @@ Concept-Mastery-System/
     │   │   ├── app.js           # Routing, state machine, views & active recall loop
     │   │   └── mock.js          # Standalone offline mock data
     │   ├── vendor/              # Vendored KaTeX math rendering
-    │   └── index.html           # Single-page application root
+    │   └── index.html           # Single-Page Application root
     └── data/                    # Persistent storage (SQLite DBs & uploads)
         ├── uploads/             # Ingested study materials
         └── vectorstore/         # Inverted index, materials & mastery SQLite DBs
@@ -193,14 +212,14 @@ uvicorn app.main:app --port 8000 --reload
 
 ---
 
-## Running Tests (195 / 195 Passing — 100%)
+## Running Tests (215 / 215 Passing — 100%)
 
 The platform includes comprehensive test suites validating all core architectural dimensions:
 
 ```bash
 cd concept-mastery/backend
 
-# 1. Run all modular test suites (45 tests)
+# 1. Run all modular test suites (65 tests)
 pytest tests/ -v
 
 # 2. Run OpenRouter gateway test battery (50 tests)
@@ -218,9 +237,10 @@ pytest final_100_test_cases.py -v
 | `tests/test_closed_loop.py` | 7 | **PASSED** |
 | `tests/test_universal_material_ingest.py` | 8 | **PASSED** |
 | `tests/test_openrouter_gateway.py` | 6 | **PASSED** |
+| `tests/test_tools_tts_and_notes.py` | 20 | **PASSED** |
 | `tests/openrouter_testcases.py` | 50 | **PASSED** |
 | `final_100_test_cases.py` | 100 | **PASSED** |
-| **Total** | **195** | **100% Passed** |
+| **Total** | **215** | **100% Passed** |
 
 ---
 
