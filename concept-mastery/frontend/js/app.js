@@ -2011,15 +2011,35 @@
       }
 
       if (!conceptsList.length) {
-        conceptsList = [
-          { id: "recursion", label: "Recursion & State Invariants" },
-          { id: "dynamic_programming", label: "Dynamic Programming" },
-          { id: "binary_search", label: "Binary Search Boundaries" },
-          { id: "graph_traversal", label: "Graph Traversal & DAGs" }
-        ];
+        return `
+          <div class="page-header">
+            <div class="page-header-text">
+              <h1 class="page-title">Smart Study Notes</h1>
+              <p class="page-subtitle">
+                Elicit targeted study formats grounded in primary material chunks with ElevenLabs voice notes, PDF handouts, and PPTX slide decks.
+              </p>
+            </div>
+          </div>
+          <div class="empty-state-card">
+            <div class="empty-state-icon">
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
+                <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+              </svg>
+            </div>
+            <h3 class="empty-state-title">No Study Material Uploaded Yet</h3>
+            <p class="empty-state-desc">
+              Upload a PDF, lecture slides, YouTube link, or notes in the Study Material tab to extract your course concepts and generate custom smart study notes.
+            </p>
+            <a href="#upload" class="btn btn-primary" style="margin-top:0.5rem;">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="16" x2="12" y2="15"/></svg>
+              Upload Study Material &rarr;
+            </a>
+          </div>
+        `;
       }
 
-      if (!AppState.smartNotes.selectedConceptId) {
+      if (!AppState.smartNotes.selectedConceptId || !conceptsList.some(c => c.id === AppState.smartNotes.selectedConceptId)) {
         AppState.smartNotes.selectedConceptId = conceptsList[0].id;
       }
 
@@ -2060,7 +2080,7 @@
               </div>
             </div>
 
-            <!-- Task Selector 5 Cards -->
+            <!-- Task Selector 5 Cards: ('exam', 'test', 'quiz', 'viva', 'custom') -->
             <div class="task-selector-grid" id="task-selector-grid">
               <div class="task-card ${selectedTask === 'exam' ? 'selected' : ''}" data-task="exam">
                 <div class="task-card-icon">📝</div>
@@ -2071,13 +2091,13 @@
                 <p class="task-card-desc">High-yield derivations, step-by-step formulas, common exam traps, and worked numerical problems.</p>
               </div>
 
-              <div class="task-card ${selectedTask === 'viva' ? 'selected' : ''}" data-task="viva">
-                <div class="task-card-icon">🎙️</div>
+              <div class="task-card ${selectedTask === 'test' ? 'selected' : ''}" data-task="test">
+                <div class="task-card-icon">🎯</div>
                 <div class="task-card-title">
-                  <span>Viva / Interview</span>
+                  <span>Practice Test</span>
                   <span class="task-card-check">&check;</span>
                 </div>
-                <p class="task-card-desc">30-second elevator pitch, intuitive real-world analogy, and counter-arguments for examiner probes.</p>
+                <p class="task-card-desc">Timed diagnostic problems, point-weighted exam scenarios, trap analysis, and verified model answer key.</p>
               </div>
 
               <div class="task-card ${selectedTask === 'quiz' ? 'selected' : ''}" data-task="quiz">
@@ -2089,19 +2109,19 @@
                 <p class="task-card-desc">Rapid review triggers, invariant properties, edge-case traps, and high-speed formula reference sheet.</p>
               </div>
 
-              <div class="task-card ${selectedTask === 'essay' ? 'selected' : ''}" data-task="essay">
-                <div class="task-card-icon">✍️</div>
+              <div class="task-card ${selectedTask === 'viva' ? 'selected' : ''}" data-task="viva">
+                <div class="task-card-icon">🎙️</div>
                 <div class="task-card-title">
-                  <span>Essay / Assignment</span>
+                  <span>Viva / Oral Defense</span>
                   <span class="task-card-check">&check;</span>
                 </div>
-                <p class="task-card-desc">Formal academic prose, theoretical synthesis, literature context, and grounded discussion.</p>
+                <p class="task-card-desc">30-second elevator pitch, intuitive real-world analogy, and counter-arguments for examiner probes.</p>
               </div>
 
               <div class="task-card ${selectedTask === 'custom' ? 'selected' : ''}" data-task="custom">
                 <div class="task-card-icon">💡</div>
                 <div class="task-card-title">
-                  <span>Custom Prompt</span>
+                  <span>Custom Option</span>
                   <span class="task-card-check">&check;</span>
                 </div>
                 <p class="task-card-desc">Define custom study requirements, specific rubric targets, or specialized problem-solving focus.</p>
@@ -2111,7 +2131,7 @@
             <!-- Validation Error Alert -->
             <div class="task-selector-error-msg" id="task-selector-error">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-              <span>Please select your task type (Exam Prep, Viva, Quiz, Essay, or Custom) before generating notes.</span>
+              <span>Please select your task type (Exam Prep, Practice Test, Quiz Cheat Sheet, Viva / Oral Defense, or Custom Option) before generating notes.</span>
             </div>
 
             <!-- Custom Instructions Box (Toggled for Custom Prompt) -->

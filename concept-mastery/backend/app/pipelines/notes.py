@@ -22,7 +22,7 @@ except (ImportError, ModuleNotFoundError):
 
 logger = logging.getLogger("concept_mastery.notes")
 
-VALID_TASK_TYPES = {"exam", "viva", "quiz", "essay", "custom"}
+VALID_TASK_TYPES = {"exam", "test", "quiz", "viva", "custom", "essay"}
 
 
 def _build_deterministic_note(
@@ -85,6 +85,49 @@ def _build_deterministic_note(
   2. *Step 2*: Compute intermediate transition: $f_1 = \\phi(1.0) \\times 0.85 = 0.85$ {c2}.
   3. *Step 3*: Accumulate recursive sum: $\\sum_{{j=1}}^{{4}} f_j = 3.42$ {c1}.
   4. *Conclusion*: The exact equilibrium response evaluates to $\\mathbf{{3.42 \\pm 0.05}}$ {c3}.
+"""
+
+    elif task_type == "test":
+        title = f"Mock Test & Practice Exam: {concept_name}"
+        key_takeaways = [
+            f"Timed diagnostic assessment items simulating exam conditions {c1}.",
+            f"Multi-part analytical and numerical problem-solving scenarios {c2}.",
+            f"Verified scoring rubric and model answer key with step citations {c3}."
+        ]
+        markdown_content = f"""# Mock Test & Practice Exam: {concept_name}
+
+## 1. Section A: Timed Diagnostic Multiple-Choice (10 Points)
+- **Question 1 (Core Mechanism)**: Which governing invariant guarantees structural correctness for {concept_name}? {c1}
+  - A) Unbounded monotonic state drift
+  - B) Strict recursive state invariance under boundary constraints *(Correct)*
+  - C) Stochastic permutation of intermediate states
+  - D) Constant-time brute-force evaluation
+- **Question 2 (Complexity Boundaries)**: Under standard operational parameters, what is the asymptotic runtime overhead? {c2}
+  - A) $\\mathcal{{O}}(1)$ lookup
+  - B) $\\mathcal{{O}}(N \\log N)$ worst-case *(Correct)*
+  - C) Exponential $\\mathcal{{O}}(2^N)$
+  - D) Unbounded divergence
+
+## 2. Section B: Multi-Step Calculation & Problem-Solving (20 Points)
+- **Scenario**: A system initialized at state $S_0 = 1.0$ undergoes recursive optimization for {concept_name} with transition factor $\\alpha = 0.15$ {c1}.
+- **Task**:
+  1. Formulate the primary transition recurrence $\\mathcal{{T}}(S_k)$ {c2}.
+  2. Compute intermediate states for $k = 1, 2, 3$.
+  3. Determine the steady-state convergence value within tolerance $\\pm 0.05$.
+
+## 3. Section C: Edge Cases & Common Traps (10 Points)
+- Identify two boundary conditions where standard execution fails:
+  1. *Zero-Index Initialization Trap*: Missing boundary base cases cause index out-of-bounds {c3}.
+  2. *Convergence Divergence*: Setting learning rates or update coefficients too large leads to numerical overflow {c1}.
+
+## 4. Scoring Rubric & Verified Model Answer Key
+- **Q1 (5 pts)**: Option B grounded in {c1}.
+- **Q2 (5 pts)**: Option B grounded in {c2}.
+- **Problem-Solving (20 pts)**:
+  - Step 1 (5 pts): Correct recurrence formulation grounded in {c1}.
+  - Step 2 (10 pts): Accurate numerical progression through steps $k=1,2,3$ {c2}.
+  - Step 3 (5 pts): Convergence boundary evaluated with step verification {c3}.
+- **Edge Cases (10 pts)**: Accurate identification of boundary traps with mitigations.
 """
 
     elif task_type == "viva":
@@ -211,7 +254,7 @@ def generate_smart_note(req: SmartNoteRequest) -> SmartNoteResponse:
     # 1. MANDATORY TASK-TYPE ELICITATION GATE
     if not req.task_type or req.task_type.lower().strip() not in VALID_TASK_TYPES:
         raise store.UserError(
-            "Please select which task you need notes for (exam, viva, quiz, essay, or custom) before generating notes."
+            "Please select which task you need notes for (exam, test, quiz, viva, or custom) before generating notes."
         )
 
     task_type = req.task_type.lower().strip()
@@ -276,6 +319,13 @@ Depending on the task_type, format the markdown content with the EXACT following
   ## 2. Step-by-Step Formulas
   ## 3. Common Exam Traps
   ## 4. Worked Numerical Problems
+
+- If task_type is 'test':
+  # Mock Test & Practice Exam: <Concept Name>
+  ## 1. Section A: Timed Diagnostic Multiple-Choice (10 Points)
+  ## 2. Section B: Multi-Step Calculation & Problem-Solving (20 Points)
+  ## 3. Section C: Edge Cases & Common Traps (10 Points)
+  ## 4. Scoring Rubric & Verified Model Answer Key
 
 - If task_type is 'viva':
   # Oral Defense / Viva Master Guide: <Concept Name>

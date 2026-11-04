@@ -317,8 +317,8 @@ def test_15_generate_smart_note_elicitation_gate():
 
 
 def test_16_smart_notes_distinct_task_type_formatting():
-    """Test distinct formatting across task types ('exam', 'viva', 'quiz', 'essay')."""
-    task_types = ["exam", "viva", "quiz", "essay"]
+    """Test distinct formatting across task types ('exam', 'test', 'quiz', 'viva', 'essay')."""
+    task_types = ["exam", "test", "quiz", "viva", "essay"]
     generated_notes = {}
 
     for tt in task_types:
@@ -329,12 +329,13 @@ def test_16_smart_notes_distinct_task_type_formatting():
         generated_notes[tt] = note_resp
 
     assert "Derivation" in generated_notes["exam"].markdown_content or "Trap" in generated_notes["exam"].markdown_content
+    assert "Mock Test" in generated_notes["test"].markdown_content or "Diagnostic" in generated_notes["test"].markdown_content or "Rubric" in generated_notes["test"].markdown_content
     assert "Elevator Pitch" in generated_notes["viva"].markdown_content or "Examiner" in generated_notes["viva"].markdown_content or "Analogy" in generated_notes["viva"].markdown_content
     assert "Cheat Sheet" in generated_notes["quiz"].markdown_content or "Parameter" in generated_notes["quiz"].markdown_content or "Cloze" in generated_notes["quiz"].markdown_content
     assert "Monograph" in generated_notes["essay"].markdown_content or "Theoretical" in generated_notes["essay"].markdown_content
 
     mds = [n.markdown_content for n in generated_notes.values()]
-    assert len(set(mds)) == 4, "Each task type must produce a unique, distinct markdown formatting."
+    assert len(set(mds)) == 5, "Each task type must produce a unique, distinct markdown formatting."
 
 
 def test_17_generate_note_audio_attaches_audio_url():
