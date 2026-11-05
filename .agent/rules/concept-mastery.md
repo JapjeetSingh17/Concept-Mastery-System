@@ -13,12 +13,14 @@ You are working on the **Concept Mastery Platform**, a high-precision, closed-lo
 1. **Vectorless SQLite BM25 Indexing**:
    - Chunks are stored in `chunks` and indexed with `chunk_fts`.
    - Never replace this with external vector databases or dense embedding models unless explicitly instructed.
-2. **Epistemic Mastery Tracking**:
-   - Student beliefs are modeled via Bayesian Beta distributions $\text{Beta}(\alpha, \beta)$ in `backend/app/pipelines/mastery.py`.
-   - $\text{Mastery Mean} = \alpha / (\alpha + \beta)$.
-   - Fewer than 2 attempts = `UNKNOWN` (do not penalize unassessed nodes as weak).
-   - $\ge 70\%$ = `STRONG`.
-   - $< 70\%$ = `WEAK`.
+2. **Multi-Agent Pedagogical Assessment & Head Teacher Arbiter**:
+   - Replaced the old Bayesian Beta formula with a 6-layer Multi-Agent Pedagogical Assessment panel (`pipelines/mastery_orchestrator.py` & `pipelines/pedagogical_agents.py`).
+   - 4 Specialist Teachers (Teaching Agent, Assessment Agent, Misconception Detective, Learning Observer) deliberate on student work.
+   - Head Teacher Arbiter issues qualitative outcomes:
+     * `MASTERED` (maps to legacy `STRONG`)
+     * `NOT_YET_MASTERED` (maps to legacy `WEAK`)
+     * `INSUFFICIENT_EVIDENCE` (maps to legacy `UNKNOWN`)
+   - Software guardrails: hallucination-stripping via `store.verify_evidence_refs`, `MAX_FOLLOW_UP_QUESTIONS = 2`, `MAX_AGENT_CALLS = 6`.
 3. **Empty-State Gating & Multi-Tenancy**:
    - When a user has 0 materials ingested, never show hardcoded dummy concepts.
    - Lifecycle state must be `AWAITING_UPLOAD` until material is uploaded, then `BASELINE_DIAGNOSTIC` until the 6-question baseline test is completed.

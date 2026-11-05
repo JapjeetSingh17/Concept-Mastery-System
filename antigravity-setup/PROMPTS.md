@@ -47,7 +47,7 @@ Please:
 3. Present the micro-lesson key takeaways to me in chat.
 4. Start a 120-second focus countdown timer.
 5. When the timer expires, simulate hiding the lesson notes and prompt me for blind retrieval.
-6. Submit my written retrieval to POST /api/active-recall/verify, and explain the AI Audit breakdown: what I retained, what gaps I missed, and how my Bayesian Beta mastery score updated.
+6. Submit my written retrieval to POST /api/active-recall/verify, and explain the AI Audit breakdown: what I retained, what gaps I missed, and how my Multi-Agent Pedagogical assessment (MASTERED, NOT YET MASTERED, or INSUFFICIENT EVIDENCE) updated.
 ```
 
 ---

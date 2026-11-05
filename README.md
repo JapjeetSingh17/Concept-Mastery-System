@@ -51,17 +51,37 @@ A production-grade, closed-loop educational mastery platform that solves the fun
               │                                                        │
               └───────────────────────────┬────────────────────────────┘
                                           ▼
-                            ┌───────────────────────────┐
-                            │ Epistemic Mastery Engine  │
-                            │ (Beta Distribution &      │
-                            │  Weak vs Unknown Detector)│
-                            └─────────────┬─────────────┘
+                      ┌───────────────────────────────────────┐
+                      │        Learning Evidence Store        │
+                      │ (SQLite `learning_evidence_store` DB) │
+                      └───────────────────┬───────────────────┘
                                           │
-                                          ▼
-                            ┌───────────────────────────┐
-                            │ Explainable Dashboard &   │
-                            │ Remedial Re-Assessment    │
-                            └───────────────────────────┘
+        ┌───────────────────┬─────────────┴───────┬───────────────────┐
+        ▼                   ▼                     ▼                   ▼
+┌──────────────┐    ┌──────────────┐      ┌──────────────┐    ┌──────────────┐
+│  👩‍🏫 Teacher   │    │ 🎯 Assessment│      │ 🕵️ Detective  │    │ 📈 Observer   │
+│    Agent     │    │    Agent     │      │(Misconception)│   │  (Progress)  │
+└──────┬───────┘    └──────┬───────┘      └──────┬───────┘    └──────┬───────┘
+       │                   │                     │                   │
+       └───────────────────┼─────────────────────┴───────────────────┘
+                           ▼
+              ┌───────────────────────────┐
+              │ Reference ID Validator    │
+              │ (`verify_evidence_refs`)  │
+              └─────────────┬─────────────┘
+                            ▼
+              ┌───────────────────────────┐
+              │ Head Teacher / Arbiter    │
+              │ (Qualitative Deliberation │
+              │  & Evidence Verification) │
+              └─────────────┬─────────────┘
+                            │
+                            ▼
+              ┌───────────────────────────┐
+              │ Explainable Dashboard &   │
+              │ Deliberation Inspector    │
+              │ (MASTERED, WEAK, UNKNOWN) │
+              └───────────────────────────┘
 ```
 
 ---

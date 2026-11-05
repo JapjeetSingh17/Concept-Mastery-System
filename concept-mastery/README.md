@@ -2,8 +2,8 @@
 
 ![System Architecture](docs/architecture.png)
 
-A closed-loop concept mastery learning system built around the epistemic architecture:
-**Study PDF → Semantic section chunker & synonym normalizer → Vector index with page metadata + Prerequisite concept graph → Grounded tutor & quiz generator → Epistemic Beta belief mastery engine → Weak vs. Unknown detector → Targeted re-teaching & adaptive assessment → Explainable learner dashboard.**
+A closed-loop concept mastery learning system built around the pedagogical architecture:
+**Universal Multi-Format Ingestor → Inverted SQLite BM25 Index with dynamic citation anchors + Prerequisite concept DAG → Grounded Socratic tutor & numerical quiz generator → 6-Layer Multi-Agent Pedagogical Assessment System (4 Specialist Teachers + Head Teacher Arbiter) → Targeted re-teaching & adaptive active recall → Explainable learner dashboard with deliberation inspector.**
 
 ---
 
@@ -61,7 +61,7 @@ The frontend has been completely redesigned into a premium educational SaaS appl
 4. **Concept Check / Quiz (`#practice`)**:
    - Distraction-free question-by-question assessment.
    - Accessible choices A, B, C, D with keyboard shortcuts (`1-4` or `A-D`, `Enter` to submit).
-   - **Authoritative Server-Side Grading**: The backend authoritatively grades answers and updates the epistemic Beta belief distribution.
+   - **Authoritative Multi-Agent Grading**: The backend authoritatively evaluates student work, explanations, and cognitive forms through the 6-Layer Multi-Agent Pedagogical Assessment panel.
    - Instant diagnostic explanation quoting specific textbook pages.
    - Side panel with live session accuracy donut gauge and pedagogical study tips.
    - Comprehensive quiz results screen with performance summary.
@@ -73,10 +73,10 @@ The frontend has been completely redesigned into a premium educational SaaS appl
    - Collapsible SVG directed prerequisite graph showing topological dependencies with arrows.
    - Quick concept detail inspector dialog.
 
-6. **Progress & Epistemic Analytics (`#progress`)**:
-   - Deep-dive analytics into the epistemic Beta($\alpha$, $\beta$) learner model.
-   - Diagnostic table showing concept names, status, mastery percentage, total attempts, uncertainty spread ($\pm X\%$), and diagnostic explanation.
-   - Clear distinction between "Unknown" (insufficient evidence) vs "Weak" (verified struggle).
+6. **Progress & Pedagogical Deliberation Analytics (`#progress`)**:
+   - Deep-dive analytics into the 6-layer Multi-Agent Pedagogical Assessment model.
+   - Diagnostic table showing concept names, qualitative status (`MASTERED`, `NOT YET MASTERED`, `NEEDS EVIDENCE`), total attempts, and diagnostic explanation.
+   - Dedicated **"Inspect Deliberation"** modal showing findings from the 4 Specialist Teachers and Head Teacher Arbiter.
 
 7. **Platform Settings (`#settings`)**:
    - Student profile name customization (persists in `localStorage`).
@@ -97,7 +97,7 @@ The frontend has been completely redesigned into a premium educational SaaS appl
 | Prerequisite Graph | `pipelines/concepts.py` | Learning Path (`#learning-path`) | Extracts concepts from headings/terms, establishes dependencies |
 | Grounded Tutor | `pipelines/tutor.py` | AI Tutor (`#tutor`) | Context-restricted answers with page citations and text extracts |
 | Adaptive Quiz Generator | `pipelines/quiz.py` | Concept Check (`#practice`) | Cloze/LLM questions grounded in document passages |
-| Epistemic Mastery Engine | `pipelines/mastery.py` | Progress (`#progress`) | Beta($\alpha$, $\beta$) belief updates with uncertainty bounds |
+| Multi-Agent Pedagogical Assessment | `pipelines/mastery_orchestrator.py` + `mastery.py` | Progress (`#progress`) | 4 Specialist Teacher Agents + Head Teacher Arbiter deliberation |
 | Closed Loop Controller | `pipelines/loop.py` | Entire App | answer &rarr; estimate &rarr; detect weak vs. unknown &rarr; recommend |
 
 ---
