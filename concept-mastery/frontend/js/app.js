@@ -425,15 +425,169 @@
     }
   }
 
+  function parseTimestampToSeconds(ts) {
+    if (!ts) return 0;
+    const clean = String(ts).replace(/[\[\]]/g, "").trim();
+    const parts = clean.split(":").map(Number);
+    if (parts.length === 2) {
+      return (parts[0] || 0) * 60 + (parts[1] || 0);
+    } else if (parts.length === 3) {
+      return (parts[0] || 0) * 3600 + (parts[1] || 0) * 60 + (parts[2] || 0);
+    }
+    return 0;
+  }
+
+  function formatSecondsToTimestamp(sec) {
+    const s = Math.max(0, parseInt(sec, 10) || 0);
+    const hrs = Math.floor(s / 3600);
+    const mins = Math.floor((s % 3600) / 60);
+    const rem = s % 60;
+    if (hrs > 0) {
+      return `${String(hrs).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(rem).padStart(2, '0')}`;
+    }
+    return `${String(mins).padStart(2, '0')}:${String(rem).padStart(2, '0')}`;
+  }
+
   // Format grounded citation tags inside text
   function formatGroundedCitations(text) {
     if (!text) return "";
-    return text.replace(/\[(Page|Slide|Section)\s+([^\]]+)\]/gi, (match, type, loc) => {
+    let out = text.replace(/\[(Page|Slide|Section)\s+([^\]]+)\]/gi, (match, type, loc) => {
       const cleanLoc = esc(loc.trim());
       const cleanType = esc(type);
       return `<button class="grounded-citation-chip view-citation-chip" data-loc="${cleanLoc}" data-type="${cleanType}" type="button">📖 ${cleanType} ${cleanLoc}</button>`;
     });
+    out = out.replace(/\[(?:Video\s+)?(\d{1,2}:\d{2}(?::\d{2})?)\]/gi, (match, ts) => {
+      const cleanTs = esc(ts.trim());
+      const sec = parseTimestampToSeconds(cleanTs);
+      return `<button class="timestamp-citation-chip view-timestamp-chip" data-seconds="${sec}" data-timestamp="${cleanTs}" type="button">▶ [${cleanTs}]</button>`;
+    });
+    return out;
   }
+
+  window.jumpYouTubePlayerToSeconds = function(seconds, videoId) {
+    const sec = parseInt(seconds, 10);
+    if (isNaN(sec)) return;
+
+    const iframe = document.getElementById("youtube-player-iframe");
+    if (iframe) {
+      try {
+        iframe.contentWindow.postMessage(JSON.stringify({
+          event: "command",
+          func: "seekTo",
+          args: [sec, true]
+        }), "*");
+        iframe.contentWindow.postMessage(JSON.stringify({
+          event: "command",
+          func: "playVideo",
+          args: []
+        }), "*");
+      } catch (err) {}
+
+      // Fallback reload if API didn't connect or player needs to jump
+      const currSrc = iframe.src || "";
+      if (videoId && !currSrc.includes(`start=${sec}`)) {
+        iframe.src = `https://www.youtube.com/embed/${videoId}?start=${sec}&autoplay=1&enablejsapi=1`;
+      }
+    }
+
+    // Highlight row in transcript list
+    document.querySelectorAll(".transcript-row").forEach(row => {
+      const rSec = parseInt(row.getAttribute("data-seconds"), 10);
+      if (!isNaN(rSec) && Math.abs(rSec - sec) < 60) {
+        row.classList.add("active-row");
+        row.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      } else {
+        row.classList.remove("active-row");
+      }
+    });
+  };
+
+  window.openVideoPreviewAtTimestamp = async function(targetSeconds, targetMatId = null) {
+    const previewModal = $("#material-preview-modal");
+    if (!previewModal) return;
+
+    let matId = targetMatId;
+    if (!matId) {
+      const mats = AppState.materials || [];
+      const ytMat = mats.find(m => (m.source_type || "").toLowerCase() === "youtube");
+      if (ytMat) matId = ytMat.material_id;
+    }
+
+    if (!matId && AppState.activeDoc && AppState.activeDoc.source_type === "youtube") {
+      matId = AppState.activeDoc.material_id;
+    }
+
+    // Check if modal is already open with youtube player
+    const existingIframe = document.getElementById("youtube-player-iframe");
+    if (previewModal.open && existingIframe) {
+      window.jumpYouTubePlayerToSeconds(targetSeconds);
+      return;
+    }
+
+    if (!matId) {
+      showToast(`Timestamp [${formatSecondsToTimestamp(targetSeconds)}] referenced. Upload or select a YouTube lecture to view embedded playback.`, "info");
+      return;
+    }
+
+    try {
+      const preview = await ApiService.getMaterialPreview(matId);
+      const previewModalTitle = $("#preview-modal-title");
+      const previewModalBadge = $("#preview-modal-type-badge");
+      const previewModalBody = $("#preview-modal-body");
+
+      if (previewModalTitle) previewModalTitle.textContent = preview.title || "Material Preview";
+      if (previewModalBadge) {
+        previewModalBadge.textContent = "YOUTUBE";
+        previewModalBadge.className = "material-type-badge badge-youtube";
+      }
+
+      const items = Array.isArray(preview.structured_preview) ? preview.structured_preview : [];
+      const videoId = items[0]?.video_id || "";
+
+      if (previewModalBody) {
+        previewModalBody.innerHTML = `
+          <div class="youtube-split-viewer">
+            <div class="video-player-frame">
+              ${videoId ? `
+                <iframe id="youtube-player-iframe" src="https://www.youtube.com/embed/${esc(videoId)}?start=${targetSeconds}&autoplay=1&enablejsapi=1" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
+              ` : `
+                <div style="display:flex; align-items:center; justify-content:center; height:100%; color:#fff;">No video stream available</div>
+              `}
+            </div>
+            <div class="youtube-transcript-list" id="youtube-transcript-list">
+              <h4 style="margin:0 0 0.5rem 0; font-size:0.95rem; color:var(--ink-primary);">Timestamped Transcript (${items.length} segments across full duration)</h4>
+              ${items.map(it => {
+                const ts = it.label || it.timestamp || "00:00";
+                const sec = it.start_seconds !== undefined ? it.start_seconds : parseTimestampToSeconds(ts);
+                const isActive = Math.abs(sec - targetSeconds) < 60 ? "active-row" : "";
+                return `
+                  <div class="transcript-row ${isActive}" data-seconds="${sec}" data-video-id="${esc(videoId)}">
+                    <span class="transcript-ts-badge">[${esc(ts)}]</span>
+                    <span>${esc(it.text)}</span>
+                  </div>
+                `;
+              }).join('')}
+            </div>
+          </div>
+        `;
+
+        previewModalBody.querySelectorAll(".transcript-row").forEach(r => {
+          r.onclick = () => {
+            const sec = parseInt(r.getAttribute("data-seconds"), 10);
+            const vid = r.getAttribute("data-video-id");
+            if (!isNaN(sec)) {
+              window.jumpYouTubePlayerToSeconds(sec, vid);
+            }
+          };
+        });
+      }
+
+      previewModal.showModal();
+      setTimeout(() => window.jumpYouTubePlayerToSeconds(targetSeconds, videoId), 400);
+    } catch (err) {
+      showToast(`Could not open video preview: ${err.message}`, "danger");
+    }
+  };
 
   // Markdown renderer for Smart Notes
   function formatMarkdownNotes(mdText) {
@@ -3225,6 +3379,8 @@
       unknown: "var(--color-unknown)"
     };
 
+    const maxY = Math.max(300, ...graph.nodes.map(n => (n.y || 0) + 70));
+
     const lines = (graph.edges || []).map(([from, to]) => {
       const a = byId[from];
       const b = byId[to];
@@ -3236,15 +3392,16 @@
       const st = statusMap[n.id] || "unknown";
       const col = colors[st];
       return `
-        <g class="graph-node-group" style="cursor:pointer;" data-cid="${esc(n.id)}">
+        <g class="graph-node-group" style="cursor:pointer;" data-cid="${esc(n.id)}" data-name="${esc(n.name)}">
+          <title>${esc(n.name)} (${st.toUpperCase()}) - Click to practice, study, or jump to video</title>
           <circle cx="${n.x}" cy="${n.y}" r="24" fill="${col}" stroke="#ffffff" stroke-width="3" filter="drop-shadow(0 2px 4px rgba(0,0,0,0.15))"/>
-          <text x="${n.x}" y="${n.y + 42}" text-anchor="middle" font-size="12" font-weight="600" fill="var(--ink-primary)">${esc(n.name)}</text>
+          <text x="${n.x}" y="${n.y + 40}" text-anchor="middle" font-size="11" font-weight="600" fill="var(--ink-primary)">${esc(n.name)}</text>
         </g>
       `;
     }).join("");
 
     return `
-      <svg viewBox="0 0 740 280" style="width:100%; min-width:600px; height:auto;">
+      <svg viewBox="0 0 740 ${maxY}" style="width:100%; min-width:600px; height:auto;">
         <defs>
           <marker id="arrowhead" viewBox="0 0 10 10" refX="28" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
             <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--ink-muted)" opacity="0.7"/>
@@ -3616,19 +3773,23 @@
                 <div class="youtube-split-viewer">
                   <div class="video-player-frame">
                     ${videoId ? `
-                      <iframe src="https://www.youtube.com/embed/${esc(videoId)}" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
+                      <iframe id="youtube-player-iframe" src="https://www.youtube.com/embed/${esc(videoId)}?enablejsapi=1" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
                     ` : `
                       <div style="display:flex; align-items:center; justify-content:center; height:100%; color:#fff;">No video stream available</div>
                     `}
                   </div>
-                  <div class="youtube-transcript-list">
-                    <h4 style="margin:0 0 0.5rem 0; font-size:0.95rem; color:var(--ink-primary);">Timestamped Transcript</h4>
-                    ${items.map(it => `
-                      <div class="transcript-row">
-                        <span class="transcript-ts-badge">[${esc(it.label || it.timestamp)}]</span>
-                        <span>${esc(it.text)}</span>
-                      </div>
-                    `).join('')}
+                  <div class="youtube-transcript-list" id="youtube-transcript-list">
+                    <h4 style="margin:0 0 0.5rem 0; font-size:0.95rem; color:var(--ink-primary);">Timestamped Transcript (${items.length} segments across full duration)</h4>
+                    ${items.map(it => {
+                      const ts = it.label || it.timestamp || "00:00";
+                      const sec = it.start_seconds !== undefined ? it.start_seconds : parseTimestampToSeconds(ts);
+                      return `
+                        <div class="transcript-row" data-seconds="${sec}" data-video-id="${esc(videoId)}">
+                          <span class="transcript-ts-badge">[${esc(ts)}]</span>
+                          <span>${esc(it.text)}</span>
+                        </div>
+                      `;
+                    }).join('')}
                   </div>
                 </div>
               `;
@@ -3743,6 +3904,17 @@
                     } finally {
                       daBtn.disabled = false;
                       daBtn.innerHTML = origBtnText;
+                    }
+                  };
+                });
+              }
+              if (stype === "youtube") {
+                previewModalBody.querySelectorAll(".transcript-row").forEach(r => {
+                  r.onclick = () => {
+                    const sec = parseInt(r.getAttribute("data-seconds"), 10);
+                    const vid = r.getAttribute("data-video-id");
+                    if (!isNaN(sec)) {
+                      window.jumpYouTubePlayerToSeconds(sec, vid);
                     }
                   };
                 });
@@ -4417,34 +4589,87 @@
         };
       });
 
+      function showConceptActionModal(cid) {
+        if (!cid) return;
+        const modal = $("#concept-modal");
+        const title = $("#concept-modal-title");
+        const body = $("#concept-modal-body");
+        if (!modal || !title || !body) return;
+
+        const c = (AppState.masteryList || []).find(x => x.id === cid || x.concept_id === cid) ||
+                  (AppState.graphData?.nodes || []).find(x => x.id === cid || x.concept_id === cid) ||
+                  { id: cid, name: cid.replace(/[-_]/g, " ").replace(/\b\w/g, l => l.toUpperCase()), why: "Prerequisite Concept" };
+
+        title.textContent = c.name || "Concept Details";
+        const st = getConceptStatus(c);
+        const scoreVal = (c.score !== undefined) ? Math.round((c.score || 0.5) * 100) : 50;
+
+        body.innerHTML = `
+          <div style="margin-bottom:1rem; display:flex; align-items:center; gap:0.5rem; flex-wrap:wrap;">
+            <span class="status-pill ${st}">${st.toUpperCase()}</span>
+            <span style="font-size:0.85rem; color:var(--ink-muted);">Estimated Belief: ${scoreVal}%</span>
+          </div>
+          <p style="margin-bottom:1rem; font-size:0.92rem; color:var(--ink-primary); line-height:1.5;">
+            ${esc(c.definition || c.why || "Key concept extracted across the course material timeline.")}
+          </p>
+          ${c.prerequisites && c.prerequisites.length ? `
+            <div style="margin-bottom:1rem;">
+              <strong style="font-size:0.82rem; color:var(--ink-muted); text-transform:uppercase;">Prerequisites:</strong>
+              <div style="display:flex; gap:0.35rem; flex-wrap:wrap; margin-top:0.25rem;">
+                ${c.prerequisites.map(p => `<span class="badge" style="font-size:0.75rem; background:var(--surface-muted);">${esc(p)}</span>`).join('')}
+              </div>
+            </div>
+          ` : ''}
+          <div style="display:flex; gap:0.5rem; margin-top:1.5rem; flex-wrap:wrap;">
+            <button class="btn btn-primary btn-sm start-direct-quiz" data-cid="${esc(c.id)}">⚡ Practice Quiz</button>
+            <button class="btn btn-secondary btn-sm start-direct-recall" data-cid="${esc(c.id)}" data-name="${esc(c.name)}">🧠 Active Recall</button>
+            <button class="btn btn-secondary btn-sm ask-direct-tutor" data-name="${esc(c.name)}">💬 Ask Tutor</button>
+          </div>
+        `;
+
+        body.querySelector(".start-direct-quiz")?.addEventListener("click", () => {
+          modal.close();
+          AppState.quizSession.targetConceptId = c.id;
+          navigateTo("practice");
+        });
+
+        body.querySelector(".start-direct-recall")?.addEventListener("click", () => {
+          modal.close();
+          if (!AppState.activeRecallSession) AppState.activeRecallSession = {};
+          AppState.activeRecallSession.targetConceptId = c.id;
+          AppState.activeRecallSession.targetConceptName = c.name;
+          navigateTo("recall");
+        });
+
+        body.querySelector(".ask-direct-tutor")?.addEventListener("click", () => {
+          modal.close();
+          navigateTo("tutor");
+          setTimeout(() => {
+            const input = document.getElementById("tutor-prompt-input");
+            if (input) {
+              input.value = `Can you explain ${c.name} in detail and test my understanding?`;
+              input.focus();
+            }
+          }, 300);
+        });
+
+        if (typeof modal.showModal === "function") modal.showModal();
+        else modal.setAttribute("open", "");
+      }
+
+      // Non-Linear DAG Node Click Handler
+      $$(".graph-node-group").forEach(nodeGroup => {
+        nodeGroup.onclick = () => {
+          const cid = nodeGroup.getAttribute("data-cid");
+          if (cid) showConceptActionModal(cid);
+        };
+      });
+
       // Concept Details Modal
       $$(".inspect-concept-btn").forEach(btn => {
         btn.onclick = () => {
           const cid = btn.getAttribute("data-cid");
-          const c = (AppState.masteryList || []).find(x => x.id === cid);
-          if (!c) return;
-
-          const modal = $("#concept-modal");
-          const title = $("#concept-modal-title");
-          const body = $("#concept-modal-body");
-          if (!modal || !title || !body) return;
-
-          title.textContent = c.name;
-          const st = getConceptStatus(c);
-          body.innerHTML = `
-            <div style="margin-bottom:1rem;">
-              <span class="status-pill ${st}">${st}</span>
-              <span style="font-size:0.85rem; color:var(--ink-muted); margin-left:0.5rem;">Estimated Belief: ${Math.round((c.score||0.5)*100)}%</span>
-            </div>
-            <p style="margin-bottom:1rem; font-size:0.92rem; color:var(--ink-primary);">${esc(c.why || "No diagnostic notes available.")}</p>
-            <div style="display:flex; gap:0.65rem; margin-top:1.5rem;">
-              <a href="#tutor" class="btn btn-secondary btn-sm" onclick="document.getElementById('concept-modal').close()">Ask Tutor</a>
-              <a href="#practice" data-target-concept="${esc(c.id)}" class="btn btn-primary btn-sm start-target-quiz" onclick="document.getElementById('concept-modal').close()">Practice Now</a>
-            </div>
-          `;
-
-          if (typeof modal.showModal === "function") modal.showModal();
-          else modal.setAttribute("open", "");
+          if (cid) showConceptActionModal(cid);
         };
       });
     },
@@ -5149,8 +5374,25 @@
 
     window.addEventListener("hashchange", handleHashChange);
     
-    // Global navigation listener for practice links and teacher deliberation modal
+    // Global navigation listener for practice links, teacher deliberation modal, and timestamp chips
     document.addEventListener("click", (e) => {
+      const tsChip = e.target.closest(".view-timestamp-chip, .timestamp-citation-chip");
+      if (tsChip) {
+        const sec = parseInt(tsChip.getAttribute("data-seconds"), 10);
+        if (!isNaN(sec)) {
+          window.openVideoPreviewAtTimestamp(sec);
+        }
+        return;
+      }
+
+      const citChip = e.target.closest(".view-citation-chip, .grounded-citation-chip");
+      if (citChip) {
+        const loc = citChip.getAttribute("data-loc");
+        const type = citChip.getAttribute("data-type");
+        showToast(`Grounding source anchor: ${type || 'Page'} ${loc || ''}`, "info");
+        return;
+      }
+
       const inspectBtn = e.target.closest(".btn-inspect-deliberation");
       if (inspectBtn) {
         const cid = inspectBtn.getAttribute("data-concept-id");

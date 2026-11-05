@@ -20,7 +20,29 @@ from ..core import store, llm
 from ..core.text import normalize, STOP, SYN, NORMALIZER
 from ..models.schemas import ConceptNode, ConceptEdge, GraphExport
 
-MAX_CONCEPTS = 12
+MAX_CONCEPTS = 24
+
+GENERIC_SECTION_PATTERNS = [
+    re.compile(r"^(?:lecture\s+)?segment\b", re.I),
+    re.compile(r"^video\s*\[", re.I),
+    re.compile(r"^voice\s+note\b", re.I),
+    re.compile(r"^page\s+\d+", re.I),
+    re.compile(r"^slide\s+\d+", re.I),
+    re.compile(r"^section\s*:\s*overview", re.I),
+    re.compile(r"^introduction$", re.I),
+    re.compile(r"^overview$", re.I),
+    re.compile(r"^summary$", re.I),
+    re.compile(r"^conclusion$", re.I),
+    re.compile(r"^\d{1,2}:\d{2}(?::\d{2})?$", re.I),
+]
+
+
+def is_generic_section_heading(heading: str) -> bool:
+    """Detect if a heading is an arbitrary locator/segment label rather than a real domain concept."""
+    if not heading or not heading.strip():
+        return True
+    h = heading.strip()
+    return any(p.search(h) for p in GENERIC_SECTION_PATTERNS)
 
 # In-memory graph references
 _GRAPH: nx.DiGraph = nx.DiGraph()
@@ -43,23 +65,62 @@ def _slug(s: str) -> str:
 
 
 def _candidate_terms(chunks: list[dict], limit: int) -> list[str]:
-    tf, df = Counter(), Counter()
-    for c in chunks:
-        words = re.findall(r"[a-z][a-z\-]*", normalize(c["text"]))
-        seen = set()
-        for n in (1, 2):
-            for i in range(len(words) - n + 1):
-                g = words[i:i + n]
-                if g[0] in STOP or g[-1] in STOP or any(len(w) < 3 for w in g):
-                    continue
-                t = " ".join(g)
-                tf[t] += 1
-                seen.add(t)
-        df.update(seen)
+    """Extract candidate domain terms from chunks, partitioning long materials across full timeline."""
+    if not chunks:
+        return []
 
-    ok = [(tf[t] * (1.6 if " " in t else 1.0), t) for t in tf if 2 <= df[t] <= 0.6 * len(chunks) and tf[t] >= 3]
+    # Partition chunks into Early (0-33%), Middle (33-66%), Late (66-100%)
+    # to guarantee representation of concepts appearing deep into the material/video
+    n = len(chunks)
+    partitions: list[list[dict]] = []
+    if n >= 6:
+        p1 = chunks[: n // 3]
+        p2 = chunks[n // 3 : 2 * n // 3]
+        p3 = chunks[2 * n // 3 :]
+        partitions = [p1, p2, p3]
+    else:
+        partitions = [chunks]
+
+    def _extract_from_subset(subset: list[dict], sub_limit: int) -> list[str]:
+        tf, df = Counter(), Counter()
+        for c in subset:
+            words = re.findall(r"[a-z][a-z\-]*", normalize(c["text"]))
+            seen = set()
+            for n_gram in (1, 2):
+                for i in range(len(words) - n_gram + 1):
+                    g = words[i : i + n_gram]
+                    if g[0] in STOP or g[-1] in STOP or any(len(w) < 3 for w in g):
+                        continue
+                    t = " ".join(g)
+                    tf[t] += 1
+                    seen.add(t)
+            df.update(seen)
+
+        sub_len = len(subset)
+        ok = [
+            (tf[t] * (1.6 if " " in t else 1.0), t)
+            for t in tf
+            if (1 <= df[t] <= max(0.85 * sub_len, 2)) and tf[t] >= (2 if sub_len <= 5 else 3)
+        ]
+        res: list[str] = []
+        for _, t in sorted(ok, reverse=True):
+            if is_generic_section_heading(t):
+                continue
+            if not any(t in o or o in t for o in res):
+                res.append(t)
+            if len(res) >= sub_limit:
+                break
+        return res
+
+    global_terms = _extract_from_subset(chunks, limit)
+    tier_terms: list[str] = []
+    if len(partitions) > 1:
+        per_tier = max(4, limit // 3)
+        for part in partitions:
+            tier_terms.extend(_extract_from_subset(part, per_tier))
+
     out: list[str] = []
-    for _, t in sorted(ok, reverse=True):
+    for t in global_terms + tier_terms:
         if not any(t in o or o in t for o in out):
             out.append(t)
         if len(out) >= limit:
@@ -72,7 +133,19 @@ def _llm_extract_definitions_and_prereqs(chunks: list[dict], concept_names: list
     if not llm.enabled() or not concept_names:
         return {}
 
-    ctx_parts = [f"[Page {c['page']} · {c['section']}] {c['text']}" for c in chunks[:12]]
+    # Sample chunks distributed evenly across the full duration/page timeline
+    if len(chunks) <= 16:
+        sampled_chunks = chunks
+    else:
+        step = len(chunks) / 16.0
+        sampled_chunks = [chunks[int(i * step)] for i in range(16)]
+
+    ctx_parts = []
+    for c in sampled_chunks:
+        loc = c.get("locator_label") or f"Page {c.get('page', 1)}"
+        sec = c.get("section", "")
+        txt = c.get("text", "")
+        ctx_parts.append(f"[{loc} · {sec}] {txt}")
     ctx = "\n\n".join(ctx_parts)
 
     system_prompt = (
@@ -130,18 +203,20 @@ def _layout(concepts: list[dict]):
     if not concepts:
         return
     maxd = max((c.get("depth", 0) for c in concepts), default=0)
-    if maxd <= 4:
-        cols: dict[int, list] = {}
-        for c in concepts:
-            cols.setdefault(c["depth"], []).append(c)
+    cols: dict[int, list] = {}
+    for c in concepts:
+        cols.setdefault(c.get("depth", 0), []).append(c)
+
+    if maxd <= 5:
+        y_step = 85.0
         for d, col in cols.items():
             for k, c in enumerate(col):
-                c["x"] = 90.0 + d * (520.0 / max(maxd, 1)) if maxd else 350.0
-                c["y"] = 115.0 if len(col) == 1 else 55.0 + k * (125.0 / max(len(col) - 1, 1))
+                c["x"] = 80.0 + d * (560.0 / max(maxd, 1)) if maxd else 360.0
+                c["y"] = 55.0 + k * y_step
     else:
         for i, c in enumerate(concepts):
-            c["x"] = float(100 + (i % 4) * 166)
-            c["y"] = float(50 + (i // 4) * 75)
+            c["x"] = float(80 + (i % 4) * 180)
+            c["y"] = float(55 + (i // 4) * 85)
 
 
 def build(chunks: list[dict]) -> tuple[list[dict], list[list[str]]]:
@@ -150,15 +225,18 @@ def build(chunks: list[dict]) -> tuple[list[dict], list[list[str]]]:
 
     names: list[str] = []
     for c in chunks:
-        if c["section"] != "Introduction" and c["section"] not in names:
-            names.append(c["section"])
+        sec = str(c.get("section", "")).strip()
+        if not is_generic_section_heading(sec) and sec not in names:
+            names.append(sec)
+
     names = names[:MAX_CONCEPTS]
-    if len(names) < 6:
+    if len(names) < MAX_CONCEPTS:
         for t in _candidate_terms(chunks, MAX_CONCEPTS):
             if len(names) >= MAX_CONCEPTS:
                 break
-            if t.title() not in names:
-                names.append(t.title())
+            t_title = t.title()
+            if not is_generic_section_heading(t_title) and t_title not in names:
+                names.append(t_title)
 
     concepts: list[dict] = []
     used_ids: set[str] = set()

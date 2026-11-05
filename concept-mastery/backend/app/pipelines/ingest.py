@@ -318,8 +318,19 @@ def extract_youtube_id(url: str) -> Optional[str]:
     return None
 
 
+def format_seconds_to_timestamp(seconds: float | int) -> str:
+    """Format seconds into MM:SS or HH:MM:SS format."""
+    sec = int(max(0, seconds))
+    hours = sec // 3600
+    minutes = (sec % 3600) // 60
+    rem_seconds = sec % 60
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{rem_seconds:02d}"
+    return f"{minutes:02d}:{rem_seconds:02d}"
+
+
 def load_youtube_material(url: str, custom_title: Optional[str] = None) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]], str]:
-    """Fetch timestamped YouTube video transcript and segment into semantic topic windows. Anchors [04:15]."""
+    """Fetch timestamped YouTube video transcript across full duration and segment into sliding topic windows."""
     video_id = extract_youtube_id(url)
     if not video_id:
         raise store.UserError(f"Invalid YouTube URL: '{url}'. Please provide a standard watch or youtu.be link.")
@@ -349,74 +360,120 @@ def load_youtube_material(url: str, custom_title: Optional[str] = None) -> Tuple
     if not raw_transcript:
         raise store.UserError(f"No subtitle segments found for YouTube video {video_id}.")
 
+    # Collect and sort all snippets chronologically across 100% of video duration
+    snippets = []
+    for s in raw_transcript:
+        text = str(s.get("text", "")).strip()
+        start = float(s.get("start", 0.0))
+        dur = float(s.get("duration", 0.0))
+        if text:
+            snippets.append({"text": text, "start": start, "duration": dur})
+    snippets.sort(key=lambda x: x["start"])
+
+    if not snippets:
+        raise store.UserError(f"No valid transcript text found for YouTube video {video_id}.")
+
     title = custom_title or f"YouTube Lecture: {video_id}"
     raw_items: List[Dict[str, Any]] = []
     structured_preview: List[Dict[str, Any]] = []
 
-    # Group transcript snippets into ~60-90 second semantic topic windows
-    current_window_text: List[str] = []
-    window_start_sec = 0.0
-    window_index = 1
+    # Sliding 2-to-3 minute semantic topic window segmenter
+    WINDOW_TARGET_SEC = 150.0   # 2.5 minutes per topic window
+    WINDOW_STRIDE_SEC = 100.0   # 1.67 minutes stride (~50s overlap)
+    total_duration = max((s["start"] + s["duration"] for s in snippets), default=0.0)
 
-    for snippet in raw_transcript:
-        text = str(snippet.get("text", "")).strip()
-        start = float(snippet.get("start", 0.0))
-        if not text:
-            continue
+    if total_duration <= 180.0:
+        combined = " ".join(s["text"] for s in snippets).strip()
+        start_sec = snippets[0]["start"]
+        label = format_seconds_to_timestamp(start_sec)
+        structured_preview.append({
+            "index": 1,
+            "label": label,
+            "timestamp": label,
+            "start_seconds": int(start_sec),
+            "end_seconds": int(total_duration),
+            "text": combined,
+            "video_id": video_id,
+        })
+        raw_items.append({
+            "page": 1,
+            "locator_label": label,
+            "section": f"Video [{label}]",
+            "text": combined,
+        })
+    else:
+        window_index = 1
+        curr_idx = 0
+        n_snippets = len(snippets)
 
-        if not current_window_text:
-            window_start_sec = start
+        while curr_idx < n_snippets:
+            window_start_sec = snippets[curr_idx]["start"]
+            target_end_sec = window_start_sec + WINDOW_TARGET_SEC
 
-        current_window_text.append(text)
-        total_words = sum(len(t.split()) for t in current_window_text)
+            window_texts = []
+            window_end_sec = window_start_sec
 
-        # Flush window if duration > 75s or words > 120
-        if (start - window_start_sec >= 75.0) or total_words >= 110:
-            combined = " ".join(current_window_text).strip()
-            mm = int(window_start_sec) // 60
-            ss = int(window_start_sec) % 60
-            timestamp_str = f"{mm:02d}:{ss:02d}"
-            label = timestamp_str
+            end_idx = curr_idx
+            while end_idx < n_snippets:
+                s = snippets[end_idx]
+                window_texts.append(s["text"])
+                window_end_sec = max(window_end_sec, s["start"] + s.get("duration", 0.0))
+                end_idx += 1
+                total_w = sum(len(t.split()) for t in window_texts)
+                if s["start"] >= target_end_sec and total_w >= 45:
+                    break
+
+            combined = " ".join(window_texts).strip()
+            ts_str = format_seconds_to_timestamp(window_start_sec)
 
             structured_preview.append({
                 "index": window_index,
-                "label": label,
-                "timestamp": timestamp_str,
+                "label": ts_str,
+                "timestamp": ts_str,
                 "start_seconds": int(window_start_sec),
+                "end_seconds": int(window_end_sec),
                 "text": combined,
-                "video_id": video_id
+                "video_id": video_id,
             })
 
             raw_items.append({
                 "page": window_index,
-                "locator_label": label,
-                "section": f"Lecture Segment ({timestamp_str})",
-                "text": combined
+                "locator_label": ts_str,
+                "section": f"Video [{ts_str}]",
+                "text": combined,
             })
 
-            current_window_text = []
             window_index += 1
 
-    if current_window_text:
-        combined = " ".join(current_window_text).strip()
-        mm = int(window_start_sec) // 60
-        ss = int(window_start_sec) % 60
-        timestamp_str = f"{mm:02d}:{ss:02d}"
-        label = timestamp_str
-        structured_preview.append({
-            "index": window_index,
-            "label": label,
-            "timestamp": timestamp_str,
-            "start_seconds": int(window_start_sec),
-            "text": combined,
-            "video_id": video_id
-        })
-        raw_items.append({
-            "page": window_index,
-            "locator_label": label,
-            "section": f"Lecture Segment ({timestamp_str})",
-            "text": combined
-        })
+            # Advance curr_idx using stride to maintain continuous overlapping progression
+            next_start_target = window_start_sec + WINDOW_STRIDE_SEC
+            next_idx = curr_idx + 1
+            while next_idx < n_snippets and snippets[next_idx]["start"] < next_start_target:
+                next_idx += 1
+
+            if next_idx >= n_snippets or next_idx == curr_idx:
+                if end_idx < n_snippets:
+                    tail_texts = [s["text"] for s in snippets[curr_idx:]]
+                    tail_combined = " ".join(tail_texts).strip()
+                    tail_start = snippets[curr_idx]["start"]
+                    tail_ts = format_seconds_to_timestamp(tail_start)
+                    structured_preview.append({
+                        "index": window_index,
+                        "label": tail_ts,
+                        "timestamp": tail_ts,
+                        "start_seconds": int(tail_start),
+                        "end_seconds": int(total_duration),
+                        "text": tail_combined,
+                        "video_id": video_id,
+                    })
+                    raw_items.append({
+                        "page": window_index,
+                        "locator_label": tail_ts,
+                        "section": f"Video [{tail_ts}]",
+                        "text": tail_combined,
+                    })
+                break
+            curr_idx = next_idx
 
     full_text = "\n\n".join(item["text"] for item in raw_items)
     return title, raw_items, structured_preview, full_text
@@ -1007,7 +1064,7 @@ class UniversalMaterialIngestor:
                 items.append({
                     "page": p.get("index", 1),
                     "locator_label": p.get("label", f"Page {p.get('index', 1)}"),
-                    "section": p.get("heading") or p.get("title") or (f"Segment {p.get('label')}" if p.get("timestamp") else "Introduction"),
+                    "section": p.get("heading") or p.get("title") or (f"Video [{p.get('label')}]" if p.get("timestamp") else "Introduction"),
                     "text": p.get("text", "")
                 })
 

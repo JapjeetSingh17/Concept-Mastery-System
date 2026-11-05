@@ -2271,6 +2271,57 @@ dialog::backdrop {
   white-space: nowrap;
 }
 
+.transcript-row.active-row {
+  background: var(--primary-light);
+  border-left: 3px solid var(--primary);
+  font-weight: 500;
+}
+
+.timestamp-citation-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.15rem 0.5rem;
+  background: rgba(37, 99, 235, 0.1);
+  color: var(--primary);
+  border: 1px solid rgba(37, 99, 235, 0.25);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono, monospace);
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  vertical-align: baseline;
+}
+
+.timestamp-citation-chip:hover {
+  background: var(--primary);
+  color: #ffffff;
+  border-color: var(--primary);
+}
+
+.grounded-citation-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.15rem 0.5rem;
+  background: rgba(16, 185, 129, 0.1);
+  color: #059669;
+  border: 1px solid rgba(16, 185, 129, 0.25);
+  border-radius: var(--radius-sm);
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  vertical-align: baseline;
+}
+
+.grounded-citation-chip:hover {
+  background: #059669;
+  color: #ffffff;
+  border-color: #059669;
+}
+
 /* Web Reader Mode View */
 .web-reader-container {
   max-width: 780px;
