@@ -155,6 +155,11 @@ def evaluate_submission_node(state: LoopState) -> LoopState:
     record = mastery.get_record(user_id, target_cid)
     state["state"] = record.status
 
+    # Check if Head Teacher Arbiter generated a follow-up question
+    latest_decision = store.get_latest_mastery_decision(user_id, target_cid)
+    if latest_decision and latest_decision.get("follow_up_question"):
+        state["follow_up_question"] = latest_decision["follow_up_question"]
+
     # Add evidence trail
     trail = state.get("evidence_trail", [])
     trail.append(f"Evaluated {target_cid}: Score {record.score}, Status {record.status.value}")
@@ -321,6 +326,10 @@ def start_session(user_id: str = "default") -> dict:
     if res.get("next_step") == "COMPLETE":
         action = "complete"
 
+    # Consult latest decision for follow-up questions from Head Teacher
+    latest_decision = store.get_latest_mastery_decision(user_id, target) if target else None
+    follow_up_q = latest_decision.get("follow_up_question") if latest_decision else None
+
     return {
         "user_id": user_id,
         "lifecycle": get_lifecycle_state(user_id),
@@ -330,6 +339,7 @@ def start_session(user_id: str = "default") -> dict:
         "status": status.value if hasattr(status, "value") else str(status),
         "quiz": questions[0] if questions else None,
         "quiz_count": len(questions),
+        "follow_up_question": follow_up_q,
         "remedial_lesson": res.get("remedial_lesson"),
         "artifacts": res.get("artifacts", []),
         "external_links": res.get("external_links", []),
@@ -371,6 +381,10 @@ def submit_quiz_answer(sub: QuizSubmission) -> dict:
 
     record = mastery.get_record(sub.user_id, sub.concept_id)
 
+    # Retrieve any pending follow-up question produced by Head Teacher Arbiter
+    latest_decision = store.get_latest_mastery_decision(sub.user_id, sub.concept_id)
+    follow_up_q = latest_decision.get("follow_up_question") if latest_decision else None
+
     return {
         "user_id": sub.user_id,
         "question_id": sub.question_id,
@@ -390,10 +404,48 @@ def submit_quiz_answer(sub: QuizSubmission) -> dict:
         },
         "next_action": action,
         "next_concept_id": next_concept_id,
+        "follow_up_question": follow_up_q,
         "remedial_lesson": remedial_text,
         "artifacts": remedial_state.get("artifacts", []) if routed == "remedial_reteach" else evaluated_state.get("artifacts", []),
         "external_links": remedial_state.get("external_links", []) if routed == "remedial_reteach" else evaluated_state.get("external_links", []),
         "step_by_step_solution": eval_result.step_by_step_solution,
+    }
+
+
+def get_learner_loop_status(user_id: str = "default") -> dict:
+    """Return learner loop lifecycle state, diagnostic readiness, and any pending follow-up questions."""
+    mats = store.list_study_materials(user_id)
+    if not mats:
+        return {
+            "ok": True,
+            "loop_state": "UNINITIALIZED",
+            "state": LIFECYCLE_AWAITING_UPLOAD,
+            "lifecycle": LIFECYCLE_AWAITING_UPLOAD,
+            "message": "Upload your study material to begin.",
+            "follow_up_question": None,
+        }
+
+    lifecycle = get_lifecycle_state(user_id)
+    snap = mastery.snapshot(user_id)
+    total_attempts = sum(c.get("attempts", 0) for c in snap)
+    baseline_done = (lifecycle == LIFECYCLE_ACTIVE_LEARNING or total_attempts >= 3)
+
+    # Search for pending follow-up questions from Head Teacher Arbiter
+    pending_follow_up = None
+    for s in snap:
+        if s.get("follow_up_question"):
+            pending_follow_up = s["follow_up_question"]
+            break
+
+    return {
+        "ok": True,
+        "user_id": user_id,
+        "lifecycle": lifecycle,
+        "loop_state": "ACTIVE_LOOP" if baseline_done else "BASELINE_DIAGNOSTIC",
+        "state": LIFECYCLE_ACTIVE_LEARNING if baseline_done else lifecycle,
+        "message": "Active learning session in progress." if baseline_done else "Baseline diagnostic required.",
+        "follow_up_question": pending_follow_up,
+        "total_attempts": total_attempts,
     }
 
 
@@ -557,6 +609,22 @@ def evaluate_baseline_diagnostic(user_id: str = "default", submissions: list = N
                 miscons.extend(it["eval"].misconceptions)
             row["misconceptions"] = json.dumps(miscons)
             mastery._save_row(conn, row)
+
+            # Persist authoritative baseline decision in explainable mastery store
+            try:
+                store.save_mastery_decision({
+                    "concept_id": cid,
+                    "user_id": user_id,
+                    "outcome": "MASTERED" if status == MasteryStatus.STRONG else "NOT_YET_MASTERED",
+                    "legacy_status": status.value,
+                    "supporting_evidence_refs": [],
+                    "demonstrated_understanding": [audit] if status == MasteryStatus.STRONG else [],
+                    "remaining_gaps": miscons,
+                    "recommended_next_action": "Advance to subsequent concepts." if status == MasteryStatus.STRONG else "Remediate baseline gaps.",
+                    "explainable_summary": audit,
+                }, user_id=user_id)
+            except Exception as e:
+                logger.warning(f"Error persisting baseline mastery decision for {cid}: {e}")
 
             concept_results[cid] = {
                 "concept_id": cid,

@@ -7,7 +7,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 from .. import config
 from .vector_index import VectorIndex
 
@@ -92,6 +92,62 @@ CREATE TABLE IF NOT EXISTS smart_notes (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_smart_notes_user_concept ON smart_notes(user_id, concept_id);
+
+-- Learning Evidence Store
+CREATE TABLE IF NOT EXISTS learning_evidence_store (
+    evidence_id                 TEXT PRIMARY KEY,
+    user_id                     TEXT NOT NULL DEFAULT 'default',
+    concept_id                  TEXT NOT NULL,
+    question_id                 TEXT NOT NULL DEFAULT '',
+    question_text               TEXT NOT NULL DEFAULT '',
+    question_form               TEXT NOT NULL DEFAULT 'quiz',
+    student_answer              TEXT NOT NULL DEFAULT '',
+    student_explanation         TEXT NOT NULL DEFAULT '',
+    problem_solving_approach    TEXT NOT NULL DEFAULT '',
+    hints_used                  INTEGER NOT NULL DEFAULT 0,
+    solution_revealed_first     INTEGER NOT NULL DEFAULT 0,
+    corrected_after_feedback    INTEGER NOT NULL DEFAULT 0,
+    is_unfamiliar_example       INTEGER NOT NULL DEFAULT 0,
+    session_id                  TEXT,
+    created_at                  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_learning_evidence_user_concept ON learning_evidence_store(user_id, concept_id);
+
+-- Specialist Agent Findings
+CREATE TABLE IF NOT EXISTS specialist_agent_findings (
+    finding_id                  TEXT PRIMARY KEY,
+    decision_id                 TEXT NOT NULL,
+    user_id                     TEXT NOT NULL DEFAULT 'default',
+    concept_id                  TEXT NOT NULL,
+    agent_role                  TEXT NOT NULL,
+    evidence_refs_json          TEXT NOT NULL DEFAULT '[]',
+    findings                    TEXT NOT NULL DEFAULT '',
+    identified_gaps_json        TEXT NOT NULL DEFAULT '[]',
+    recommended_action          TEXT NOT NULL DEFAULT '',
+    assessment_confidence       TEXT NOT NULL DEFAULT 'moderate',
+    limitations                 TEXT NOT NULL DEFAULT '',
+    created_at                  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_specialist_findings_decision_user_concept ON specialist_agent_findings(decision_id, user_id, concept_id);
+
+-- Explainable Mastery Decisions
+CREATE TABLE IF NOT EXISTS explainable_mastery_decisions (
+    decision_id                     TEXT PRIMARY KEY,
+    user_id                         TEXT NOT NULL DEFAULT 'default',
+    concept_id                      TEXT NOT NULL,
+    outcome                         TEXT NOT NULL DEFAULT 'INSUFFICIENT_EVIDENCE',
+    legacy_status                   TEXT NOT NULL DEFAULT 'UNKNOWN',
+    demonstrated_understanding_json TEXT NOT NULL DEFAULT '[]',
+    remaining_gaps_json             TEXT NOT NULL DEFAULT '[]',
+    unresolved_disagreements_json   TEXT NOT NULL DEFAULT '[]',
+    supporting_evidence_refs_json   TEXT NOT NULL DEFAULT '[]',
+    recommended_next_action         TEXT NOT NULL DEFAULT '',
+    follow_up_question_json         TEXT DEFAULT NULL,
+    evidence_version                INTEGER NOT NULL DEFAULT 1,
+    evaluation_pending              INTEGER NOT NULL DEFAULT 0,
+    updated_at                      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mastery_decisions_user_concept ON explainable_mastery_decisions(user_id, concept_id);
 """
 
 @contextmanager
@@ -615,6 +671,402 @@ def update_smart_note_urls(
                 return True
         res = conn.execute(sql, tuple(params_with_id))
         return res.rowcount > 0
+
+
+# ── Multi-Agent Evidence & Deliberation Persistence ─────────────────────────
+
+def save_learning_evidence(rec: dict | Any) -> dict:
+    """Save or update a student learning evidence record."""
+    init_materials_db()
+    if hasattr(rec, "model_dump"):
+        data = rec.model_dump()
+    elif isinstance(rec, dict):
+        data = dict(rec)
+    else:
+        data = getattr(rec, "__dict__", {}).copy()
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    evidence_id = data.get("evidence_id") or f"evi_{uuid.uuid4().hex[:12]}"
+    user_id = data.get("user_id") or "default"
+    concept_id = data.get("concept_id", "")
+    question_id = data.get("question_id") or ""
+    question_text = data.get("question_text") or ""
+    question_form = data.get("question_form") or "quiz"
+    student_answer = data.get("student_answer") or ""
+    student_explanation = data.get("student_explanation") or ""
+    problem_solving_approach = data.get("problem_solving_approach") or ""
+    hints_used = int(data.get("hints_used", 0) or 0)
+    solution_revealed_first = 1 if data.get("solution_revealed_first") else 0
+    corrected_after_feedback = 1 if data.get("corrected_after_feedback") else 0
+    is_unfamiliar_example = 1 if data.get("is_unfamiliar_example") else 0
+    session_id = data.get("session_id")
+    created_at = data.get("created_at") or now_iso
+
+    with get_materials_db() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO learning_evidence_store
+            (evidence_id, user_id, concept_id, question_id, question_text,
+             question_form, student_answer, student_explanation, problem_solving_approach,
+             hints_used, solution_revealed_first, corrected_after_feedback,
+             is_unfamiliar_example, session_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                evidence_id, user_id, concept_id, question_id, question_text,
+                question_form, student_answer, student_explanation, problem_solving_approach,
+                hints_used, solution_revealed_first, corrected_after_feedback,
+                is_unfamiliar_example, session_id, created_at
+            )
+        )
+
+    return {
+        "evidence_id": evidence_id,
+        "user_id": user_id,
+        "concept_id": concept_id,
+        "question_id": question_id,
+        "question_text": question_text,
+        "question_form": question_form,
+        "student_answer": student_answer,
+        "student_explanation": student_explanation,
+        "problem_solving_approach": problem_solving_approach,
+        "hints_used": hints_used,
+        "solution_revealed_first": bool(solution_revealed_first),
+        "corrected_after_feedback": bool(corrected_after_feedback),
+        "is_unfamiliar_example": bool(is_unfamiliar_example),
+        "session_id": session_id,
+        "created_at": created_at,
+    }
+
+
+def get_learning_evidence(evidence_id: str, user_id: str = "default") -> dict | None:
+    """Fetch a single learning evidence record by ID and user_id."""
+    init_materials_db()
+    with get_materials_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM learning_evidence_store WHERE evidence_id = ? AND user_id = ?",
+            (evidence_id, user_id)
+        ).fetchone()
+        if not row:
+            return None
+        res = dict(row)
+        res["solution_revealed_first"] = bool(res.get("solution_revealed_first", 0))
+        res["corrected_after_feedback"] = bool(res.get("corrected_after_feedback", 0))
+        res["is_unfamiliar_example"] = bool(res.get("is_unfamiliar_example", 0))
+        return res
+
+
+def list_learning_evidence(user_id: str, concept_id: str, limit: int = 50) -> list[dict]:
+    """Retrieve chronologically ordered (most recent first) learning evidence records for a concept."""
+    init_materials_db()
+    with get_materials_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM learning_evidence_store
+            WHERE user_id = ? AND concept_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (user_id, concept_id, limit)
+        ).fetchall()
+        results = []
+        for r in rows:
+            d = dict(r)
+            d["solution_revealed_first"] = bool(d.get("solution_revealed_first", 0))
+            d["corrected_after_feedback"] = bool(d.get("corrected_after_feedback", 0))
+            d["is_unfamiliar_example"] = bool(d.get("is_unfamiliar_example", 0))
+            results.append(d)
+        return results
+
+
+def save_specialist_finding(finding: dict | Any, decision_id: str, user_id: str = "default") -> dict:
+    """Save an assessment finding produced by a specialist agent during deliberation."""
+    init_materials_db()
+    if hasattr(finding, "model_dump"):
+        data = finding.model_dump()
+    elif isinstance(finding, dict):
+        data = dict(finding)
+    else:
+        data = getattr(finding, "__dict__", {}).copy()
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    finding_id = data.get("finding_id") or f"find_{uuid.uuid4().hex[:12]}"
+    uid = data.get("user_id") or user_id
+    concept_id = data.get("concept_id", "")
+    agent_role = data.get("agent_role", "")
+    findings = data.get("findings", "")
+    recommended_action = data.get("recommended_action", "")
+    assessment_confidence = data.get("assessment_confidence", "moderate")
+    limitations = data.get("limitations", "")
+    created_at = data.get("created_at") or now_iso
+
+    evidence_refs = data.get("evidence_refs", [])
+    if isinstance(evidence_refs, str):
+        evidence_refs_json = evidence_refs
+        try:
+            evidence_refs = json.loads(evidence_refs)
+        except Exception:
+            evidence_refs = []
+    else:
+        evidence_refs_json = json.dumps(evidence_refs or [])
+
+    identified_gaps = data.get("identified_gaps", [])
+    if isinstance(identified_gaps, str):
+        identified_gaps_json = identified_gaps
+        try:
+            identified_gaps = json.loads(identified_gaps)
+        except Exception:
+            identified_gaps = []
+    else:
+        identified_gaps_json = json.dumps(identified_gaps or [])
+
+    with get_materials_db() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO specialist_agent_findings
+            (finding_id, decision_id, user_id, concept_id, agent_role,
+             evidence_refs_json, findings, identified_gaps_json,
+             recommended_action, assessment_confidence, limitations, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                finding_id, decision_id, uid, concept_id, agent_role,
+                evidence_refs_json, findings, identified_gaps_json,
+                recommended_action, assessment_confidence, limitations, created_at
+            )
+        )
+
+    return {
+        "finding_id": finding_id,
+        "decision_id": decision_id,
+        "user_id": uid,
+        "concept_id": concept_id,
+        "agent_role": agent_role,
+        "evidence_refs": evidence_refs,
+        "evidence_refs_json": evidence_refs_json,
+        "findings": findings,
+        "identified_gaps": identified_gaps,
+        "identified_gaps_json": identified_gaps_json,
+        "recommended_action": recommended_action,
+        "assessment_confidence": assessment_confidence,
+        "limitations": limitations,
+        "created_at": created_at,
+    }
+
+
+def list_specialist_findings(decision_id: str, user_id: str = "default") -> list[dict]:
+    """Retrieve all specialist agent findings associated with a deliberation decision."""
+    init_materials_db()
+    with get_materials_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM specialist_agent_findings
+            WHERE decision_id = ? AND user_id = ?
+            ORDER BY created_at ASC
+            """,
+            (decision_id, user_id)
+        ).fetchall()
+        results = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["evidence_refs"] = json.loads(d.get("evidence_refs_json") or "[]")
+            except Exception:
+                d["evidence_refs"] = []
+            try:
+                d["identified_gaps"] = json.loads(d.get("identified_gaps_json") or "[]")
+            except Exception:
+                d["identified_gaps"] = []
+            results.append(d)
+        return results
+
+
+def save_mastery_decision(decision: dict | Any, user_id: str = "default") -> dict:
+    """Save an explainable mastery decision from the Head Teacher agent."""
+    init_materials_db()
+    if hasattr(decision, "model_dump"):
+        data = decision.model_dump()
+    elif isinstance(decision, dict):
+        data = dict(decision)
+    else:
+        data = getattr(decision, "__dict__", {}).copy()
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    decision_id = data.get("decision_id") or f"dec_{uuid.uuid4().hex[:12]}"
+    uid = data.get("user_id") or user_id
+    concept_id = data.get("concept_id", "")
+    outcome = data.get("outcome") or "INSUFFICIENT_EVIDENCE"
+    legacy_status = data.get("legacy_status") or "UNKNOWN"
+
+    dem_under = data.get("demonstrated_understanding", [])
+    dem_under_json = dem_under if isinstance(dem_under, str) else json.dumps(dem_under or [])
+
+    rem_gaps = data.get("remaining_gaps", [])
+    rem_gaps_json = rem_gaps if isinstance(rem_gaps, str) else json.dumps(rem_gaps or [])
+
+    unres_dis = data.get("unresolved_disagreements", [])
+    unres_dis_json = unres_dis if isinstance(unres_dis, str) else json.dumps(unres_dis or [])
+
+    supp_refs = data.get("supporting_evidence_refs", [])
+    supp_refs_json = supp_refs if isinstance(supp_refs, str) else json.dumps(supp_refs or [])
+
+    rec_next = data.get("recommended_next_action") or ""
+
+    fu_q = data.get("follow_up_question")
+    fu_q_json = fu_q if isinstance(fu_q, str) or fu_q is None else json.dumps(fu_q)
+
+    evidence_version = int(data.get("evidence_version", 1) or 1)
+    evaluation_pending = 1 if data.get("evaluation_pending") else 0
+    updated_at = data.get("updated_at") or now_iso
+    explainable_summary = data.get("explainable_summary") or ""
+
+    with get_materials_db() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO explainable_mastery_decisions
+            (decision_id, user_id, concept_id, outcome, legacy_status,
+             demonstrated_understanding_json, remaining_gaps_json,
+             unresolved_disagreements_json, supporting_evidence_refs_json,
+             recommended_next_action, follow_up_question_json,
+             evidence_version, evaluation_pending, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                decision_id, uid, concept_id, outcome, legacy_status,
+                dem_under_json, rem_gaps_json,
+                unres_dis_json, supp_refs_json,
+                rec_next, fu_q_json,
+                evidence_version, evaluation_pending, updated_at
+            )
+        )
+
+    def _parse(val, default):
+        if val is None:
+            return default
+        if isinstance(val, (list, dict)):
+            return val
+        try:
+            return json.loads(val)
+        except Exception:
+            return default
+
+    return {
+        "decision_id": decision_id,
+        "user_id": uid,
+        "concept_id": concept_id,
+        "outcome": outcome,
+        "legacy_status": legacy_status,
+        "demonstrated_understanding": _parse(dem_under_json, []),
+        "remaining_gaps": _parse(rem_gaps_json, []),
+        "unresolved_disagreements": _parse(unres_dis_json, []),
+        "supporting_evidence_refs": _parse(supp_refs_json, []),
+        "recommended_next_action": rec_next,
+        "follow_up_question": _parse(fu_q_json, None) if fu_q_json else None,
+        "evidence_version": evidence_version,
+        "evaluation_pending": bool(evaluation_pending),
+        "updated_at": updated_at,
+        "explainable_summary": explainable_summary,
+    }
+
+
+def get_latest_mastery_decision(user_id: str, concept_id: str) -> dict | None:
+    """Fetch the latest explainable mastery decision for a given user and concept."""
+    init_materials_db()
+    with get_materials_db() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM explainable_mastery_decisions
+            WHERE user_id = ? AND concept_id = ?
+            ORDER BY updated_at DESC, evidence_version DESC
+            LIMIT 1
+            """,
+            (user_id, concept_id)
+        ).fetchone()
+        if not row:
+            return None
+        res = dict(row)
+        for key in ("demonstrated_understanding", "remaining_gaps", "unresolved_disagreements", "supporting_evidence_refs"):
+            json_key = f"{key}_json"
+            try:
+                res[key] = json.loads(res.get(json_key) or "[]")
+            except Exception:
+                res[key] = []
+        fu_key = "follow_up_question_json"
+        if res.get(fu_key):
+            try:
+                res["follow_up_question"] = json.loads(res[fu_key])
+            except Exception:
+                res["follow_up_question"] = None
+        else:
+            res["follow_up_question"] = None
+        res["evaluation_pending"] = bool(res.get("evaluation_pending", 0))
+        res["explainable_summary"] = res.get("explainable_summary", "")
+        return res
+
+
+def list_latest_mastery_decisions(user_id: str) -> list[dict]:
+    """Retrieve the latest explainable mastery decision for each concept for the user."""
+    init_materials_db()
+    with get_materials_db() as conn:
+        query = """
+            WITH Ranked AS (
+                SELECT *,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY concept_id
+                           ORDER BY updated_at DESC, evidence_version DESC
+                       ) as rn
+                FROM explainable_mastery_decisions
+                WHERE user_id = ?
+            )
+            SELECT * FROM Ranked WHERE rn = 1 ORDER BY updated_at DESC
+        """
+        rows = conn.execute(query, (user_id,)).fetchall()
+        decisions = []
+        for r in rows:
+            res = dict(r)
+            res.pop("rn", None)
+            for key in ("demonstrated_understanding", "remaining_gaps", "unresolved_disagreements", "supporting_evidence_refs"):
+                json_key = f"{key}_json"
+                try:
+                    res[key] = json.loads(res.get(json_key) or "[]")
+                except Exception:
+                    res[key] = []
+            fu_key = "follow_up_question_json"
+            if res.get(fu_key):
+                try:
+                    res["follow_up_question"] = json.loads(res[fu_key])
+                except Exception:
+                    res["follow_up_question"] = None
+            else:
+                res["follow_up_question"] = None
+            res["evaluation_pending"] = bool(res.get("evaluation_pending", 0))
+            res["explainable_summary"] = res.get("explainable_summary", "")
+            decisions.append(res)
+        return decisions
+
+
+def verify_evidence_refs(user_id: str, concept_id: str, claimed_refs: list[str]) -> list[str]:
+    """Deterministically checks learning_evidence_store for user_id and concept_id.
+    Only returns refs that genuinely exist for that user and concept. Fabricated or cross-tenant IDs are strictly omitted.
+    """
+    if not claimed_refs:
+        return []
+    init_materials_db()
+    clean_refs = [r for r in claimed_refs if r and isinstance(r, str)]
+    if not clean_refs:
+        return []
+    unique_refs = list(dict.fromkeys(clean_refs))
+    placeholders = ",".join("?" for _ in unique_refs)
+    with get_materials_db() as conn:
+        query = f"""
+            SELECT evidence_id FROM learning_evidence_store
+            WHERE user_id = ? AND concept_id = ? AND evidence_id IN ({placeholders})
+        """
+        params = [user_id, concept_id] + unique_refs
+        rows = conn.execute(query, tuple(params)).fetchall()
+        valid_set = {r["evidence_id"] for r in rows}
+        return [ref for ref in unique_refs if ref in valid_set]
+
 
 # ── Knowledge Base Per-User Management ──────────────────────────────────────
 

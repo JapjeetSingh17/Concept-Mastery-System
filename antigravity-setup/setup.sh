@@ -98,3 +98,4 @@ echo "  3. In Antigravity:"
 echo "     Open 'antigravity-setup/PROMPTS.md' to copy-paste prompts into"
 echo "     the Antigravity agent chat to automate your learning and dev workflow!"
 echo "=================================================================="
+

@@ -131,3 +131,4 @@ When interacting with Antigravity, use these built-in slash commands:
 - `/browser`: To launch Antigravity's embedded browser directly to `http://127.0.0.1:8000`.
 - `/teamwork`: To launch multiple parallel sub-agents across isolated file boundaries.
 - `/boost`: To enable deep thinking and multi-perspective verification for math/algorithmic tasks.
+

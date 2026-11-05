@@ -28,9 +28,11 @@ _STATE = {
 
 def is_offline() -> bool:
     """Return True if offline test mode is active."""
+    if os.getenv("OPENROUTER_LIVE"):
+        return False
     if os.getenv("OFFLINE_TEST", "").lower() in ("1", "true", "yes"):
         return True
-    if os.getenv("PYTEST_CURRENT_TEST") and not os.getenv("OPENROUTER_LIVE"):
+    if os.getenv("PYTEST_CURRENT_TEST"):
         return True
     return False
 

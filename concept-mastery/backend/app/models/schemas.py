@@ -431,3 +431,79 @@ class DeepAudioRequest(BaseModel):
     section_or_slide_index: int = 0
     user_id: str = "default"
 
+
+# ── 12. Multi-Agent Pedagogical Assessment Schemas ─────────────────────────
+
+class LearningEvidenceRecord(BaseModel):
+    evidence_id: str
+    user_id: str = "default"
+    concept_id: str
+    question_id: str = ""
+    question_text: str = ""
+    question_form: Literal["recall", "explanation", "application", "transfer", "prediction", "quiz", "reassessment"] = "quiz"
+    student_answer: str
+    student_explanation: str = ""
+    problem_solving_approach: str = ""
+    hints_used: int = 0
+    solution_revealed_first: bool = False
+    corrected_after_feedback: bool = False
+    is_unfamiliar_example: bool = False
+    session_id: Optional[str] = None
+    created_at: str = ""
+
+
+class SpecialistAgentAssessment(BaseModel):
+    agent_role: Literal["teaching_agent", "assessment_agent", "misconception_detective", "learning_observer"]
+    concept_id: str
+    evidence_refs: list[str] = Field(default_factory=list)
+    findings: str
+    identified_gaps: list[str] = Field(default_factory=list)
+    recommended_action: str = ""
+    assessment_confidence: str = "moderate"
+    limitations: str = ""
+
+
+class HeadTeacherDecision(BaseModel):
+    concept_id: str
+    outcome: Literal["MASTERED", "NOT_YET_MASTERED", "INSUFFICIENT_EVIDENCE"] = "INSUFFICIENT_EVIDENCE"
+    legacy_status: Literal["STRONG", "WEAK", "UNKNOWN"] = "UNKNOWN"
+    supporting_evidence_refs: list[str] = Field(default_factory=list)
+    demonstrated_understanding: list[str] = Field(default_factory=list)
+    remaining_gaps: list[str] = Field(default_factory=list)
+    unresolved_disagreements: list[str] = Field(default_factory=list)
+    recommended_next_action: str = ""
+    follow_up_question: Optional[dict] = None
+    evidence_version: int = 1
+    explainable_summary: str = ""
+    decision_id: Optional[str] = None
+    user_id: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class EvaluateEvidenceRequest(BaseModel):
+    concept_id: str
+    user_id: str = "default"
+    question_id: Optional[str] = ""
+    question_text: Optional[str] = ""
+    question_form: Optional[str] = "quiz"
+    student_answer: str
+    student_explanation: Optional[str] = ""
+    problem_solving_approach: Optional[str] = ""
+    hints_used: Optional[int] = 0
+    solution_revealed_first: Optional[bool] = False
+    is_unfamiliar_example: Optional[bool] = False
+
+
+class EvaluateEvidenceResponse(BaseModel):
+    decision: HeadTeacherDecision
+    specialist_findings: list[SpecialistAgentAssessment]
+
+
+class ConceptDeliberationResponse(BaseModel):
+    concept_id: str
+    user_id: str
+    decision: Optional[HeadTeacherDecision] = None
+    specialist_findings: list[SpecialistAgentAssessment] = Field(default_factory=list)
+    evidence_records: list[LearningEvidenceRecord] = Field(default_factory=list)
+
+

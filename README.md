@@ -4,7 +4,7 @@ A production-grade, closed-loop educational mastery platform that solves the fun
 1. **Universal Multi-Format Ingestion**: Ingests textbooks (PDF), slide decks (PPTX), markdown notes (MD), word docs (DOCX), YouTube video lectures, educational web articles (e.g. GeeksforGeeks), and student voice lecture notes with rich interactive previews.
 2. **Vectorless RAG**: 100% dense-vector-free retrieval using section-based structural chunking, synonym normalization, and an inverted SQLite/BM25 index with exact dynamic citation anchors (`[Page X]`, `[Slide X]`, `[Timestamp MM:SS]`, `[Web Section]`).
 3. **Prerequisite Concept Graph (DAG)**: Automated concept extraction and dependency mining via NetworkX, cycle breaking by earliest appearance, and topological learning path generation scoped per authenticated learner.
-4. **Explainable Epistemic Knowledge Tracing**: Tri-state mastery modeling (`UNKNOWN`, `WEAK`, `STRONG`) using Bayesian Beta belief distributions and uncertainty spreads, eliminating cold-start collapse and false single-check mastery.
+4. **Multi-Agent Pedagogical Assessment & Head Teacher Arbiter**: Replaces crude numerical scoring and static formulas with an evidence-backed 6-layer assessment team (Teaching Agent, Assessment Agent, Misconception Detective, Learning Observer, and Head Teacher Arbiter) evaluating authentic student explanations, independent application, and longitudinal progress.
 5. **OpenRouter Unified LLM Gateway & NVIDIA Frontier Fallback**: Multi-model auto-failover across primary Google Gemini 2.5 Flash and NVIDIA frontier reasoning models (`nemotron-3-ultra-550b`, `nemotron-3.5-super-vl`, DeepSeek V3, Llama 3.3) with automated `<think>` block sanitization.
 6. **Google OAuth 2.0 Multi-Tenancy**: Complete student account isolation, session JWT issuance, login audit logging, and zero-state empty gating.
 7. **First-Run Baseline Diagnostic**: Calibrated 6-question baseline assessment across root and foundational DAG nodes to map prior knowledge before unlocking individual concept practice.
@@ -212,14 +212,14 @@ uvicorn app.main:app --port 8000 --reload
 
 ---
 
-## Running Tests (215 / 215 Passing — 100%)
+## Running Tests (232 / 232 Passing — 100%)
 
 The platform includes comprehensive test suites validating all core architectural dimensions:
 
 ```bash
 cd concept-mastery/backend
 
-# 1. Run all modular test suites (65 tests)
+# 1. Run all modular test suites (82 tests)
 pytest tests/ -v
 
 # 2. Run OpenRouter gateway test battery (50 tests)
@@ -231,6 +231,7 @@ pytest final_100_test_cases.py -v
 
 | Suite | Tests | Status |
 | :--- | :---: | :---: |
+| `tests/test_multi_agent_mastery.py` | 17 | **PASSED** |
 | `tests/test_baseline_diagnostic.py` | 3 | **PASSED** |
 | `tests/test_numerical_and_active_recall.py` | 14 | **PASSED** |
 | `tests/test_oauth_multi_tenancy.py` | 7 | **PASSED** |
@@ -240,7 +241,7 @@ pytest final_100_test_cases.py -v
 | `tests/test_tools_tts_and_notes.py` | 20 | **PASSED** |
 | `tests/openrouter_testcases.py` | 50 | **PASSED** |
 | `final_100_test_cases.py` | 100 | **PASSED** |
-| **Total** | **215** | **100% Passed** |
+| **Total** | **232** | **100% Passed** |
 
 ---
 

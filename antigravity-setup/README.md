@@ -186,3 +186,4 @@ mkdir -p ../data/uploads ../data/vectorstore generated_artifacts
 # 6. Start the server
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
+

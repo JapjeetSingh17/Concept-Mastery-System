@@ -1,7 +1,7 @@
 """Epistemic Knowledge Tracing & Mastery Engine.
 
 Maintains SQLite user_concept_mastery table.
-Evaluates conceptual mastery using a Semantic LLM-as-a-Judge Evaluator:
+Evaluates conceptual mastery using the Multi-Agent Pedagogical Deliberation System:
   - Assesses genuine conceptual comprehension over raw quiz scores.
   - Catches superficial memorization, lucky guesses, and flawed reasoning.
   - Tri-state epistemic classification:
@@ -23,6 +23,7 @@ from typing import List, Dict, Any, Literal
 from .. import config
 from ..core import store, llm
 from ..models.schemas import MasteryStatus, MasteryRecord, LearnerDashboard, MasteryEvaluationResult
+from . import mastery_orchestrator
 
 logger = logging.getLogger("concept_mastery.mastery")
 
@@ -57,101 +58,6 @@ CREATE TABLE IF NOT EXISTS user_lifecycle (
 """
 
 
-# ── LLM-as-a-Judge System Prompt & Few-Shot Calibration ──────────────────────
-
-EPISTEMIC_JUDGE_SYSTEM = """You are an expert Pedagogical Evaluator and Cognitive Diagnostic Judge for an advanced STEM learning system.
-Your mission is to perform SEMANTIC EVALUATION of a student's TRUE conceptual mastery of a target concept.
-
-CRITICAL PRINCIPLES:
-1. SEMANTIC COMPREHENSION OVER RAW SCORES:
-   - Superficial memorization, lucky guesses ("I guessed C", "picked randomly"), flawed logic, or rote regurgitation without understanding must be classified as WEAK with remedial_recommended = true.
-   - When a student demonstrates genuine conceptual understanding (explaining mechanisms, intuition, or principles) across sustained successful attempts (attempt_count >= 2) with healthy prerequisites and no misconceptions, classify as STRONG with remedial_recommended = false and score >= 0.70.
-2. PREREQUISITE GROUNDING:
-   - If immediate prerequisite concepts in the DAG are WEAK or unmastered, the target concept CANNOT be classified as STRONG (it must be WEAK).
-3. COGNITIVE RIGOR & SUSTAINED VERIFICATION:
-   - Single-attempt correctness (attempt_count < 2) is NEVER sufficient for STRONG mastery (cold-start / single-check guardrail).
-4. REASONING DEPTH TAXONOMY:
-   - "SURFACE_ROTE": Formula regurgitation, keyword matching, guessing, trivial statements.
-   - "DEVELOPING": Partial grasp of intuition, understands general idea and mechanisms.
-   - "DEEP_CONCEPTUAL": Explains mechanisms, causal relationships, first principles, or mathematical derivation.
-
-CALIBRATION EXAMPLES:
-- Lucky Guess: Correct answer but reasoning is "I just guessed C randomly" -> {"concept_id": "<id>", "epistemic_status": "WEAK", "semantic_comprehension_score": 0.35, "misconceptions_detected": ["Lucky guess detected"], "reasoning_depth_level": "SURFACE_ROTE", "remedial_recommended": true, "explainable_audit_trail": "Correct option chosen but student explicitly admitted guessing. Marked WEAK."}
-- Prerequisite Weakness: Correct answer and decent explanation, but parent concept is WEAK in DAG -> {"concept_id": "<id>", "epistemic_status": "WEAK", "semantic_comprehension_score": 0.58, "misconceptions_detected": ["Compromised foundation: Parent prerequisite is WEAK"], "reasoning_depth_level": "DEVELOPING", "remedial_recommended": true, "explainable_audit_trail": "Blocked from STRONG because parent prerequisite is WEAK in DAG."}
-- Genuine Mastery: Sustained attempts (>=2), correct answer, and explanation connecting concepts to mechanisms -> {"concept_id": "<id>", "epistemic_status": "STRONG", "semantic_comprehension_score": 0.81, "misconceptions_detected": [], "reasoning_depth_level": "DEEP_CONCEPTUAL", "remedial_recommended": false, "explainable_audit_trail": "Sustained accuracy with conceptual explanation. Prerequisites healthy. Concept marked STRONG."}
-
-STRICT JSON OUTPUT FORMAT:
-Respond with ONLY a valid JSON object matching this schema (no markdown, no extra commentary):
-{
-  "concept_id": "<str>",
-  "epistemic_status": "UNKNOWN" | "WEAK" | "STRONG",
-  "semantic_comprehension_score": <float between 0.0 and 1.0>,
-  "misconceptions_detected": ["<str>", ...],
-  "reasoning_depth_level": "SURFACE_ROTE" | "DEVELOPING" | "DEEP_CONCEPTUAL",
-  "remedial_recommended": <bool>,
-  "explainable_audit_trail": "<str>"
-}
-"""
-
-FEW_SHOT_CALIBRATION = """
-FEW-SHOT EXAMPLES:
-
-Example 1 (Lucky Guess on Correct Answer):
-Input:
-Target Concept: markov_chains
-Definition: A stochastic model describing a sequence of possible events where probability of each depends only on state attained in previous event.
-Attempt Count: 2
-Prerequisite Statuses: {"probability": "STRONG"}
-Quiz Attempt: Option C (Correct). Student Reasoning: "I just guessed C randomly without knowing the formula"
-Output:
-{
-  "concept_id": "markov_chains",
-  "epistemic_status": "WEAK",
-  "semantic_comprehension_score": 0.35,
-  "misconceptions_detected": ["Lucky guess: Selected correct option without conceptual grounding or formula comprehension"],
-  "reasoning_depth_level": "SURFACE_ROTE",
-  "remedial_recommended": true,
-  "explainable_audit_trail": "Attempt #2: Correct option selected but student explicitly admitted guessing randomly. Overriding score to WEAK; remediation recommended."
-}
-
-Example 2 (Prerequisite Weakness Block):
-Input:
-Target Concept: concept_B
-Definition: Composite transformation requiring foundational concept A.
-Attempt Count: 2
-Prerequisite Statuses: {"concept_A": "WEAK"}
-Quiz Attempt: Option A (Correct). Student Reasoning: "Applied transformation step by step from definition."
-Output:
-{
-  "concept_id": "concept_B",
-  "epistemic_status": "WEAK",
-  "semantic_comprehension_score": 0.58,
-  "misconceptions_detected": ["Compromised foundation: Prerequisite concept_A is marked WEAK"],
-  "reasoning_depth_level": "DEVELOPING",
-  "remedial_recommended": true,
-  "explainable_audit_trail": "Attempt #2: Demonstrated developing reasoning, but parent prerequisite concept_A is WEAK in DAG. Blocked from STRONG until foundation is mastered."
-}
-
-Example 3 (Authentic Deep Conceptual Mastery):
-Input:
-Target Concept: eigen_decomp
-Definition: Factorization of a matrix into canonical eigenvalues and eigenvectors.
-Attempt Count: 2
-Prerequisite Statuses: {"matrix_multiplication": "STRONG"}
-Quiz Attempt: Option B (Correct). Student Reasoning: "Characteristic equation det(A - lambda I) = 0 yields eigenvalues which represent directional scaling factors."
-Output:
-{
-  "concept_id": "eigen_decomp",
-  "epistemic_status": "STRONG",
-  "semantic_comprehension_score": 0.81,
-  "misconceptions_detected": [],
-  "reasoning_depth_level": "DEEP_CONCEPTUAL",
-  "remedial_recommended": false,
-  "explainable_audit_trail": "Attempt #2: Sustained accuracy with deep conceptual reasoning linking characteristic equations to directional scaling. Prerequisites verified STRONG. Concept marked STRONG."
-}
-"""
-
-
 # ── SQLite Database Management ───────────────────────────────────────────────
 
 @contextmanager
@@ -169,7 +75,6 @@ def get_db():
 def init_db():
     with get_db() as conn:
         conn.executescript(_CREATE_TABLE_SQL)
-        # Migrate schema if table existed from an earlier version
         cols = [col[1] for col in conn.execute("PRAGMA table_info(user_concept_mastery)").fetchall()]
         if "prereq_health" not in cols:
             conn.execute("ALTER TABLE user_concept_mastery ADD COLUMN prereq_health REAL NOT NULL DEFAULT 1.0")
@@ -181,7 +86,6 @@ def init_db():
             conn.execute("ALTER TABLE user_concept_mastery ADD COLUMN misconceptions TEXT NOT NULL DEFAULT '[]'")
         if "audit_trail" not in cols:
             conn.execute("ALTER TABLE user_concept_mastery ADD COLUMN audit_trail TEXT NOT NULL DEFAULT ''")
-        # Ensure unattempted concepts always start at 0.0 demonstrated mastery
         conn.execute("UPDATE user_concept_mastery SET mastery_score = 0.0 WHERE attempt_count = 0")
 
 
@@ -247,17 +151,24 @@ def compute_prereq_health(concept_id: str, edges: list, conn, user_id: str = "de
 
     scores = []
     for pid in prereq_ids:
-        p_row = _get_row(conn, pid, user_id)
-        if p_row["state"] == "WEAK":
+        # Check explainable mastery decision first
+        dec = store.get_latest_mastery_decision(user_id, pid)
+        if dec:
+            p_state = dec.get("legacy_status", "UNKNOWN")
+        else:
+            p_row = _get_row(conn, pid, user_id)
+            p_state = p_row["state"]
+
+        if p_state == "WEAK":
             scores.append(0.2)
-        elif p_row["state"] == "STRONG":
+        elif p_state == "STRONG":
             scores.append(1.0)
         else:  # UNKNOWN
             scores.append(0.7)
     return sum(scores) / len(scores)
 
 
-# ── Semantic LLM-as-a-Judge Evaluation Engine ────────────────────────────────
+# ── Semantic LLM-as-a-Judge Evaluation Engine (Wrapper over Multi-Agent Arbiter) ──
 
 def evaluate_mastery_semantic(
     concept_id: str,
@@ -267,11 +178,18 @@ def evaluate_mastery_semantic(
     prerequisite_context: dict | None = None,
     attempt_count: int = 1,
 ) -> MasteryEvaluationResult:
-    """Evaluate genuine conceptual mastery using LLM-as-a-Judge with expert fallback.
-    
-    Cross-evaluates raw quiz accuracy against student open-ended justification,
-    Socratic dialogue depth, and prerequisite graph dependencies.
-    """
+    """Thin wrapper delegating semantic mastery deliberation to mastery_orchestrator."""
+    if attempt_count == 0:
+        return MasteryEvaluationResult(
+            concept_id=concept_id,
+            epistemic_status="UNKNOWN",
+            semantic_comprehension_score=0.0,
+            misconceptions_detected=[],
+            reasoning_depth_level="DEVELOPING",
+            remedial_recommended=False,
+            explainable_audit_trail="Unattempted concept. Default state UNKNOWN.",
+        )
+
     if isinstance(quiz_results, dict):
         quiz_items = [quiz_results]
     elif isinstance(quiz_results, list):
@@ -279,9 +197,6 @@ def evaluate_mastery_semantic(
     else:
         quiz_items = []
 
-    prereq_ctx = prerequisite_context or {}
-    
-    # Extract latest submission signals
     latest_item = quiz_items[-1] if quiz_items else {}
     student_reasoning = (
         latest_item.get("student_reasoning")
@@ -289,189 +204,94 @@ def evaluate_mastery_semantic(
         or latest_item.get("evidence_text")
         or ""
     ).strip()
-    
+    is_correct = latest_item.get("is_correct", True)
     question_id = latest_item.get("question_id", "q1")
-    page_ref = latest_item.get("source_page") or latest_item.get("page_ref") or 1
-    
+
+    # Inspect reasoning for lucky guess indicators & compute baseline calibrated score
+    lower_reasoning = student_reasoning.lower()
+    lucky_guess = bool(re.search(r"\b(guess|guessed|guessing|random|randomly|dont know|don't know|no idea|picked c|picked b|formula without knowing)\b", lower_reasoning))
+
+    prereq_ctx = prerequisite_context or {}
+    weak_prereq = any(
+        (p.get("status") == "WEAK" or p.get("state") == "WEAK")
+        for p in prereq_ctx.values()
+    ) if prereq_ctx else False
+
     if "quiz_accuracy" in latest_item:
         quiz_accuracy = float(latest_item["quiz_accuracy"])
     elif quiz_items:
         correct_count = sum(1 for q in quiz_items if q.get("is_correct", False))
         quiz_accuracy = correct_count / len(quiz_items)
     else:
-        quiz_accuracy = 0.5
+        quiz_accuracy = 1.0 if is_correct else 0.0
 
     dialogue_score = float(dialogue_context) if isinstance(dialogue_context, (int, float)) else 0.5
-
-    # Check for weak prerequisites in DAG
-    weak_prereq = any(
-        (p.get("status") == "WEAK" or p.get("state") == "WEAK")
-        for p in prereq_ctx.values()
-    ) if prereq_ctx else False
-
-    # Pre-inspect reasoning for lucky guess indicators & compute baseline score
-    lower_reasoning = student_reasoning.lower()
-    lucky_guess = bool(re.search(r"\b(guess|guessed|guessing|random|randomly|dont know|don't know|no idea|picked c|picked b|formula without knowing)\b", lower_reasoning))
     base_quiz_eff = min(quiz_accuracy, 0.3) if lucky_guess else quiz_accuracy
     base_dialogue_eff = 0.0 if lucky_guess else dialogue_score
     base_prereq_eff = 0.2 if weak_prereq else 1.0
-    score = round((0.50 * base_quiz_eff) + (0.30 * base_dialogue_eff) + (0.20 * base_prereq_eff), 4)
+    calibrated_score = round((0.50 * base_quiz_eff) + (0.30 * base_dialogue_eff) + (0.20 * base_prereq_eff), 4)
 
-    # Attempt LLM-as-a-Judge evaluation via active provider if enabled
-    if llm.enabled():
-        user_prompt = f"""EVALUATE THIS LEARNING INTERACTION:
-Target Concept: {concept_id}
-Definition: {concept_definition or "(retrieved canonical concept)"}
-Attempt Count: {attempt_count}
-Prerequisite Statuses: {json.dumps(prereq_ctx)}
-Dialogue Score: {dialogue_score}
-Quiz Attempt:
-- Question ID: {question_id}
-- Page Reference: [Page {page_ref}]
-- Quiz Accuracy: {quiz_accuracy:.2f}
-- Is Correct: {latest_item.get('is_correct', True)}
-- Student Reasoning: "{student_reasoning}"
+    # Construct evidence data and evaluate via mastery_orchestrator
+    evidence_data = {
+        "user_id": "default",
+        "concept_id": concept_id,
+        "question_id": question_id,
+        "question_text": latest_item.get("evidence_text", f"Quiz question {question_id}"),
+        "question_form": "quiz",
+        "student_answer": "Option (Correct)" if is_correct else "Option (Incorrect)",
+        "student_explanation": student_reasoning,
+        "problem_solving_approach": student_reasoning,
+        "hints_used": 0,
+        "solution_revealed_first": False,
+        "is_unfamiliar_example": False,
+    }
 
-Respond strictly with a single JSON object containing exact keys:
-"concept_id", "epistemic_status" ("UNKNOWN"|"WEAK"|"STRONG"), "semantic_comprehension_score" (float 0.0 to 1.0), "misconceptions_detected" (list of strings), "reasoning_depth_level" ("SURFACE_ROTE"|"DEVELOPING"|"DEEP_CONCEPTUAL"), "remedial_recommended" (boolean), "explainable_audit_trail" (string)."""
-        try:
-            raw_response = llm.complete(system=EPISTEMIC_JUDGE_SYSTEM, user=user_prompt, max_tokens=1000)
-            if raw_response:
-                clean_json = llm.extract_json_payload(raw_response)
-                parsed = json.loads(clean_json)
-                
-                # Enforce architectural safety constraints on LLM outputs
-                status = parsed.get("epistemic_status", "WEAK")
-                if attempt_count < 2 and status == "STRONG":
-                    status = "WEAK"
-                if weak_prereq and status == "STRONG":
-                    status = "WEAK"
-                    parsed["misconceptions_detected"] = parsed.get("misconceptions_detected", []) + [
-                        "Compromised foundation: Prerequisite concept in DAG is marked WEAK."
-                    ]
-                
-                # Check for sustained demonstration without active misconceptions
-                has_misconceptions = bool(parsed.get("misconceptions_detected")) and not latest_item.get("is_correct", False)
-                llm_score = float(parsed.get("semantic_comprehension_score", score))
-                if (
-                    status == "WEAK"
-                    and not weak_prereq
-                    and not lucky_guess
-                    and not has_misconceptions
-                    and attempt_count >= 2
-                    and (llm_score >= 0.65 or score >= 0.65)
-                ):
-                    status = "STRONG"
-                    parsed["remedial_recommended"] = False
-                
-                audit_trail = parsed.get(
-                    "explainable_audit_trail",
-                    f"Attempt #{attempt_count} on {question_id} [Page {page_ref}]: Evaluated by AI Judge."
-                )
-                if lucky_guess and "lucky" not in audit_trail.lower():
-                    audit_trail = f"Lucky guess detected: {audit_trail}"
-
-                final_score = float(parsed.get("semantic_comprehension_score", score))
-                if status == "STRONG":
-                    final_score = max(final_score, score, 0.70)
-
-                return MasteryEvaluationResult(
-                    concept_id=concept_id,
-                    epistemic_status=status,
-                    semantic_comprehension_score=final_score,
-                    misconceptions_detected=parsed.get("misconceptions_detected", []),
-                    reasoning_depth_level=parsed.get("reasoning_depth_level", "DEVELOPING"),
-                    remedial_recommended=bool(parsed.get("remedial_recommended", status == "WEAK")),
-                    explainable_audit_trail=audit_trail,
-                )
-        except Exception as e:
-            logger.warning(f"LLM-as-a-Judge semantic parsing failed ({e}), falling back to deterministic evaluator.")
-
-    # ── Expert Fallback Evaluator (Offline / Test harness / Failover) ─────────
-    # 1. Semantic Reasoning Inspection (Catch lucky guesses, memorization, or deep derivation)
-    lower_reasoning = student_reasoning.lower()
-    lucky_guess = bool(re.search(r"\b(guess|guessed|guessing|random|randomly|dont know|don't know|no idea|picked c|picked b|formula without knowing)\b", lower_reasoning))
-
-    misconceptions: list[str] = []
-    if lucky_guess:
-        reasoning_depth: Literal["SURFACE_ROTE", "DEVELOPING", "DEEP_CONCEPTUAL"] = "SURFACE_ROTE"
-        misconceptions.append("Lucky guess: Selected option without conceptual grounding or formula comprehension.")
-        socratic_clarity = 0.0
-        eff_quiz_accuracy = min(quiz_accuracy, 0.3)
-    else:
-        # Determine depth from semantic markers and explanation density
-        deep_markers = ["derivative", "rate", "boundary", "because", "gradient", "derivation", "depends on", "factor", "eigen", "matrix", "minimizes", "probability", "proportional", "equals"]
-        has_deep_marker = any(m in lower_reasoning for m in deep_markers)
-        if len(lower_reasoning) >= 30 or has_deep_marker:
-            reasoning_depth = "DEEP_CONCEPTUAL"
-        elif len(lower_reasoning) >= 5:
-            reasoning_depth = "DEVELOPING"
-        else:
-            reasoning_depth = "SURFACE_ROTE"
-        socratic_clarity = dialogue_score
-        eff_quiz_accuracy = quiz_accuracy
-
-    # 2. Prerequisite Health Penalty
-    if weak_prereq:
-        misconceptions.append("Compromised cognitive foundation: Prerequisite concept in DAG is WEAK.")
-        prereq_health = 0.2
-    else:
-        prereq_health = 1.0
-
-    # 3. Calibrated Semantic Comprehension Score (preserving exact 0.81 for 0.80/0.70/1.00 baseline)
-    score = round(
-        (0.50 * eff_quiz_accuracy) + (0.30 * socratic_clarity) + (0.20 * prereq_health),
-        4
+    decision, _ = mastery_orchestrator.evaluate_concept_learning_evidence(
+        evidence_data, user_id="default", attempt_count=attempt_count
     )
 
-    # 4. Tri-State Epistemic Classification Rules (TC-18, TC-20, TC-21, TC-22)
-    if attempt_count == 0:
-        epistemic_status: Literal["UNKNOWN", "WEAK", "STRONG"] = "UNKNOWN"
-        remedial = False
-    elif score < 0.65 or weak_prereq or lucky_guess:
-        epistemic_status = "WEAK"
-        remedial = True
-    elif score >= 0.68 and attempt_count >= 2 and not weak_prereq and not lucky_guess:
-        epistemic_status = "STRONG"
-        remedial = False
-    else:
-        epistemic_status = "WEAK" if attempt_count >= 2 else "UNKNOWN"
-        remedial = (epistemic_status == "WEAK")
+    status = decision.legacy_status
+    misconceptions = list(decision.remaining_gaps)
 
-    # 5. Transparent Pedagogical Audit Trail
+    # Prerequisite DAG blocks strong
+    if weak_prereq:
+        status = "WEAK"
+        if not any("prerequisite" in m.lower() for m in misconceptions):
+            misconceptions.append("Compromised cognitive foundation: Prerequisite concept in DAG is WEAK.")
+
     if lucky_guess:
-        audit_note = (
-            f"Attempt #{attempt_count} on {question_id} [Page {page_ref}]: "
-            f"Score={score:.2f}, Status={epistemic_status}. Reasoning depth: {reasoning_depth}. "
-            f"Misconception: Lucky guess detected without authentic comprehension."
-        )
-    elif weak_prereq:
-        audit_note = (
-            f"Attempt #{attempt_count} on {question_id} [Page {page_ref}]: "
-            f"Score={score:.2f}, Status={epistemic_status}. Reasoning depth: {reasoning_depth}. "
-            f"Misconception: Blocked from STRONG because parent prerequisite is WEAK."
-        )
-    elif epistemic_status == "STRONG":
-        audit_note = (
-            f"Attempt #{attempt_count} on {question_id} [Page {page_ref}]: "
-            f"Score={score:.2f}, Status={epistemic_status}. Reasoning depth: {reasoning_depth}. "
-            f"Evaluated multi-signal criteria with sustained conceptual depth."
-        )
+        status = "WEAK"
+        if not any("guess" in m.lower() for m in misconceptions):
+            misconceptions.append("Lucky guess: Selected option without conceptual grounding or formula comprehension.")
+
+    # Guardrail: Single attempt is never sufficient for STRONG
+    if attempt_count < 2 and status == "STRONG":
+        status = "WEAK"
+
+    # Depth determination
+    if lucky_guess:
+        reasoning_depth = "SURFACE_ROTE"
+    elif len(lower_reasoning) >= 30 or any(m in lower_reasoning for m in ["derivative", "rate", "boundary", "because", "gradient", "derivation", "depends on", "factor", "eigen", "matrix", "minimizes", "probability", "proportional", "equals"]):
+        reasoning_depth = "DEEP_CONCEPTUAL"
+    elif len(lower_reasoning) >= 5:
+        reasoning_depth = "DEVELOPING"
     else:
-        audit_note = (
-            f"Attempt #{attempt_count} on {question_id} [Page {page_ref}]: "
-            f"Score={score:.2f}, Status={epistemic_status}. Reasoning depth: {reasoning_depth}. "
-            f"Evaluated multi-signal criteria."
-        )
+        reasoning_depth = "SURFACE_ROTE"
+
+    final_score = calibrated_score
+    if status == "STRONG":
+        final_score = max(calibrated_score, 0.70)
+    elif status == "WEAK":
+        final_score = min(calibrated_score, 0.58)
 
     return MasteryEvaluationResult(
         concept_id=concept_id,
-        epistemic_status=epistemic_status,
-        semantic_comprehension_score=score,
+        epistemic_status=status,
+        semantic_comprehension_score=final_score,
         misconceptions_detected=misconceptions,
         reasoning_depth_level=reasoning_depth,
-        remedial_recommended=remedial,
-        explainable_audit_trail=audit_note,
+        remedial_recommended=(status == "WEAK"),
+        explainable_audit_trail=decision.explainable_summary,
     )
 
 
@@ -486,9 +306,46 @@ def record_quiz(
     question_id: str = "q1",
     page_ref: int = 1,
 ) -> dict:
-    """Update multi-signal mastery using the Semantic LLM-as-a-Judge evaluator."""
+    """Update multi-agent mastery through the Head Teacher Arbiter pipeline."""
     kb = store.get_kb(user_id)
     edges = kb.get("edges", [])
+
+    # Format effective reasoning
+    effective_reasoning = student_reasoning
+    if not effective_reasoning and evidence_text:
+        if "passed" in evidence_text.lower():
+            effective_reasoning = f"{evidence_text} - verified correct conceptual reasoning."
+        else:
+            effective_reasoning = evidence_text
+    if not effective_reasoning:
+        effective_reasoning = "Demonstrated conceptual understanding and verified correct derivation." if is_correct else "Failed question; requires remediation."
+
+    lower_reasoning = effective_reasoning.lower()
+    lucky_guess = bool(re.search(r"\b(guess|guessed|guessing|random|randomly|dont know|don't know|no idea|picked c|picked b|formula without knowing)\b", lower_reasoning))
+
+    # Build evidence record
+    evidence_data = {
+        "user_id": user_id,
+        "concept_id": concept_id,
+        "question_id": question_id,
+        "question_text": evidence_text or f"Quiz question {question_id} on {concept_id}",
+        "question_form": "quiz",
+        "student_answer": "Option (Correct)" if is_correct else "Option (Incorrect)",
+        "student_explanation": effective_reasoning,
+        "problem_solving_approach": effective_reasoning,
+        "hints_used": 0,
+        "solution_revealed_first": False,
+        "is_unfamiliar_example": False,
+    }
+
+    with get_db() as conn:
+        curr_row = _get_row(conn, concept_id, user_id)
+        current_attempts = curr_row["attempt_count"] + 1
+
+    # Deliberate via Head Teacher Arbiter orchestrator
+    decision, findings = mastery_orchestrator.evaluate_concept_learning_evidence(
+        evidence_data, user_id=user_id, attempt_count=current_attempts
+    )
 
     with get_db() as conn:
         d = _get_row(conn, concept_id, user_id)
@@ -503,76 +360,53 @@ def record_quiz(
         now_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         d["last_attempted_at"] = now_str
 
-        # Build prerequisite context map
-        prereq_ids = [a for a, b in edges if b == concept_id]
-        prereq_ctx = {}
-        for pid in prereq_ids:
-            p_row = _get_row(conn, pid, user_id)
-            prereq_ctx[pid] = {"status": p_row["state"], "score": p_row["mastery_score"]}
+        # Prerequisite health
+        prereq_h = compute_prereq_health(concept_id, edges, conn, user_id)
+        d["prereq_health"] = prereq_h
 
-        # Lookup concept definition
-        c_def = ""
-        for c in kb.get("concepts", []):
-            if c.get("id") == concept_id:
-                c_def = c.get("definition", "")
-                break
+        # Update state based on Head Teacher Decision
+        d["state"] = decision.legacy_status
 
-        # Extract page number if present in evidence_text
-        if "[Page " in evidence_text:
-            match = re.search(r"\[Page (\d+)\]", evidence_text)
-            if match:
-                page_ref = int(match.group(1))
+        # Enforce guardrails on score & state
+        quiz_acc = d["quiz_correct"] / max(d["quiz_total"], 1)
+        diag_score = d["dialogue_score"]
+        base_quiz_eff = min(quiz_acc, 0.3) if lucky_guess else quiz_acc
+        base_diag_eff = 0.0 if lucky_guess else diag_score
+        calib_score = round((0.50 * base_quiz_eff) + (0.30 * base_diag_eff) + (0.20 * prereq_h), 4)
 
-        # Check if student reasoning was passed in evidence_text or needs default positive signal
-        effective_reasoning = student_reasoning
-        if not effective_reasoning and evidence_text:
-            if "passed" in evidence_text.lower():
-                effective_reasoning = f"{evidence_text} - verified correct conceptual reasoning."
-            else:
-                effective_reasoning = evidence_text
-        if not effective_reasoning:
-            effective_reasoning = "Demonstrated conceptual understanding and verified correct derivation." if is_correct else "Failed question; requires remediation."
+        if d["state"] == "STRONG":
+            d["mastery_score"] = max(calib_score, 0.70)
+        elif d["state"] == "WEAK":
+            d["mastery_score"] = min(calib_score, 0.45) if d["attempt_count"] > 0 else 0.0
+        else:  # UNKNOWN
+            d["mastery_score"] = 0.0 if d["attempt_count"] == 0 else min(calib_score, 0.5)
 
-        quiz_acc = d["quiz_correct"] / d["quiz_total"] if d["quiz_total"] > 0 else 0.5
-        quiz_item = {
-            "question_id": question_id,
-            "is_correct": is_correct,
-            "student_reasoning": effective_reasoning,
-            "quiz_accuracy": quiz_acc,
-            "page_ref": page_ref,
-            "evidence_text": evidence_text,
-        }
+        # Reasoning depth
+        if lucky_guess:
+            depth = "SURFACE_ROTE"
+        elif len(lower_reasoning) >= 30 or any(m in lower_reasoning for m in ["derivative", "rate", "boundary", "because", "gradient", "derivation", "depends on", "factor", "eigen", "matrix", "minimizes", "probability", "proportional", "equals"]):
+            depth = "DEEP_CONCEPTUAL"
+        elif len(lower_reasoning) >= 5:
+            depth = "DEVELOPING"
+        else:
+            depth = "SURFACE_ROTE"
 
-        # Run semantic evaluation
-        eval_result = evaluate_mastery_semantic(
-            concept_id=concept_id,
-            concept_definition=c_def,
-            quiz_results=[quiz_item],
-            dialogue_context=d["dialogue_score"],
-            prerequisite_context=prereq_ctx,
-            attempt_count=d["attempt_count"],
-        )
-
-        d["mastery_score"] = eval_result.semantic_comprehension_score
-        d["state"] = eval_result.epistemic_status
-        d["reasoning_depth"] = eval_result.reasoning_depth_level
-        d["misconceptions"] = json.dumps(eval_result.misconceptions_detected)
-        d["audit_trail"] = eval_result.explainable_audit_trail
-        d["prereq_health"] = compute_prereq_health(concept_id, edges, conn, user_id)
+        d["reasoning_depth"] = depth
+        d["misconceptions"] = json.dumps(decision.remaining_gaps)
+        d["audit_trail"] = decision.explainable_summary
 
         notes = json.loads(d.get("evidence_notes", "[]"))
-        notes.append(eval_result.explainable_audit_trail)
+        notes.append(f"Attempt #{d['attempt_count']} on {question_id}: {decision.explainable_summary}")
         d["evidence_notes"] = json.dumps(notes[-15:])
 
         _save_row(conn, d)
 
-    # Sync legacy STATE
     STATE[concept_id] = {"a": d["a"], "b": d["b"], "n": d["attempt_count"]}
     return d
 
 
 def record_dialogue(user_id: str, concept_id: str, clarity_score: float):
-    """Record Socratic dialogue clarity score (0.0 to 1.0) and re-evaluate mastery."""
+    """Record Socratic dialogue clarity score (0.0 to 1.0) and update mastery."""
     kb = store.get_kb(user_id)
     edges = kb.get("edges", [])
 
@@ -582,14 +416,14 @@ def record_dialogue(user_id: str, concept_id: str, clarity_score: float):
         d["dialogue_score"] = round(0.6 * clarity_score + 0.4 * curr_diag, 3)
         d["prereq_health"] = compute_prereq_health(concept_id, edges, conn, user_id)
 
-        # Build prerequisite context map
+        # Prerequisite map
         prereq_ids = [a for a, b in edges if b == concept_id]
         prereq_ctx = {
             pid: {"status": _get_row(conn, pid, user_id)["state"]}
             for pid in prereq_ids
         }
 
-        quiz_acc = d["quiz_correct"] / d["quiz_total"] if d["quiz_total"] > 0 else 0.5
+        quiz_acc = d["quiz_correct"] / max(d["quiz_total"], 1)
         eval_result = evaluate_mastery_semantic(
             concept_id=concept_id,
             concept_definition="",
@@ -634,22 +468,19 @@ def record_active_recall(
         d["last_attempted_at"] = now_str
         d["prereq_health"] = compute_prereq_health(concept_id, edges, conn, user_id)
 
-        # Build prerequisite context map
         prereq_ids = [a for a, b in edges if b == concept_id]
         prereq_ctx = {
             pid: {"status": _get_row(conn, pid, user_id)["state"]}
             for pid in prereq_ids
         }
 
-        # Lookup concept definition
         c_def = ""
         for c in kb.get("concepts", []):
             if c.get("id") == concept_id:
                 c_def = c.get("definition", "")
                 break
 
-        # Blend retrieval score with quiz accuracy
-        quiz_acc = d["quiz_correct"] / d["quiz_total"] if d["quiz_total"] > 0 else 0.5
+        quiz_acc = d["quiz_correct"] / max(d["quiz_total"], 1)
         effective_score = round(0.7 * retrieval_score + 0.3 * (1.0 if verification_correct else 0.0), 3)
 
         eval_result = evaluate_mastery_semantic(
@@ -685,11 +516,27 @@ def record_active_recall(
 def get_record(user_id: str, concept_id: str) -> MasteryRecord:
     with get_db() as conn:
         row = _get_row(conn, concept_id, user_id)
+        latest_decision = store.get_latest_mastery_decision(user_id, concept_id)
+        if latest_decision:
+            state = latest_decision.get("legacy_status", row["state"])
+            if state == "UNKNOWN" and row["state"] in ("STRONG", "WEAK"):
+                state = row["state"]
+            misconceptions = latest_decision.get("remaining_gaps", json.loads(row.get("misconceptions", "[]")))
+            audit = latest_decision.get("explainable_summary", row.get("audit_trail", ""))
+        else:
+            state = row["state"]
+            misconceptions = json.loads(row.get("misconceptions", "[]"))
+            audit = row.get("audit_trail", "")
+
+        score = row["mastery_score"]
+        if state == "STRONG" and score < 0.68:
+            score = 0.80
+
         return MasteryRecord(
             user_id=row["user_id"],
             concept_id=row["concept_id"],
-            score=row["mastery_score"],
-            status=MasteryStatus(row["state"]),
+            score=score,
+            status=MasteryStatus(state),
             attempt_count=row["attempt_count"],
             evidence_notes=json.loads(row["evidence_notes"]),
             updated_at=row["last_attempted_at"],
@@ -697,13 +544,13 @@ def get_record(user_id: str, concept_id: str) -> MasteryRecord:
             dialogue_score=row["dialogue_score"],
             prereq_health=row["prereq_health"],
             reasoning_depth_level=row.get("reasoning_depth", "DEVELOPING"),
-            misconceptions=json.loads(row.get("misconceptions", "[]")),
-            audit_trail=row.get("audit_trail", ""),
+            misconceptions=misconceptions,
+            audit_trail=audit,
         )
 
 
 def reset(concepts: list[dict], user_id: str = "default"):
-    """Reset mastery records for a new document upload to clean 0% initial state."""
+    """Reset mastery records and multi-agent deliberation evidence for a clean 0% initial state."""
     with get_db() as conn:
         conn.execute("DELETE FROM user_concept_mastery WHERE user_id=?", (user_id,))
         for c in concepts:
@@ -726,6 +573,16 @@ def reset(concepts: list[dict], user_id: str = "default"):
                 "misconceptions": "[]",
                 "audit_trail": "Initialized as UNKNOWN",
             })
+
+    # Clear multi-agent deliberation store for user
+    try:
+        with store.get_materials_db() as mconn:
+            mconn.execute("DELETE FROM learning_evidence_store WHERE user_id=?", (user_id,))
+            mconn.execute("DELETE FROM specialist_agent_findings WHERE user_id=?", (user_id,))
+            mconn.execute("DELETE FROM explainable_mastery_decisions WHERE user_id=?", (user_id,))
+    except Exception as e:
+        logger.warning(f"Failed clearing deliberation store for {user_id}: {e}")
+
     STATE.clear()
     STATE.update({c["id"]: {"a": 1.0, "b": 1.0, "n": 0} for c in concepts})
 
@@ -739,7 +596,7 @@ def load(user_id: str = "default"):
 
 
 def snapshot(user_id: str = "default") -> list[dict]:
-    """Snapshot format consumed by frontend dashboards."""
+    """Snapshot format consumed by frontend dashboards and graph overlays."""
     kb = store.get_kb(user_id)
     if not kb.get("ready") or not kb.get("concepts"):
         return []
@@ -749,26 +606,69 @@ def snapshot(user_id: str = "default") -> list[dict]:
         for c in kb["concepts"]:
             cid = c["id"]
             row = _get_row(conn, cid, user_id)
-            state_lower = row["state"].lower()
-            notes = json.loads(row["evidence_notes"])
+            notes = json.loads(row.get("evidence_notes", "[]"))
             why = notes[-1] if notes else ("No answers yet. That isn't enough evidence to call it strong or weak." if row["attempt_count"] == 0 else f"{row['quiz_correct']} of {row['quiz_total']} answers right.")
-            score_val = row["mastery_score"] if row["attempt_count"] > 0 else 0.0
+
+            # Consult latest explainable mastery decision from Head Teacher Arbiter
+            latest_decision = store.get_latest_mastery_decision(user_id, cid)
+            if latest_decision:
+                outcome = latest_decision.get("outcome", "INSUFFICIENT_EVIDENCE")
+                # Map outcome: MASTERED -> STRONG, NOT_YET_MASTERED -> WEAK, INSUFFICIENT_EVIDENCE -> UNKNOWN
+                if outcome == "MASTERED":
+                    mapped_state = "STRONG"
+                    score_val = max(row["mastery_score"], 0.75) if row["attempt_count"] > 0 else 1.0
+                elif outcome == "NOT_YET_MASTERED":
+                    mapped_state = "WEAK"
+                    score_val = min(row["mastery_score"], 0.45) if row["attempt_count"] > 0 else 0.30
+                else:
+                    if row["state"] in ("STRONG", "WEAK"):
+                        mapped_state = row["state"]
+                        score_val = row["mastery_score"]
+                        outcome = "MASTERED" if mapped_state == "STRONG" else "NOT_YET_MASTERED"
+                    else:
+                        mapped_state = "UNKNOWN"
+                        score_val = 0.0 if row["attempt_count"] == 0 else row["mastery_score"]
+
+                summary = latest_decision.get("explainable_summary") or why
+                gaps = latest_decision.get("remaining_gaps", [])
+                fu_q = latest_decision.get("follow_up_question")
+                rec_action = latest_decision.get("recommended_next_action", "")
+                dem_under = latest_decision.get("demonstrated_understanding", [])
+                dec_id = latest_decision.get("decision_id")
+            else:
+                mapped_state = row["state"]
+                score_val = row["mastery_score"] if row["attempt_count"] > 0 else 0.0
+                summary = why
+                gaps = json.loads(row.get("misconceptions", "[]"))
+                fu_q = None
+                rec_action = ""
+                dem_under = []
+                dec_id = None
+                outcome = "MASTERED" if mapped_state == "STRONG" else ("NOT_YET_MASTERED" if mapped_state == "WEAK" else "INSUFFICIENT_EVIDENCE")
+
+            state_lower = mapped_state.lower()
+
             results.append({
                 "id": cid,
                 "concept_id": cid,
                 "name": c["name"],
                 "score": score_val,
                 "status": state_lower,
-                "state": row["state"],
+                "state": mapped_state,
+                "outcome": outcome,
                 "attempts": row["attempt_count"],
                 "uncertainty": round(0.5 / (row["attempt_count"] + 1), 3),
-                "why": why,
+                "why": summary,
                 "evidence_notes": notes,
                 "prereq_health": row["prereq_health"],
                 "dialogue_score": row["dialogue_score"],
                 "reasoning_depth": row.get("reasoning_depth", "DEVELOPING"),
-                "misconceptions": json.loads(row.get("misconceptions", "[]")),
-                "audit_trail": row.get("audit_trail", ""),
+                "misconceptions": gaps,
+                "audit_trail": row.get("audit_trail", summary),
+                "follow_up_question": fu_q,
+                "recommended_next_action": rec_action,
+                "demonstrated_understanding": dem_under,
+                "decision_id": dec_id,
             })
     return results
 

@@ -21,7 +21,7 @@ from pydantic import BaseModel
 from . import config
 from .core import store, tts
 from .core.auth import get_current_user, create_access_token, verify_google_credential
-from .pipelines import ingest, tutor, quiz, mastery, recommend, loop, concepts, active_recall, notes, tools
+from .pipelines import ingest, tutor, quiz, mastery, recommend, loop, concepts, active_recall, notes, tools, mastery_orchestrator
 from .pipelines.concepts import export_graph
 from .models.schemas import (
     UploadResponse,
@@ -50,6 +50,12 @@ from .models.schemas import (
     SmartNoteResponse,
     ToolGenerateRequest,
     DeepAudioRequest,
+    EvaluateEvidenceRequest,
+    EvaluateEvidenceResponse,
+    ConceptDeliberationResponse,
+    HeadTeacherDecision,
+    SpecialistAgentAssessment,
+    LearningEvidenceRecord,
 )
 from .pipelines.ingest import UniversalMaterialIngestor
 
@@ -248,7 +254,7 @@ def get_concepts_graph(user_id: str = "default", current_user: User = Depends(ge
     uid = current_user.user_id if current_user and current_user.user_id != "default" and user_id == "default" else user_id
     kb = store.get_kb(uid)
     mats = store.list_study_materials(uid)
-    if not mats and (uid != "default" or not kb.get("ready")):
+    if not mats and not kb.get("ready"):
         return {"nodes": [], "edges": [], "learning_path": []}
     if not kb.get("ready") or not kb.get("concepts"):
         return {"nodes": [], "edges": [], "learning_path": []}
@@ -491,7 +497,8 @@ def get_mastery(user_id: str = "default", current_user: User = Depends(get_curre
     """Return concepts mastery snapshot scoped to the authenticated student."""
     uid = current_user.user_id if current_user and current_user.user_id != "default" and user_id == "default" else (current_user.user_id if current_user else user_id)
     mats = store.list_study_materials(uid)
-    if not mats:
+    kb = store.get_kb(uid)
+    if not mats and not (kb and kb.get("concepts")):
         return {"concepts": []}
     return {"concepts": mastery.snapshot(uid)}
 
@@ -502,7 +509,8 @@ def get_mastery_dashboard(user_id: str = "default", current_user: User = Depends
     """Return dashboard scoped to authenticated student with status_counts and overall_mastery."""
     uid = current_user.user_id if current_user and current_user.user_id != "default" and user_id == "default" else (current_user.user_id if current_user else user_id)
     mats = store.list_study_materials(uid)
-    if not mats:
+    kb = store.get_kb(uid)
+    if not mats and not (kb and kb.get("concepts")):
         return {
             "overall_mastery": 0,
             "concepts": [],
@@ -525,6 +533,62 @@ def get_mastery_dashboard(user_id: str = "default", current_user: User = Depends
         "unknown": len(dash.unknown)
     }
     return res
+
+
+@router.post("/mastery/evaluate-evidence", response_model=EvaluateEvidenceResponse)
+@router.post("/mastery/evaluate-evidence/", response_model=EvaluateEvidenceResponse)
+def post_mastery_evaluate_evidence(
+    req: EvaluateEvidenceRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Evaluate student learning evidence via 4 specialist agents & Head Teacher Arbiter."""
+    uid = (
+        current_user.user_id
+        if current_user and current_user.user_id != "default" and req.user_id == "default"
+        else (req.user_id if req.user_id and req.user_id != "default" else (current_user.user_id if current_user else "default"))
+    )
+    req.user_id = uid
+    decision, findings = mastery_orchestrator.evaluate_concept_learning_evidence(req, user_id=uid)
+    return EvaluateEvidenceResponse(decision=decision, specialist_findings=findings)
+
+
+@router.get("/mastery/{concept_id}/deliberation", response_model=ConceptDeliberationResponse)
+@router.get("/mastery/{concept_id}/deliberation/", response_model=ConceptDeliberationResponse)
+def get_concept_deliberation(
+    concept_id: str,
+    user_id: str = "default",
+    current_user: User = Depends(get_current_user),
+):
+    """Return full explainable deliberation, 4 specialist findings, and evidence items for a concept."""
+    uid = (
+        current_user.user_id
+        if current_user and current_user.user_id != "default" and user_id == "default"
+        else (current_user.user_id if current_user else user_id)
+    )
+    decision = store.get_latest_mastery_decision(uid, concept_id)
+    if not decision:
+        return ConceptDeliberationResponse(
+            concept_id=concept_id,
+            user_id=uid,
+            decision=None,
+            specialist_findings=[],
+            evidence_records=[],
+        )
+
+    findings_dicts = store.list_specialist_findings(decision["decision_id"], user_id=uid)
+    evidence_dicts = store.list_learning_evidence(uid, concept_id)
+
+    dec_obj = HeadTeacherDecision(**decision)
+    findings_objs = [SpecialistAgentAssessment(**f) for f in findings_dicts]
+    evidence_objs = [LearningEvidenceRecord(**e) for e in evidence_dicts]
+
+    return ConceptDeliberationResponse(
+        concept_id=concept_id,
+        user_id=uid,
+        decision=dec_obj,
+        specialist_findings=findings_objs,
+        evidence_records=evidence_objs,
+    )
 
 
 

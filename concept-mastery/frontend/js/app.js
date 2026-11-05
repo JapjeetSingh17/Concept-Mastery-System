@@ -50,6 +50,336 @@
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
 
+  // ── Multi-Agent Pedagogical Assessment ApiService Methods ──────────────────
+  if (typeof ApiService !== "undefined") {
+    ApiService.evaluateEvidence = async function(evidenceData) {
+      const base = typeof getEffectiveBase === "function" ? getEffectiveBase() : "";
+      const authToken = typeof ApiService.getToken === "function" ? ApiService.getToken() : null;
+      const headers = { "Content-Type": "application/json" };
+      if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
+      const res = await fetch(`${base}/api/mastery/evaluate-evidence`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(evidenceData)
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `evaluateEvidence failed with status ${res.status}`);
+      }
+      return await res.json();
+    };
+
+    ApiService.getConceptDeliberation = async function(conceptId, userId) {
+      const base = typeof getEffectiveBase === "function" ? getEffectiveBase() : "";
+      const authToken = typeof ApiService.getToken === "function" ? ApiService.getToken() : null;
+      const headers = {};
+      if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
+      const uid = userId || getCurrentUserId();
+      const url = `${base}/api/mastery/${encodeURIComponent(conceptId)}/deliberation?user_id=${encodeURIComponent(uid)}`;
+      const res = await fetch(url, { headers });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `getConceptDeliberation failed with status ${res.status}`);
+      }
+      return await res.json();
+    };
+
+    if (typeof window !== "undefined" && window.ApiService) {
+      window.ApiService.evaluateEvidence = ApiService.evaluateEvidence;
+      window.ApiService.getConceptDeliberation = ApiService.getConceptDeliberation;
+    }
+  }
+
+  // ── Multi-Agent Qualitative Outcome Badges ─────────────────────────────────
+  function getQualitativeOutcome(c) {
+    if (c && c.outcome) {
+      if (c.outcome === "MASTERED") return "MASTERED";
+      if (c.outcome === "NOT_YET_MASTERED") return "NOT_YET_MASTERED";
+      if (c.outcome === "INSUFFICIENT_EVIDENCE") return "INSUFFICIENT_EVIDENCE";
+    }
+    const st = typeof getConceptStatus === "function" ? getConceptStatus(c) : (c.status || c.state || "").toLowerCase();
+    if (st === "strong") return "MASTERED";
+    if (st === "weak") return "NOT_YET_MASTERED";
+    return "INSUFFICIENT_EVIDENCE";
+  }
+
+  function renderOutcomeBadge(c) {
+    const outcome = getQualitativeOutcome(c);
+    if (outcome === "MASTERED") {
+      return `<span class="outcome-badge outcome-mastered" style="background:#10b981; color:#ffffff; font-weight:700; font-size:0.75rem; padding:0.25rem 0.65rem; border-radius:9999px; letter-spacing:0.04em; display:inline-flex; align-items:center; gap:0.25rem;">MASTERED</span>`;
+    }
+    if (outcome === "NOT_YET_MASTERED") {
+      return `<span class="outcome-badge outcome-not-yet" style="background:#f43f5e; color:#ffffff; font-weight:700; font-size:0.75rem; padding:0.25rem 0.65rem; border-radius:9999px; letter-spacing:0.04em; display:inline-flex; align-items:center; gap:0.25rem;">NOT YET MASTERED</span>`;
+    }
+    return `<span class="outcome-badge outcome-insufficient" style="background:#64748b; color:#ffffff; font-weight:700; font-size:0.75rem; padding:0.25rem 0.65rem; border-radius:9999px; letter-spacing:0.04em; display:inline-flex; align-items:center; gap:0.25rem;">NEEDS EVIDENCE</span>`;
+  }
+
+  // ── Multi-Agent Teacher Deliberation Modal Controller ───────────────────────
+  async function openTeacherDeliberationModal(conceptId, conceptName) {
+    const modal = $("#modal-teacher-deliberation");
+    const title = $("#deliberation-modal-title");
+    const subtitle = $("#deliberation-modal-subtitle");
+    const body = $("#modal-teacher-deliberation-body");
+    if (!modal || !body) return;
+
+    if (title) title.textContent = conceptName || conceptId;
+    if (subtitle) subtitle.textContent = "Multi-Agent Pedagogical Deliberation · 4 Specialist Teachers + Head Teacher Arbiter";
+
+    body.innerHTML = `
+      <div style="text-align:center; padding:3rem 1rem;">
+        <span class="upload-icon-pulse" style="width:28px; height:28px; border:3px solid var(--primary); border-top-color:transparent; border-radius:50%; display:inline-block; animation:spin 1s linear infinite;"></span>
+        <p style="margin-top:1rem; color:var(--ink-secondary); font-size:0.92rem;">
+          Consulting 4 Specialist Teachers and deliberating Head Teacher Arbiter decision for <strong>${esc(conceptName || conceptId)}</strong>...
+        </p>
+      </div>
+    `;
+
+    if (typeof modal.showModal === "function") modal.showModal();
+    else modal.setAttribute("open", "");
+
+    try {
+      const uid = getCurrentUserId();
+      const res = await ApiService.getConceptDeliberation(conceptId, uid);
+      const decision = res.decision;
+      const findings = res.specialist_findings || [];
+      const evidence = res.evidence_records || [];
+
+      const teacherFinding = findings.find(f => f.agent_role === "teaching_agent");
+      const assessmentFinding = findings.find(f => f.agent_role === "assessment_agent");
+      const misconceptionFinding = findings.find(f => f.agent_role === "misconception_detective");
+      const observerFinding = findings.find(f => f.agent_role === "learning_observer");
+
+      const outcome = decision ? decision.outcome : "INSUFFICIENT_EVIDENCE";
+      const outcomeBadge = renderOutcomeBadge({ outcome });
+
+      body.innerHTML = `
+        <!-- Top Summary Banner -->
+        <div style="background:var(--surface-subtle, #f8fafc); border:1px solid var(--border-subtle, #e2e8f0); border-radius:12px; padding:1.25rem; margin-bottom:1.5rem;">
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.75rem; margin-bottom:0.75rem;">
+            <div>
+              <span style="font-size:0.75rem; text-transform:uppercase; letter-spacing:0.05em; color:var(--ink-muted); font-weight:700;">Head Teacher Arbiter Verdict</span>
+              <h2 style="margin:0.25rem 0 0 0; font-size:1.35rem; font-weight:800; color:var(--ink-primary);">${esc(conceptName || conceptId)}</h2>
+            </div>
+            <div>
+              ${outcomeBadge}
+            </div>
+          </div>
+
+          <p style="font-size:0.95rem; line-height:1.55; color:var(--ink-primary); margin:0 0 1rem 0; font-weight:500;">
+            ${esc(decision && decision.explainable_summary ? decision.explainable_summary : "No prior deliberation recorded. Complete learning interactions or submit evidence to initiate multi-agent assessment.")}
+          </p>
+
+          <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap:1rem;">
+            <!-- Demonstrated Understanding -->
+            <div style="background:#fff; border:1px solid var(--border-subtle, #e2e8f0); border-radius:8px; padding:0.85rem 1rem;">
+              <div style="font-size:0.78rem; font-weight:700; color:#10b981; text-transform:uppercase; margin-bottom:0.4rem; display:flex; align-items:center; gap:0.35rem;">
+                <span>✓</span> Demonstrated Understanding
+              </div>
+              ${decision && decision.demonstrated_understanding && decision.demonstrated_understanding.length > 0 ? `
+                <ul style="margin:0; padding-left:1.2rem; font-size:0.85rem; color:var(--ink-primary); line-height:1.45;">
+                  ${decision.demonstrated_understanding.map(u => `<li>${esc(u)}</li>`).join("")}
+                </ul>
+              ` : `
+                <span style="font-size:0.82rem; color:var(--ink-muted);">None demonstrated yet.</span>
+              `}
+            </div>
+
+            <!-- Remaining Gaps -->
+            <div style="background:#fff; border:1px solid var(--border-subtle, #e2e8f0); border-radius:8px; padding:0.85rem 1rem;">
+              <div style="font-size:0.78rem; font-weight:700; color:#f43f5e; text-transform:uppercase; margin-bottom:0.4rem; display:flex; align-items:center; gap:0.35rem;">
+                <span>⚠</span> Remaining Gaps &amp; Misconceptions
+              </div>
+              ${decision && decision.remaining_gaps && decision.remaining_gaps.length > 0 ? `
+                <ul style="margin:0; padding-left:1.2rem; font-size:0.85rem; color:var(--ink-primary); line-height:1.45;">
+                  ${decision.remaining_gaps.map(g => `<li>${esc(g)}</li>`).join("")}
+                </ul>
+              ` : `
+                <span style="font-size:0.82rem; color:var(--ink-muted);">No remaining gaps identified.</span>
+              `}
+            </div>
+          </div>
+
+          ${decision && decision.recommended_next_action ? `
+            <div style="margin-top:1rem; padding:0.75rem 1rem; background:#eff6ff; border:1px solid #bfdbfe; border-radius:8px; display:flex; align-items:center; gap:0.6rem; font-size:0.88rem; color:#1e40af;">
+              <span style="font-weight:700;">🎯 Recommended Next Action:</span>
+              <span>${esc(decision.recommended_next_action)}</span>
+            </div>
+          ` : ''}
+
+          ${decision && decision.follow_up_question ? `
+            <div style="margin-top:0.75rem; padding:0.75rem 1rem; background:#fffbeb; border:1px solid #fef3c7; border-radius:8px; font-size:0.88rem; color:#92400e;">
+              <div style="font-weight:700; margin-bottom:0.25rem;">Follow-up Cognitive Probe:</div>
+              <div>${esc(decision.follow_up_question.question_text || '')}</div>
+            </div>
+          ` : ''}
+        </div>
+
+        <!-- 4 Specialist Teacher Cards -->
+        <div style="margin-bottom:1.5rem;">
+          <h4 style="font-size:1rem; font-weight:700; margin-bottom:0.75rem; color:var(--ink-primary); display:flex; align-items:center; gap:0.4rem;">
+            <span>👥</span> 4 Specialist Pedagogical Teachers
+          </h4>
+          <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap:1rem;">
+            
+            <!-- 1. Teaching Agent -->
+            <div class="card" style="margin:0; padding:1.15rem; border-top:3px solid #3b82f6;">
+              <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:0.5rem;">
+                <div>
+                  <h4 style="margin:0; font-size:0.95rem; font-weight:700;">👩‍🏫 Teaching Agent</h4>
+                  <span style="font-size:0.76rem; color:var(--ink-muted);">Conceptual comprehension &amp; in-own-words synthesis</span>
+                </div>
+                <span style="font-size:0.72rem; padding:0.15rem 0.45rem; border-radius:4px; background:#eff6ff; color:#2563eb; font-weight:600;">
+                  ${teacherFinding ? esc(teacherFinding.assessment_confidence) : 'pending'}
+                </span>
+              </div>
+              <p style="font-size:0.84rem; line-height:1.45; color:var(--ink-primary); margin:0 0 0.5rem 0;">
+                ${teacherFinding ? esc(teacherFinding.findings) : "Awaiting student interactions on this concept."}
+              </p>
+              ${teacherFinding && teacherFinding.recommended_action ? `
+                <div style="font-size:0.78rem; color:var(--ink-secondary);">
+                  <strong>Action:</strong> ${esc(teacherFinding.recommended_action)}
+                </div>
+              ` : ''}
+            </div>
+
+            <!-- 2. Assessment Agent -->
+            <div class="card" style="margin:0; padding:1.15rem; border-top:3px solid #8b5cf6;">
+              <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:0.5rem;">
+                <div>
+                  <h4 style="margin:0; font-size:0.95rem; font-weight:700;">🎯 Assessment Agent</h4>
+                  <span style="font-size:0.76rem; color:var(--ink-muted);">Independent testing &amp; cognitive forms</span>
+                </div>
+                <span style="font-size:0.72rem; padding:0.15rem 0.45rem; border-radius:4px; background:#f5f3ff; color:#7c3aed; font-weight:600;">
+                  ${assessmentFinding ? esc(assessmentFinding.assessment_confidence) : 'pending'}
+                </span>
+              </div>
+              <p style="font-size:0.84rem; line-height:1.45; color:var(--ink-primary); margin:0 0 0.5rem 0;">
+                ${assessmentFinding ? esc(assessmentFinding.findings) : "Awaiting student assessment probes."}
+              </p>
+              ${assessmentFinding && assessmentFinding.recommended_action ? `
+                <div style="font-size:0.78rem; color:var(--ink-secondary);">
+                  <strong>Action:</strong> ${esc(assessmentFinding.recommended_action)}
+                </div>
+              ` : ''}
+            </div>
+
+            <!-- 3. Misconception Detective -->
+            <div class="card" style="margin:0; padding:1.15rem; border-top:3px solid #f43f5e;">
+              <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:0.5rem;">
+                <div>
+                  <h4 style="margin:0; font-size:0.95rem; font-weight:700;">🕵️ Misconception Detective</h4>
+                  <span style="font-size:0.76rem; color:var(--ink-muted);">Flawed mental models &amp; contradictions</span>
+                </div>
+                <span style="font-size:0.72rem; padding:0.15rem 0.45rem; border-radius:4px; background:#fff1f2; color:#e11d48; font-weight:600;">
+                  ${misconceptionFinding ? esc(misconceptionFinding.assessment_confidence) : 'pending'}
+                </span>
+              </div>
+              <p style="font-size:0.84rem; line-height:1.45; color:var(--ink-primary); margin:0 0 0.5rem 0;">
+                ${misconceptionFinding ? esc(misconceptionFinding.findings) : "No active misconceptions detected."}
+              </p>
+              ${misconceptionFinding && misconceptionFinding.recommended_action ? `
+                <div style="font-size:0.78rem; color:var(--ink-secondary);">
+                  <strong>Action:</strong> ${esc(misconceptionFinding.recommended_action)}
+                </div>
+              ` : ''}
+            </div>
+
+            <!-- 4. Learning Observer -->
+            <div class="card" style="margin:0; padding:1.15rem; border-top:3px solid #10b981;">
+              <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:0.5rem;">
+                <div>
+                  <h4 style="margin:0; font-size:0.95rem; font-weight:700;">📈 Learning Observer</h4>
+                  <span style="font-size:0.76rem; color:var(--ink-muted);">Longitudinal progress &amp; persistence</span>
+                </div>
+                <span style="font-size:0.72rem; padding:0.15rem 0.45rem; border-radius:4px; background:#ecfdf5; color:#059669; font-weight:600;">
+                  ${observerFinding ? esc(observerFinding.assessment_confidence) : 'pending'}
+                </span>
+              </div>
+              <p style="font-size:0.84rem; line-height:1.45; color:var(--ink-primary); margin:0 0 0.5rem 0;">
+                ${observerFinding ? esc(observerFinding.findings) : "Tracking longitudinal learning trajectory."}
+              </p>
+              ${observerFinding && observerFinding.recommended_action ? `
+                <div style="font-size:0.78rem; color:var(--ink-secondary);">
+                  <strong>Action:</strong> ${esc(observerFinding.recommended_action)}
+                </div>
+              ` : ''}
+            </div>
+
+          </div>
+        </div>
+
+        <!-- Supporting Evidence Records Section -->
+        <div>
+          <h4 style="font-size:1rem; font-weight:700; margin-bottom:0.75rem; color:var(--ink-primary); display:flex; align-items:center; gap:0.4rem;">
+            <span>📝</span> Cited Student Evidence Records (${evidence.length})
+          </h4>
+          ${evidence.length === 0 ? `
+            <div style="padding:1.5rem; text-align:center; background:var(--surface-subtle, #f8fafc); border-radius:8px; border:1px dashed var(--border-subtle, #e2e8f0); color:var(--ink-muted); font-size:0.88rem;">
+              No student evidence records recorded for this concept yet. Start a quiz or answer questions to generate evidence.
+            </div>
+          ` : `
+            <div style="display:flex; flex-direction:column; gap:0.75rem;">
+              ${evidence.map(ev => `
+                <div style="background:#fff; border:1px solid var(--border-subtle, #e2e8f0); border-radius:8px; padding:0.9rem 1.1rem;">
+                  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.4rem; flex-wrap:wrap; gap:0.5rem;">
+                    <div style="display:flex; align-items:center; gap:0.5rem;">
+                      <span style="font-family:monospace; font-size:0.78rem; background:#f1f5f9; padding:0.15rem 0.45rem; border-radius:4px; color:#475569;">
+                        ${esc(ev.evidence_id || '')}
+                      </span>
+                      <span style="font-size:0.78rem; text-transform:uppercase; font-weight:700; color:#2563eb;">
+                        ${esc(ev.question_form || 'quiz')}
+                      </span>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:0.4rem;">
+                      ${ev.hints_used > 0 ? `
+                        <span style="font-size:0.74rem; background:#fef3c7; color:#b45309; padding:0.15rem 0.45rem; border-radius:4px; font-weight:600;">
+                          ${ev.hints_used} hint(s) used
+                        </span>
+                      ` : `
+                        <span style="font-size:0.74rem; background:#f0fdf4; color:#15803d; padding:0.15rem 0.45rem; border-radius:4px; font-weight:600;">
+                          0 hints (unassisted)
+                        </span>
+                      `}
+                      ${ev.solution_revealed_first ? `
+                        <span style="font-size:0.74rem; background:#fee2e2; color:#b91c1c; padding:0.15rem 0.45rem; border-radius:4px; font-weight:600;">
+                          Solution revealed first
+                        </span>
+                      ` : ''}
+                    </div>
+                  </div>
+
+                  ${ev.question_text ? `
+                    <div style="font-size:0.85rem; color:var(--ink-secondary); margin-bottom:0.35rem;">
+                      <strong>Q:</strong> ${esc(ev.question_text)}
+                    </div>
+                  ` : ''}
+
+                  <div style="font-size:0.88rem; color:var(--ink-primary); margin-bottom:0.25rem;">
+                    <strong>Student Answer:</strong> "${esc(ev.student_answer || '')}"
+                  </div>
+
+                  ${ev.student_explanation ? `
+                    <div style="font-size:0.82rem; color:var(--ink-secondary); font-style:italic;">
+                      <strong>Explanation:</strong> "${esc(ev.student_explanation)}"
+                    </div>
+                  ` : ''}
+                </div>
+              `).join("")}
+            </div>
+          `}
+        </div>
+      `;
+    } catch (err) {
+      body.innerHTML = `
+        <div style="padding:2rem; text-align:center; color:#ef4444;">
+          <p style="font-weight:700;">Failed to load teacher deliberation</p>
+          <p style="font-size:0.85rem;">${esc(err.message || String(err))}</p>
+          <button class="btn btn-secondary btn-sm" onclick="document.getElementById('modal-teacher-deliberation').close()">Close</button>
+        </div>
+      `;
+    }
+  }
+
   // HTML Entity Escaping
   function esc(str) {
     if (str === null || str === undefined) return "";
@@ -607,6 +937,15 @@
         if (e.target === diagModal) diagModal.close();
       });
     }
+
+    const delibClose = $("#modal-teacher-deliberation-close");
+    const delibModal = $("#modal-teacher-deliberation");
+    if (delibClose && delibModal) {
+      delibClose.onclick = () => delibModal.close();
+      delibModal.addEventListener("click", e => {
+        if (e.target === delibModal) delibModal.close();
+      });
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -774,7 +1113,7 @@
                   <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
                 </div>
                 <h4>Scoring Baseline Knowledge Profile...</h4>
-                <p style="color: var(--ink-secondary); font-size: 0.88rem;">Updating epistemic Beta belief distributions and unlocking prerequisite DAG...</p>
+                <p style="color: var(--ink-secondary); font-size: 0.88rem;">Conducting Multi-Agent Pedagogical Deliberation and unlocking prerequisite DAG...</p>
               </div>
             `;
             try {
@@ -1496,19 +1835,18 @@
 
           <div class="concept-preview-list">
             ${masteryData.slice(0, 5).map(c => {
-              const st = getConceptStatus(c);
-              const scorePercent = Math.round((c.score || 0.5) * 100);
+              const badge = renderOutcomeBadge(c);
               return `
-                <div class="concept-preview-item">
+                <div class="concept-preview-item" style="display:flex; justify-content:space-between; align-items:center; padding:0.85rem 0; border-bottom:1px solid var(--border-subtle);">
                   <div class="concept-preview-left">
-                    <span class="concept-preview-name">${esc(c.name)}</span>
-                    <span class="concept-preview-stats">${c.attempts || 0} attempts · ${scorePercent}% belief score</span>
+                    <span class="concept-preview-name" style="font-weight:600; font-size:0.95rem;">${esc(c.name)}</span>
+                    <span class="concept-preview-stats" style="font-size:0.8rem; color:var(--ink-secondary); display:block; margin-top:0.2rem;">${c.attempts || 0} interaction(s) · Multi-Agent Pedagogical Assessment</span>
                   </div>
-                  <div style="display:flex; align-items:center; gap:0.85rem;">
-                    <div style="width:100px;" class="progress-bar-track">
-                      <div class="progress-bar-fill ${st}" style="width:${scorePercent}%;"></div>
-                    </div>
-                    <span class="status-pill ${st}">${st}</span>
+                  <div style="display:flex; align-items:center; gap:0.65rem;">
+                    ${badge}
+                    <button class="btn btn-outline btn-sm btn-inspect-deliberation" data-concept-id="${esc(c.id)}" data-concept-name="${esc(c.name)}" title="Inspect Multi-Agent Deliberation">
+                      Inspect Deliberation
+                    </button>
                     <a href="#practice" data-target-concept="${esc(c.id)}" class="btn btn-secondary btn-sm start-target-quiz">Quiz</a>
                   </div>
                 </div>
@@ -2394,7 +2732,7 @@
                 <span style="font-weight:700; font-size:0.85rem;">Study Tip</span>
               </div>
               <p style="font-size:0.82rem; margin:0;" id="quiz-sidebar-tip">
-                Answer independently. The backend Epistemic Mastery engine tracks uncertainty using Beta beliefs.
+                Answer independently. The Multi-Agent Pedagogical Assessment system evaluates genuine conceptual reasoning and cognitive depth.
               </p>
             </div>
           </div>
@@ -2569,7 +2907,7 @@
           <div class="page-header">
             <div class="page-header-text">
               <h1>Progress &amp; Mastery Analytics</h1>
-              <p>Epistemic belief tracking using Beta(a,b) distributions across all verified concepts.</p>
+              <p>Multi-Agent Pedagogical Assessment (4 Specialist Teachers + Head Teacher Arbiter).</p>
             </div>
             <div class="page-header-actions">
               <button class="btn btn-secondary btn-disabled-gated" disabled title="Upload study material first">Take Practice Quiz</button>
@@ -2602,7 +2940,7 @@
         <div class="page-header">
           <div class="page-header-text">
             <h1>Progress &amp; Mastery Analytics</h1>
-            <p>Epistemic belief tracking using Beta(a,b) distributions across all verified concepts.</p>
+            <p>Multi-Agent Pedagogical Assessment (4 Specialist Teachers + Head Teacher Arbiter).</p>
           </div>
           <div class="page-header-actions">
             ${isBaselineDone ? `
@@ -2618,38 +2956,38 @@
           <div class="card" style="text-align:center;">
             <span style="font-size:0.75rem; text-transform:uppercase; color:var(--ink-muted); font-weight:700;">Overall Mastery</span>
             <h2 style="font-size:2rem; margin:0.35rem 0; color:var(--primary);">${avg}%</h2>
-            <span style="font-size:0.75rem; color:var(--ink-secondary);">Average belief mean</span>
+            <span style="font-size:0.75rem; color:var(--ink-secondary);">Multi-Agent evaluation</span>
           </div>
 
           <div class="card" style="text-align:center;">
-            <span style="font-size:0.75rem; text-transform:uppercase; color:var(--color-strong); font-weight:700;">Strong Concepts</span>
+            <span style="font-size:0.75rem; text-transform:uppercase; color:var(--color-strong); font-weight:700;">Mastered Concepts</span>
             <h2 style="font-size:2rem; margin:0.35rem 0; color:var(--color-strong);">${strongCount}</h2>
-            <span style="font-size:0.75rem; color:var(--ink-secondary);">&ge; 70% estimated mastery</span>
+            <span style="font-size:0.75rem; color:var(--ink-secondary);">Verified authentic comprehension</span>
           </div>
 
           <div class="card" style="text-align:center;">
-            <span style="font-size:0.75rem; text-transform:uppercase; color:var(--color-weak); font-weight:700;">Weak Concepts</span>
+            <span style="font-size:0.75rem; text-transform:uppercase; color:var(--color-weak); font-weight:700;">Not Yet Mastered</span>
             <h2 style="font-size:2rem; margin:0.35rem 0; color:var(--color-weak);">${weakCount}</h2>
-            <span style="font-size:0.75rem; color:var(--ink-secondary);">&ge; 2 answers &amp; &lt; 70%</span>
+            <span style="font-size:0.75rem; color:var(--ink-secondary);">Identified misconceptions or gaps</span>
           </div>
 
           <div class="card" style="text-align:center;">
-            <span style="font-size:0.75rem; text-transform:uppercase; color:var(--color-unknown); font-weight:700;">Unknown Concepts</span>
+            <span style="font-size:0.75rem; text-transform:uppercase; color:var(--color-unknown); font-weight:700;">Needs Evidence</span>
             <h2 style="font-size:2rem; margin:0.35rem 0; color:var(--color-unknown);">${unknownCount}</h2>
-            <span style="font-size:0.75rem; color:var(--ink-secondary);">&lt; 2 answers recorded</span>
+            <span style="font-size:0.75rem; color:var(--ink-secondary);">Awaiting diagnostic evidence</span>
           </div>
         </div>
 
-        <!-- Epistemic Explanation Banner -->
+        <!-- Multi-Agent Assessment Explanation Banner -->
         <div class="card" style="margin-bottom:1.75rem; background:var(--surface-subtle); border-color:var(--border-subtle);">
           <div style="display:flex; align-items:flex-start; gap:0.85rem;">
             <div style="width:32px; height:32px; border-radius:50%; background:var(--primary-light); color:var(--primary); display:flex; align-items:center; justify-content:center; flex-shrink:0;">
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
             </div>
             <div>
-              <h4 style="font-size:0.95rem; margin-bottom:0.25rem;">How the Epistemic Engine Works</h4>
+              <h4 style="font-size:0.95rem; margin-bottom:0.25rem;">Multi-Agent Pedagogical Assessment System</h4>
               <p style="font-size:0.85rem; margin:0; line-height:1.5;">
-                Unlike crude score-percentages, each concept maintains a Bayesian $\\text{Beta}(\\alpha, \\beta)$ belief state. <strong>Unknown</strong> means fewer than 2 answers exist—we do not penalize unseen concepts as weak. As you answer questions, the uncertainty spread shrinks and estimates stabilize.
+                Rather than using crude numerical scores or formulas, your mastery is deliberated by four specialist pedagogical teachers (Teaching Agent, Assessment Agent, Misconception Detective, and Learning Observer) and arbitrated by the Head Teacher. Decisions evaluate genuine understanding, cognitive transfer, and mental models.
               </p>
             </div>
           </div>
@@ -2661,38 +2999,29 @@
             <thead>
               <tr>
                 <th>Concept</th>
-                <th>Status</th>
-                <th>Mastery Score</th>
-                <th>Total Attempts</th>
-                <th>Uncertainty Spread</th>
+                <th>Pedagogical Outcome</th>
+                <th>Assessment Status</th>
+                <th>Evidence Records</th>
                 <th>Diagnostic Explanation</th>
-                <th>Action</th>
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody>
               ${masteryData.length === 0 ? `
-                <tr><td colspan="7" style="text-align:center; padding:2rem; color:var(--ink-muted);">No concepts assessed yet. Upload material and take a quiz.</td></tr>
+                <tr><td colspan="6" style="text-align:center; padding:2rem; color:var(--ink-muted);">No concepts assessed yet. Upload material and take a quiz.</td></tr>
               ` : masteryData.map(c => {
                 const st = getConceptStatus(c);
-                const scorePercent = (c.attempts && c.attempts > 0) ? Math.round((c.score || 0) * 100) : 0;
-                const uncertainty = c.uncertainty !== undefined ? `&plusmn;${Math.round(c.uncertainty * 100)}%` : "&plusmn;25%";
+                const badge = renderOutcomeBadge(c);
                 return `
                   <tr>
                     <td><strong>${esc(c.name)}</strong></td>
-                    <td><span class="status-pill ${st}">${st}</span></td>
+                    <td>${badge}</td>
+                    <td><span class="status-pill ${st}">${st.toUpperCase()}</span></td>
+                    <td>${c.attempts || 0} interaction(s)</td>
+                    <td style="max-width:320px; font-size:0.82rem; color:var(--ink-secondary);">${esc(c.why || c.explainable_summary || "Multi-Agent assessment active")}</td>
                     <td>
-                      <div style="display:flex; align-items:center; gap:0.65rem;">
-                        <div style="width:70px;" class="progress-bar-track">
-                          <div class="progress-bar-fill ${st}" style="width:${scorePercent}%;"></div>
-                        </div>
-                        <span style="font-weight:700; font-size:0.85rem;">${scorePercent}%</span>
-                      </div>
-                    </td>
-                    <td>${c.attempts || 0}</td>
-                    <td><span style="color:var(--ink-muted); font-size:0.85rem;">${uncertainty}</span></td>
-                    <td style="max-width:340px; font-size:0.82rem; color:var(--ink-secondary);">${esc(c.why || "Tracking belief")}</td>
-                    <td>
-                      <div style="display:flex; gap:0.4rem;">
+                      <div style="display:flex; gap:0.4rem; align-items:center;">
+                        <button class="btn btn-outline btn-sm btn-inspect-deliberation" data-concept-id="${esc(c.id)}" data-concept-name="${esc(c.name)}" title="Inspect Deliberation">Inspect Deliberation</button>
                         <a href="#tutor" class="btn btn-secondary btn-sm" title="Ask Tutor">Ask</a>
                         <a href="#practice" data-target-concept="${esc(c.id)}" class="btn btn-primary btn-sm start-target-quiz" title="Quiz this concept">Quiz</a>
                       </div>
@@ -4820,8 +5149,16 @@
 
     window.addEventListener("hashchange", handleHashChange);
     
-    // Global navigation listener for practice links ensuring clean session start on topic switch
+    // Global navigation listener for practice links and teacher deliberation modal
     document.addEventListener("click", (e) => {
+      const inspectBtn = e.target.closest(".btn-inspect-deliberation");
+      if (inspectBtn) {
+        const cid = inspectBtn.getAttribute("data-concept-id");
+        const cname = inspectBtn.getAttribute("data-concept-name");
+        openTeacherDeliberationModal(cid, cname);
+        return;
+      }
+
       const targetLink = e.target.closest("a[href='#practice'], button.start-target-quiz, a.start-target-quiz");
       if (targetLink) {
         const cid = targetLink.getAttribute("data-target-concept");

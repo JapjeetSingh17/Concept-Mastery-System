@@ -336,6 +336,29 @@
     </div>
   </dialog>
 
+  <!-- Native Modal Dialog for Multi-Agent Pedagogical Assessment Deliberation -->
+  <dialog id="modal-teacher-deliberation" aria-labelledby="deliberation-modal-title" style="max-width: 880px; width: 94%; max-height: 90vh; border-radius: var(--radius-xl, 16px); border: 1px solid var(--border-subtle, #e2e8f0); box-shadow: var(--shadow-modal, 0 20px 25px -5px rgba(0, 0, 0, 0.2)); background: var(--surface-card, #ffffff); overflow: hidden; padding: 0;">
+    <div class="dialog-inner" style="display: flex; flex-direction: column; max-height: 90vh;">
+      <div class="dialog-header modal-header" style="display: flex; justify-content: space-between; align-items: center; padding: 1.25rem 1.75rem; border-bottom: 1px solid var(--border-subtle, #e2e8f0); background: var(--surface-subtle, #f8fafc);">
+        <div style="display: flex; align-items: center; gap: 0.85rem;">
+          <div style="width: 42px; height: 42px; border-radius: 10px; background: #eff6ff; color: #2563eb; display: flex; align-items: center; justify-content: center; font-size: 1.35rem;">
+            🎓
+          </div>
+          <div>
+            <h3 id="deliberation-modal-title" style="margin: 0; font-size: 1.2rem; font-weight: 700; color: var(--ink-primary);">Multi-Agent Pedagogical Assessment</h3>
+            <span id="deliberation-modal-subtitle" style="font-size: 0.84rem; color: var(--ink-secondary);">4 Specialist Teachers + Head Teacher Arbiter</span>
+          </div>
+        </div>
+        <button class="dialog-close-btn modal-close" id="modal-teacher-deliberation-close" aria-label="Close dialog" style="background: none; border: none; font-size: 1.6rem; cursor: pointer; color: var(--ink-muted); line-height: 1; padding: 0.25rem 0.5rem; border-radius: 6px;">
+          &times;
+        </button>
+      </div>
+      <div class="dialog-body modal-body" id="modal-teacher-deliberation-body" style="padding: 1.75rem; overflow-y: auto; flex: 1;">
+        <!-- Rendered dynamically by app.js -->
+      </div>
+    </div>
+  </dialog>
+
   <!-- Global Toast Alerts Container -->
   <div id="toast-container" aria-live="polite"></div>
 
