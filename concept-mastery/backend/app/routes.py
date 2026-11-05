@@ -221,6 +221,13 @@ async def submit_medical_verification(
     evidence = await id_card.read()
     if not evidence or len(evidence) > 5 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="Student ID file must be between 1 byte and 5 MB.")
+    if suffix == ".pdf" and not evidence.startswith(b"%PDF"):
+        raise HTTPException(status_code=400, detail="The uploaded ID does not appear to be a valid PDF.")
+    if suffix == ".png" and not evidence.startswith(bytes([137, 80, 78, 71])):
+        raise HTTPException(status_code=400, detail="The uploaded ID does not appear to be a valid PNG image.")
+    if suffix in {".jpg", ".jpeg"} and not evidence.startswith(bytes([255, 216, 255])):
+        raise HTTPException(status_code=400, detail="The uploaded ID does not appear to be a valid JPEG image.")
+    previous = next((r for r in store.list_medical_verification_requests() if r["user_id"] == current_user.user_id), None)
     stored_name = f"{uuid.uuid4().hex}{suffix}"
     evidence_path = config.MEDICAL_VERIFICATION_DIR / stored_name
     evidence_path.write_bytes(evidence)
@@ -235,6 +242,10 @@ async def submit_medical_verification(
         educational_email=email,
         id_card_filename=stored_name,
     )
+    if previous:
+        old_path = config.MEDICAL_VERIFICATION_DIR / Path(previous["id_card_filename"]).name
+        if old_path != evidence_path:
+            old_path.unlink(missing_ok=True)
     return {
         "ok": True,
         "status": "pending",
@@ -276,12 +287,17 @@ def review_medical_verification(
     x_verification_review_token: str | None = Header(None),
 ):
     _require_verification_reviewer(x_verification_review_token)
+    record = next((r for r in store.list_medical_verification_requests() if r["user_id"] == user_id), None)
     reviewed = store.review_medical_verification_request(
         user_id=user_id,
         status=body.status,
         reviewer="configured-verification-reviewer",
         notes=body.notes,
     )
+    if record:
+        evidence_path = (config.MEDICAL_VERIFICATION_DIR / Path(record["id_card_filename"]).name).resolve()
+        if evidence_path.parent == config.MEDICAL_VERIFICATION_DIR.resolve():
+            evidence_path.unlink(missing_ok=True)
     if not reviewed:
         raise HTTPException(status_code=404, detail="Verification request not found.")
     return {"ok": True, "request": reviewed}
