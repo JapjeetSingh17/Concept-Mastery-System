@@ -1040,8 +1040,33 @@ async def post_materials_ingest_url(req: IngestUrlRequest, current_user: User = 
             user_id=uid,
             title=req.title
         )
+        # URL ingestion shares the same moderation gate as file uploads. The
+        # ingestor persists extracted text, so inspect the saved record and
+        # remove it immediately if it contains restricted material.
+        stored_material = store.get_study_material(mat_res["material_id"], user_id=uid)
+        extracted_text = (stored_material or {}).get("raw_extracted_text", "")
+        screening = screen_text(extracted_text)
+        if screening.decision == ContentDecision.REVIEW and not screening.matched_signals:
+            UniversalMaterialIngestor.delete_material(material_id=mat_res["material_id"], user_id=uid)
+            raise HTTPException(
+                status_code=422,
+                detail="This URL has no supported extractable text or transcript. It was not retained; manual moderation is required."
+            )
+        if screening.matched_signals and not store.is_medical_verified(uid):
+            UniversalMaterialIngestor.delete_material(material_id=mat_res["material_id"], user_id=uid)
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "MEDICAL_VERIFICATION_REQUIRED",
+                    "message": "This material contains explicit-content signals. Only verified medical students can access it. Submit your medical student ID and institution-issued email for review.",
+                    "verification_endpoint": "/api/auth/medical-verification",
+                    "signals": list(screening.matched_signals),
+                },
+            )
     except store.UserError as ue:
         raise HTTPException(status_code=400, detail=str(ue))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to ingest URL '{url}': {e}")
 
