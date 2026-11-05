@@ -2444,9 +2444,17 @@
       const activeConcept = concepts.find(c => c.id === session.conceptId) || { id: session.conceptId, name: session.conceptId };
       const statusPill = getConceptStatus(activeConcept);
 
+      function cleanConceptLabel(c) {
+        let name = c.name || c.id || "Concept";
+        if (/^segment\s+\d/i.test(name) || /^video\s*\[/i.test(name)) {
+          return `Topic: ${name.replace(/^Video\s*\[?/i, '').replace(/\]$/, '')}`;
+        }
+        return name;
+      }
+
       const conceptSelectHtml = concepts.map(c => `
         <option value="${esc(c.id)}" ${c.id === session.conceptId ? "selected" : ""}>
-          ${esc(c.name || c.id)} (${getConceptStatus(c)})
+          ${esc(cleanConceptLabel(c))} (${getConceptStatus(c)})
         </option>
       `).join("");
 
@@ -4038,6 +4046,19 @@
       renderMath(document);
       const session = AppState.activeRecallSession;
       if (!session) return;
+
+      // Clickable study citation pill jumps to video or source preview
+      $$(".study-citation-pill").forEach(pill => {
+        pill.style.cursor = "pointer";
+        pill.onclick = () => {
+          const txt = pill.textContent || "";
+          const match = txt.match(/(\d{1,2}:\d{2})/);
+          if (match) {
+            const sec = parseTimestampToSeconds(match[1]);
+            window.openVideoPreviewAtTimestamp(sec);
+          }
+        };
+      });
 
       // Concept Selector
       const conceptSelect = $("#recall-concept-select");

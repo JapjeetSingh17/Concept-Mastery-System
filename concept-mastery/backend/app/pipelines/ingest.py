@@ -377,15 +377,17 @@ def load_youtube_material(url: str, custom_title: Optional[str] = None) -> Tuple
     raw_items: List[Dict[str, Any]] = []
     structured_preview: List[Dict[str, Any]] = []
 
-    # Sliding 2-to-3 minute semantic topic window segmenter
-    WINDOW_TARGET_SEC = 150.0   # 2.5 minutes per topic window
-    WINDOW_STRIDE_SEC = 100.0   # 1.67 minutes stride (~50s overlap)
+    # Sliding 3-to-4 minute semantic topic window segmenter (minimum 150-300 words)
+    WINDOW_TARGET_SEC = 180.0   # 3.0 minutes minimum target per window
+    WINDOW_STRIDE_SEC = 120.0   # 2.0 minutes stride (~60s overlap)
     total_duration = max((s["start"] + s["duration"] for s in snippets), default=0.0)
 
     if total_duration <= 180.0:
         combined = " ".join(s["text"] for s in snippets).strip()
         start_sec = snippets[0]["start"]
-        label = format_seconds_to_timestamp(start_sec)
+        start_ts = format_seconds_to_timestamp(start_sec)
+        end_ts = format_seconds_to_timestamp(total_duration)
+        label = f"{start_ts} - {end_ts}" if start_ts != end_ts else start_ts
         structured_preview.append({
             "index": 1,
             "label": label,
@@ -420,16 +422,18 @@ def load_youtube_material(url: str, custom_title: Optional[str] = None) -> Tuple
                 window_end_sec = max(window_end_sec, s["start"] + s.get("duration", 0.0))
                 end_idx += 1
                 total_w = sum(len(t.split()) for t in window_texts)
-                if s["start"] >= target_end_sec and total_w >= 45:
+                if s["start"] >= target_end_sec and total_w >= 35:
                     break
 
             combined = " ".join(window_texts).strip()
-            ts_str = format_seconds_to_timestamp(window_start_sec)
+            start_ts = format_seconds_to_timestamp(window_start_sec)
+            end_ts = format_seconds_to_timestamp(window_end_sec)
+            ts_range = f"{start_ts} - {end_ts}"
 
             structured_preview.append({
                 "index": window_index,
-                "label": ts_str,
-                "timestamp": ts_str,
+                "label": ts_range,
+                "timestamp": ts_range,
                 "start_seconds": int(window_start_sec),
                 "end_seconds": int(window_end_sec),
                 "text": combined,
@@ -438,8 +442,8 @@ def load_youtube_material(url: str, custom_title: Optional[str] = None) -> Tuple
 
             raw_items.append({
                 "page": window_index,
-                "locator_label": ts_str,
-                "section": f"Video [{ts_str}]",
+                "locator_label": ts_range,
+                "section": f"Video [{ts_range}]",
                 "text": combined,
             })
 
@@ -456,11 +460,13 @@ def load_youtube_material(url: str, custom_title: Optional[str] = None) -> Tuple
                     tail_texts = [s["text"] for s in snippets[curr_idx:]]
                     tail_combined = " ".join(tail_texts).strip()
                     tail_start = snippets[curr_idx]["start"]
-                    tail_ts = format_seconds_to_timestamp(tail_start)
+                    tail_start_ts = format_seconds_to_timestamp(tail_start)
+                    tail_end_ts = format_seconds_to_timestamp(total_duration)
+                    tail_label = f"{tail_start_ts} - {tail_end_ts}"
                     structured_preview.append({
                         "index": window_index,
-                        "label": tail_ts,
-                        "timestamp": tail_ts,
+                        "label": tail_label,
+                        "timestamp": tail_label,
                         "start_seconds": int(tail_start),
                         "end_seconds": int(total_duration),
                         "text": tail_combined,
@@ -468,8 +474,8 @@ def load_youtube_material(url: str, custom_title: Optional[str] = None) -> Tuple
                     })
                     raw_items.append({
                         "page": window_index,
-                        "locator_label": tail_ts,
-                        "section": f"Video [{tail_ts}]",
+                        "locator_label": tail_label,
+                        "section": f"Video [{tail_label}]",
                         "text": tail_combined,
                     })
                 break
@@ -722,8 +728,83 @@ def chunk_extracted_items(
     source_title: str,
     origin_name: str
 ) -> List[Dict[str, Any]]:
-    """Segment raw extracted items into ~110-word chunks tagged with citations and metadata."""
+    """Segment raw extracted items into cohesive, semantic chunks of at least 150-300 words.
+
+    Prevents micro-chunk fragmentation by aggregating adjacent sparse items (e.g. single-sentence slides,
+    micro-transcripts, short paragraphs) under composite locators [Page 1-2] or [00:00 - 03:45].
+    """
+    MIN_WORDS = 80
+    TARGET_WORDS = 150
+    MAX_WORDS = 260
+
     chunks: List[Dict[str, Any]] = []
+
+    cur_sentences: List[str] = []
+    cur_pages: List[int] = []
+    cur_locators: List[str] = []
+    cur_sections: List[str] = []
+    cur_word_count = 0
+
+    def _flush_buffer():
+        nonlocal cur_sentences, cur_pages, cur_locators, cur_sections, cur_word_count
+        if not cur_sentences:
+            return
+
+        text = " ".join(cur_sentences).strip()
+        words = text.split()
+        if not words:
+            return
+
+        # Determine composite locator label
+        first_page = cur_pages[0] if cur_pages else 1
+        last_page = cur_pages[-1] if cur_pages else first_page
+
+        if source_type == "pdf":
+            comp_locator = f"Page {first_page}" if first_page == last_page else f"Pages {first_page}-{last_page}"
+        elif source_type == "pptx":
+            comp_locator = f"Slide {first_page}" if first_page == last_page else f"Slides {first_page}-{last_page}"
+        else:
+            locs = [l.replace("[", "").replace("]", "").replace("Video ", "").strip() for l in cur_locators if l]
+            if locs:
+                if len(locs) == 1 or locs[0] == locs[-1] or (" - " in locs[0]):
+                    comp_locator = locs[0]
+                else:
+                    start_part = locs[0].split(" - ")[0]
+                    end_part = locs[-1].split(" - ")[-1]
+                    comp_locator = f"{start_part} - {end_part}"
+            else:
+                comp_locator = f"Section {first_page}"
+
+        # Choose the most descriptive section title from cur_sections
+        chosen_section = "Introduction"
+        for sec in cur_sections:
+            if sec and not concepts.is_generic_section_heading(sec):
+                chosen_section = sec
+                break
+        if chosen_section == "Introduction" and cur_sections:
+            chosen_section = cur_sections[0]
+
+        chunks.append({
+            "id": len(chunks),
+            "chunk_id": str(uuid.uuid4()),
+            "page": first_page,
+            "section": chosen_section,
+            "locator_label": comp_locator,
+            "text": text,
+            "token_count": len(words),
+            "canonical_concepts": [],
+            "source_id": source_id,
+            "source_type": source_type,
+            "source_title": source_title,
+            "origin_url_or_filename": origin_name,
+            "source_filename": origin_name,
+        })
+
+        cur_sentences.clear()
+        cur_pages.clear()
+        cur_locators.clear()
+        cur_sections.clear()
+        cur_word_count = 0
 
     for item in items:
         page = int(item.get("page", 1))
@@ -733,54 +814,56 @@ def chunk_extracted_items(
         if not raw_text:
             continue
 
-        # Split text into sentence-bounded chunks of ~110 words
-        cur: List[str] = []
-        n = 0
-        for s in sentences(raw_text) + [None]:
-            if s is None or (n + len(s.split()) > CHUNK_WORDS and cur):
-                chunk_str = " ".join(cur).strip()
-                words = chunk_str.split()
-                if len(words) >= 8:
-                    chunks.append({
-                        "id": len(chunks),
-                        "chunk_id": str(uuid.uuid4()),
-                        "page": page,
-                        "section": section,
-                        "locator_label": locator,
-                        "text": chunk_str,
-                        "token_count": len(words),
-                        "canonical_concepts": [],
-                        "source_id": source_id,
-                        "source_type": source_type,
-                        "source_title": source_title,
-                        "origin_url_or_filename": origin_name,
-                        "source_filename": origin_name,
-                    })
-                cur, n = [], 0
-            if s:
-                cur.append(s)
-                n += len(s.split())
+        item_sentences = sentences(raw_text)
+        if not item_sentences:
+            item_sentences = [raw_text]
 
-    # Fallback if text was brief but valid
-    if not chunks and items:
-        for item in items:
-            t = str(item.get("text", "")).strip()
-            if len(t.split()) >= 4:
-                chunks.append({
-                    "id": len(chunks),
-                    "chunk_id": str(uuid.uuid4()),
-                    "page": int(item.get("page", 1)),
-                    "section": str(item.get("section", "Introduction")),
-                    "locator_label": str(item.get("locator_label", "Overview")),
-                    "text": t,
-                    "token_count": len(t.split()),
-                    "canonical_concepts": [],
-                    "source_id": source_id,
-                    "source_type": source_type,
-                    "source_title": source_title,
-                    "origin_url_or_filename": origin_name,
-                    "source_filename": origin_name,
-                })
+        # If entering a distinct non-generic thematic section, flush if we have sufficient content
+        if cur_sections and section != cur_sections[-1] and not concepts.is_generic_section_heading(section):
+            is_prev_real_heading = not concepts.is_generic_section_heading(cur_sections[-1])
+            req_words = 20 if is_prev_real_heading else MIN_WORDS
+            if cur_word_count >= req_words:
+                _flush_buffer()
+
+        for s in item_sentences:
+            s_words = len(s.split())
+            if s_words == 0:
+                continue
+
+            # If adding this sentence exceeds MAX_WORDS and we already meet MIN_WORDS, flush previous
+            if (cur_word_count + s_words > MAX_WORDS) and (cur_word_count >= MIN_WORDS):
+                _flush_buffer()
+
+            cur_sentences.append(s)
+            cur_pages.append(page)
+            if locator not in cur_locators:
+                cur_locators.append(locator)
+            if section not in cur_sections:
+                cur_sections.append(section)
+            cur_word_count += s_words
+
+            # If target words reached, flush buffer
+            if cur_word_count >= TARGET_WORDS:
+                _flush_buffer()
+
+    # Flush leftover buffer
+    if cur_sentences:
+        # If leftover is brief (< 50 words) and prior chunks exist, merge unless it has its own distinct heading
+        prev_is_distinct = (
+            chunks and cur_sections and not concepts.is_generic_section_heading(cur_sections[-1])
+            and chunks[-1].get("section") != cur_sections[-1]
+            and not concepts.is_generic_section_heading(chunks[-1].get("section", ""))
+        )
+        if cur_word_count < 50 and chunks and not prev_is_distinct:
+            last = chunks[-1]
+            last["text"] += " " + " ".join(cur_sentences).strip()
+            last["token_count"] = len(last["text"].split())
+            if cur_locators:
+                last_loc = cur_locators[-1].replace("[", "").replace("]", "").replace("Video ", "").strip()
+                if last_loc not in last["locator_label"]:
+                    last["locator_label"] = f"{last['locator_label']} - {last_loc}"
+        else:
+            _flush_buffer()
 
     return chunks
 

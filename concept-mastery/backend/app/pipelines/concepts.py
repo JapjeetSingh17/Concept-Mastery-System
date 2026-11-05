@@ -28,6 +28,7 @@ GENERIC_SECTION_PATTERNS = [
     re.compile(r"^voice\s+note\b", re.I),
     re.compile(r"^page\s+\d+", re.I),
     re.compile(r"^slide\s+\d+", re.I),
+    re.compile(r"^section\s+\d+", re.I),
     re.compile(r"^section\s*:\s*overview", re.I),
     re.compile(r"^introduction$", re.I),
     re.compile(r"^overview$", re.I),
