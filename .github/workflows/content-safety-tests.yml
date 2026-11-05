@@ -1,0 +1,25 @@
+name: Content Safety Tests
+
+on:
+  push:
+    branches:
+      - feat/explicit-content-safeguard
+  pull_request:
+
+jobs:
+  content-safety:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: concept-mastery/backend
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test runner
+        run: python -m pip install --upgrade pip pytest
+      - name: Run adversarial content-screening tests
+        run: python -m pytest tests/test_content_safety_adversarial.py -q
