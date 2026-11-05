@@ -13,6 +13,8 @@ def _p(key, default):
 
 UPLOAD_DIR = _p("UPLOAD_DIR", "../data/uploads")
 VECTOR_STORE_PATH = _p("VECTOR_STORE_PATH", "../data/vectorstore")
+MEDICAL_VERIFICATION_DIR = VECTOR_STORE_PATH / "medical_verification"
+MEDICAL_VERIFICATION_REVIEW_TOKEN = _e("MEDICAL_VERIFICATION_REVIEW_TOKEN", "")
 FRONTEND_DIR = (BASE.parent / "frontend").resolve()
 SYNONYMS_FILE = BASE / "synonyms.json"
 def _e(k, d=""): return os.getenv(k, d).split("#")[0].strip()
@@ -66,3 +68,8 @@ LLM_PROVIDER, LLM_API_KEY, LLM_MODEL = _e("LLM_PROVIDER", "openai").lower(), _e(
 LLM_BASE_URL = _e("LLM_BASE_URL", "https://api.openai.com/v1")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 VECTOR_STORE_PATH.mkdir(parents=True, exist_ok=True)
+MEDICAL_VERIFICATION_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    MEDICAL_VERIFICATION_DIR.chmod(0o700)
+except OSError:
+    pass
