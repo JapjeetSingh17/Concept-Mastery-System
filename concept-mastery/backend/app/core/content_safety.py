@@ -8,6 +8,8 @@ human review for borderline material.
 from __future__ import annotations
 
 import re
+from io import BytesIO
+from pathlib import Path
 from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable
@@ -70,3 +72,34 @@ def may_access_restricted_content(*, medical_verified: bool) -> bool:
 def allowed_educational_domains(domains: Iterable[str]) -> tuple[str, ...]:
     """Normalize allowlisted institution domains for verification workflows."""
     return tuple(sorted({d.strip().lower().lstrip("@") for d in domains if d and d.strip()}))
+
+
+
+def extract_text_for_screening(filename: str, content: bytes) -> str:
+    """Extract searchable text from supported documents without persisting them.
+
+    Empty text is treated as unscannable by screen_text, not as safe.
+    Image-only PDFs and audio/video require OCR or modality-specific review.
+    """
+    suffix = Path(filename).suffix.lower()
+    if suffix in {".txt", ".md"}:
+        return content.decode("utf-8", errors="replace")
+    if suffix == ".pdf":
+        from pypdf import PdfReader
+        reader = PdfReader(BytesIO(content))
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
+    if suffix == ".docx":
+        from docx import Document
+        document = Document(BytesIO(content))
+        return "\n".join(paragraph.text for paragraph in document.paragraphs)
+    if suffix == ".pptx":
+        from pptx import Presentation
+        presentation = Presentation(BytesIO(content))
+        return "\n".join(
+            shape.text
+            for slide in presentation.slides
+            for shape in slide.shapes
+            if getattr(shape, "has_text_frame", False) and shape.text
+        )
+    # Unsupported modalities fail closed until OCR/audio/video moderation exists.
+    return ""
