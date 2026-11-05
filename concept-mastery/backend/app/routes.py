@@ -1027,33 +1027,30 @@ async def post_materials_ingest_file(
 @router.post("/materials/ingest-url")
 @router.post("/materials/ingest-url/")
 async def post_materials_ingest_url(req: IngestUrlRequest, current_user: User = Depends(get_current_user)):
-    """Ingest educational websites (GeeksforGeeks, docs) or YouTube video lectures with timestamped transcripts."""
+    """Screen the fetched URL payload before it can be persisted or indexed."""
     url = req.url.strip()
     if not (url.startswith("http://") or url.startswith("https://")):
         raise HTTPException(status_code=400, detail="URL must begin with http:// or https://")
 
     uid = req.user_id if req.user_id != "default" else (current_user.user_id if current_user and current_user.user_id != "default" else "default")
     try:
-        mat_res = UniversalMaterialIngestor.ingest_url(
+        # Fetch/extract exactly once, without writing to the database or search index.
+        # Pass this same payload into ingestion after it passes moderation.
+        preview = UniversalMaterialIngestor.preview_url(
             url=url,
             source_type=req.source_type,
-            user_id=uid,
-            title=req.title
+            title=req.title,
         )
-        # URL ingestion shares the same moderation gate as file uploads. The
-        # ingestor persists extracted text, so inspect the saved record and
-        # remove it immediately if it contains restricted material.
-        stored_material = store.get_study_material(mat_res["material_id"], user_id=uid)
-        extracted_text = (stored_material or {}).get("raw_extracted_text", "")
+        extracted_text = preview.get("raw_text", "")
         screening = screen_text(extracted_text)
+
         if screening.decision == ContentDecision.REVIEW and not screening.matched_signals:
-            UniversalMaterialIngestor.delete_material(material_id=mat_res["material_id"], user_id=uid)
             raise HTTPException(
                 status_code=422,
-                detail="This URL has no supported extractable text or transcript. It was not retained; manual moderation is required."
+                detail="This URL has no supported extractable text or transcript. It was not retained; manual moderation or OCR is required.",
             )
+
         if screening.matched_signals and not store.is_medical_verified(uid):
-            UniversalMaterialIngestor.delete_material(material_id=mat_res["material_id"], user_id=uid)
             raise HTTPException(
                 status_code=403,
                 detail={
@@ -1063,11 +1060,20 @@ async def post_materials_ingest_url(req: IngestUrlRequest, current_user: User = 
                     "signals": list(screening.matched_signals),
                 },
             )
+
+        mat_res = UniversalMaterialIngestor.ingest_url(
+            url=url,
+            source_type=req.source_type,
+            user_id=uid,
+            title=req.title,
+            preloaded_content=preview,
+        )
     except store.UserError as ue:
         raise HTTPException(status_code=400, detail=str(ue))
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception("Failed to moderate or ingest URL %s", url)
         raise HTTPException(status_code=500, detail=f"Failed to ingest URL '{url}': {e}")
 
     active_kb = store.get_kb(uid)
@@ -1081,7 +1087,6 @@ async def post_materials_ingest_url(req: IngestUrlRequest, current_user: User = 
             "concepts": len(active_kb.get("concepts", [])),
         }
     }
-
 
 @router.get("/materials", response_model=MaterialsListResponse)
 @router.get("/materials/", response_model=MaterialsListResponse)
