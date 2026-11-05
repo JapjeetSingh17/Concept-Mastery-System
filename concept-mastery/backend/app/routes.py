@@ -12,14 +12,17 @@ Endpoints:
 
 import logging
 import time
+import hmac
+import uuid
 from pathlib import Path
 from typing import Optional, Literal
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Request, Depends, Query, Body
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Request, Depends, Query, Body, Header
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from . import config
 from .core import store, tts
+from .core.content_safety import ContentDecision, extract_text_for_screening, screen_text
 from .core.auth import get_current_user, create_access_token, verify_google_credential
 from .pipelines import ingest, tutor, quiz, mastery, recommend, loop, concepts, active_recall, notes, tools, mastery_orchestrator
 from .pipelines.concepts import export_graph
@@ -142,9 +145,151 @@ def get_auth_logs(current_user: User = Depends(get_current_user)):
     }
 
 
+# ── Medical-content access control ─────────────────────────────────────────
+
+async def _enforce_content_policy(upload: UploadFile, user_id: str) -> None:
+    """Screen extracted document text before any content is persisted or indexed."""
+    if not upload.filename:
+        raise HTTPException(status_code=400, detail="Uploaded file must have a filename.")
+    raw = await upload.read()
+    await upload.seek(0)
+    try:
+        extracted = extract_text_for_screening(upload.filename, raw)
+    except Exception as exc:
+        logger.warning("Could not screen uploaded file %s: %s", upload.filename, exc)
+        raise HTTPException(
+            status_code=422,
+            detail="This file could not be screened automatically. Upload a text-readable PDF/DOCX/PPTX/TXT/MD file or request manual review."
+        )
+    result = screen_text(extracted)
+    if result.decision == ContentDecision.REVIEW and not result.matched_signals:
+        raise HTTPException(
+            status_code=422,
+            detail="This file has no supported extractable text (for example, scanned PDFs or audio/video). It was not uploaded; manual moderation or OCR is required."
+        )
+    if result.matched_signals and not store.is_medical_verified(user_id):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "MEDICAL_VERIFICATION_REQUIRED",
+                "message": "This material contains explicit-content signals. Only verified medical students can access it. Submit your medical student ID and institution-issued email for review.",
+                "verification_endpoint": "/api/auth/medical-verification",
+                "signals": list(result.matched_signals),
+            },
+        )
+
+
+def _require_verification_reviewer(token: str | None) -> None:
+    expected = config.MEDICAL_VERIFICATION_REVIEW_TOKEN
+    if not expected or not token or not hmac.compare_digest(token, expected):
+        raise HTTPException(status_code=403, detail="Authorized verification reviewer access is required.")
+
+
+class MedicalVerificationReview(BaseModel):
+    status: Literal["verified", "rejected"]
+    notes: str = ""
+
+
+@router.get("/auth/medical-verification")
+def get_medical_verification_status(current_user: User = Depends(get_current_user)):
+    request_record = store.get_medical_verification_request(current_user.user_id)
+    return {
+        "status": request_record.get("status", "not_submitted") if request_record else "not_submitted",
+        "request": request_record,
+    }
+
+
+@router.post("/auth/medical-verification")
+async def submit_medical_verification(
+    institution: str = Form(...),
+    program: str = Form(...),
+    educational_email: str = Form(...),
+    id_card: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+):
+    """Submit a medical ID card and institution email for manual verification."""
+    if not institution.strip() or not program.strip():
+        raise HTTPException(status_code=400, detail="Institution and medical program are required.")
+    email = educational_email.strip().lower()
+    if "@" not in email or "." not in email.rsplit("@", 1)[-1]:
+        raise HTTPException(status_code=400, detail="Enter a valid institution-issued email address.")
+    if email.endswith(("@gmail.com", "@yahoo.com", "@outlook.com", "@hotmail.com")):
+        raise HTTPException(status_code=400, detail="Use an institution-issued educational email, not a public email provider.")
+    suffix = Path(id_card.filename or "").suffix.lower()
+    if suffix not in {".png", ".jpg", ".jpeg", ".pdf"}:
+        raise HTTPException(status_code=400, detail="Student ID must be a PNG, JPG, or PDF file.")
+    evidence = await id_card.read()
+    if not evidence or len(evidence) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Student ID file must be between 1 byte and 5 MB.")
+    stored_name = f"{uuid.uuid4().hex}{suffix}"
+    evidence_path = config.MEDICAL_VERIFICATION_DIR / stored_name
+    evidence_path.write_bytes(evidence)
+    try:
+        evidence_path.chmod(0o600)
+    except OSError:
+        pass
+    store.submit_medical_verification_request(
+        user_id=current_user.user_id,
+        institution=institution.strip()[:200],
+        program=program.strip()[:160],
+        educational_email=email,
+        id_card_filename=stored_name,
+    )
+    return {
+        "ok": True,
+        "status": "pending",
+        "message": "Your request is pending manual review. Access remains restricted until the ID card and institution email are checked.",
+    }
+
+
+@router.get("/admin/medical-verification")
+def list_medical_verification_requests(
+    x_verification_review_token: str | None = Header(None),
+):
+    _require_verification_reviewer(x_verification_review_token)
+    return {"requests": store.list_medical_verification_requests()}
+
+
+@router.get("/admin/medical-verification/{user_id}/id-card")
+def get_medical_verification_id_card(
+    user_id: str,
+    x_verification_review_token: str | None = Header(None),
+):
+    _require_verification_reviewer(x_verification_review_token)
+    record = next((r for r in store.list_medical_verification_requests() if r["user_id"] == user_id), None)
+    if not record:
+        raise HTTPException(status_code=404, detail="Verification request not found.")
+    safe_name = Path(record["id_card_filename"]).name
+    path = (config.MEDICAL_VERIFICATION_DIR / safe_name).resolve()
+    if path.parent != config.MEDICAL_VERIFICATION_DIR.resolve() or not path.is_file():
+        raise HTTPException(status_code=404, detail="ID evidence not found.")
+    media_type = "application/pdf" if path.suffix.lower() == ".pdf" else "image/jpeg"
+    if path.suffix.lower() == ".png":
+        media_type = "image/png"
+    return FileResponse(str(path), media_type=media_type, filename="medical-student-id" + path.suffix)
+
+
+@router.post("/admin/medical-verification/{user_id}/review")
+def review_medical_verification(
+    user_id: str,
+    body: MedicalVerificationReview,
+    x_verification_review_token: str | None = Header(None),
+):
+    _require_verification_reviewer(x_verification_review_token)
+    reviewed = store.review_medical_verification_request(
+        user_id=user_id,
+        status=body.status,
+        reviewer="configured-verification-reviewer",
+        notes=body.notes,
+    )
+    if not reviewed:
+        raise HTTPException(status_code=404, detail="Verification request not found.")
+    return {"ok": True, "request": reviewed}
+
+
 # ── 1. Document Ingestion & Vectorless Index ───────────────────────────────
 
-async def _save_uploaded_pdfs(files: list[UploadFile], file: UploadFile | None) -> list[Path]:
+async def _save_uploaded_pdfs(files: list[UploadFile], file: UploadFile | None, user_id: str) -> list[Path]:
     all_uploads: list[UploadFile] = list(files or [])
     if file:
         all_uploads.append(file)
@@ -152,6 +297,9 @@ async def _save_uploaded_pdfs(files: list[UploadFile], file: UploadFile | None) 
     valid_pdfs = [f for f in all_uploads if f.filename and f.filename.lower().endswith(".pdf")]
     if not valid_pdfs:
         raise HTTPException(status_code=400, detail="Please upload at least one valid PDF file.")
+
+    for upload in valid_pdfs:
+        await _enforce_content_policy(upload, user_id)
 
     saved_paths: list[Path] = []
     for f in valid_pdfs:
@@ -167,10 +315,11 @@ async def _save_uploaded_pdfs(files: list[UploadFile], file: UploadFile | None) 
 @router.post("/upload/", response_model=UploadResponse)
 async def post_upload(
     files: list[UploadFile] = File(default=[]),
-    file: UploadFile | None = File(default=None)
+    file: UploadFile | None = File(default=None),
+    current_user: User = Depends(get_current_user),
 ):
-    """Upload one or multiple PDFs, run section chunking & vectorless indexing, build prerequisite DAG."""
-    saved_paths = await _save_uploaded_pdfs(files, file)
+    """Upload one or multiple screened PDFs and build the prerequisite DAG."""
+    saved_paths = await _save_uploaded_pdfs(files, file, current_user.user_id)
     try:
         res = await ingest.run_ingest_async(saved_paths)
         return UploadResponse(**res)
@@ -184,10 +333,11 @@ async def post_upload(
 @router.post("/ingest/")
 async def post_ingest(
     files: list[UploadFile] = File(default=[]),
-    file: UploadFile | None = File(default=None)
+    file: UploadFile | None = File(default=None),
+    current_user: User = Depends(get_current_user),
 ):
-    """Ingest one or multiple PDFs maintaining backward compatibility with existing SPA."""
-    saved_paths = await _save_uploaded_pdfs(files, file)
+    """Ingest screened PDFs while maintaining existing SPA compatibility."""
+    saved_paths = await _save_uploaded_pdfs(files, file, current_user.user_id)
     try:
         res = await ingest.run_ingest_async(saved_paths)
         return {"jobId": res["job_id"], **res}
@@ -201,9 +351,10 @@ async def post_ingest(
 @router.post("/ingest/upload/")
 async def post_ingest_upload(
     files: list[UploadFile] = File(default=[]),
-    file: UploadFile | None = File(default=None)
+    file: UploadFile | None = File(default=None),
+    current_user: User = Depends(get_current_user),
 ):
-    return await post_upload(files=files, file=file)
+    return await post_upload(files=files, file=file, current_user=current_user)
 
 
 @router.get("/ingest/status", response_model=IngestStatusResponse)
@@ -826,6 +977,7 @@ async def post_materials_ingest_file(
                 status_code=400,
                 detail=f"Unsupported format '{ext}'. Supported: PDF, PPTX, MD, TXT, DOCX, MP3, WAV, M4A, WEBM."
             )
+        await _enforce_content_policy(f, uid)
         dest = config.UPLOAD_DIR / Path(f.filename).name
         content = await f.read()
         dest.write_bytes(content)
