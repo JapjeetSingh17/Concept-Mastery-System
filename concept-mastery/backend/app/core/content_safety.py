@@ -31,8 +31,8 @@ class ScreeningResult:
 # Strong phrase signals only. Do not flag isolated clinical terms such as
 # "breast", "penis", "vagina", "reproduction", "anatomy", or "sexual health".
 _EXPLICIT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("pornographic phrase", re.compile(r"\b(?:hardcore|amateur|homemade)\s+porn(?:ography)?\b", re.I)),
-    ("explicit-content phrase", re.compile(r"\b(?:explicit sexual content|graphic sexual content|sexual intercourse video)\b", re.I)),
+    ("pornographic phrase", re.compile(r"\b(?:(?:hardcore|amateur|homemade)\s+)?porn(?:ography|ographic)?\b", re.I)),
+    ("explicit-content phrase", re.compile(r"\b(?:sexually explicit|explicit sexual (?:content|material|images?|videos?)|graphic sexual (?:content|material|images?|videos?)|sexual intercourse video)\b", re.I)),
     ("sexual-act phrase", re.compile(r"\b(?:oral sex|anal sex|sexual acts? for arousal)\b", re.I)),
     ("adult-content label", re.compile(r"\b(?:xxx|18\+\s*adult)\b", re.I)),
 )
