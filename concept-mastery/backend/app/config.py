@@ -8,8 +8,13 @@ try:
 except ImportError:
     pass
 
+def _e(k, d=""):
+    return os.getenv(k, d).split("#")[0].strip()
+
+
 def _p(key, default):
     return (BASE / os.getenv(key, default).split("#")[0].strip()).resolve()
+
 
 UPLOAD_DIR = _p("UPLOAD_DIR", "../data/uploads")
 VECTOR_STORE_PATH = _p("VECTOR_STORE_PATH", "../data/vectorstore")
@@ -17,7 +22,6 @@ MEDICAL_VERIFICATION_DIR = VECTOR_STORE_PATH / "medical_verification"
 MEDICAL_VERIFICATION_REVIEW_TOKEN = _e("MEDICAL_VERIFICATION_REVIEW_TOKEN", "")
 FRONTEND_DIR = (BASE.parent / "frontend").resolve()
 SYNONYMS_FILE = BASE / "synonyms.json"
-def _e(k, d=""): return os.getenv(k, d).split("#")[0].strip()
 
 # PageIndex API
 PAGEINDEX_API_KEY = _e("PAGEINDEX_API_KEY", "")
