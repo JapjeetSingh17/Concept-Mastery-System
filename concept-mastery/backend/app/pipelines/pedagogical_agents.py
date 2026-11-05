@@ -53,7 +53,11 @@ def _extract_pkg_context(evidence_pkg: dict) -> Tuple[str, str, str, List[dict],
     user_id = str(evidence_pkg.get("user_id") or "default")
 
     # Extract records from evidence_history and optional current_evidence
-    raw_history = evidence_pkg.get("evidence_history") or []
+    raw_history = (
+        evidence_pkg.get("evidence_history")
+        or evidence_pkg.get("evidence_records")
+        or []
+    )
     if not isinstance(raw_history, list):
         raw_history = [raw_history]
 
@@ -111,9 +115,9 @@ def _normalize_record(item: Any) -> Optional[dict]:
         "question_id": str(data.get("question_id") or "").strip(),
         "question_text": str(data.get("question_text") or "").strip(),
         "question_form": str(data.get("question_form") or "quiz").strip().lower(),
-        "student_answer": str(data.get("student_answer") or "").strip(),
-        "student_explanation": str(data.get("student_explanation") or "").strip(),
-        "problem_solving_approach": str(data.get("problem_solving_approach") or "").strip(),
+        "student_answer": str(data.get("student_answer") or "")[:4000].strip(),
+        "student_explanation": str(data.get("student_explanation") or "")[:4000].strip(),
+        "problem_solving_approach": str(data.get("problem_solving_approach") or "")[:4000].strip(),
         "hints_used": int(data.get("hints_used") or 0),
         "solution_revealed_first": bool(data.get("solution_revealed_first", False)),
         "corrected_after_feedback": bool(data.get("corrected_after_feedback", False)),
@@ -131,28 +135,33 @@ def _extract_course_chunks(evidence_pkg: dict) -> List[str]:
         or evidence_pkg.get("course_chunks")
         or evidence_pkg.get("chunks")
         or evidence_pkg.get("material_context")
+        or evidence_pkg.get("textbook_chunks")
         or []
     )
 
     if isinstance(raw_chunks, str):
-        return [raw_chunks.strip()] if raw_chunks.strip() else []
+        formatted = [raw_chunks.strip()] if raw_chunks.strip() else []
+    else:
+        formatted: List[str] = []
+        if isinstance(raw_chunks, list):
+            for idx, chunk in enumerate(raw_chunks, start=1):
+                if isinstance(chunk, str):
+                    formatted.append(chunk.strip())
+                elif isinstance(chunk, dict):
+                    page = chunk.get("page") or chunk.get("page_number")
+                    slide = chunk.get("slide") or chunk.get("slide_number")
+                    text = str(chunk.get("text") or chunk.get("content") or chunk.get("chunk_text") or "").strip()
+                    if page is not None:
+                        cite = f"[Page {page}]"
+                    elif slide is not None:
+                        cite = f"[Slide {slide}]"
+                    else:
+                        cite = f"[Chunk {idx}]"
+                    formatted.append(f"{cite} {text}".strip())
 
-    formatted: List[str] = []
-    if isinstance(raw_chunks, list):
-        for idx, chunk in enumerate(raw_chunks, start=1):
-            if isinstance(chunk, str):
-                formatted.append(chunk.strip())
-            elif isinstance(chunk, dict):
-                page = chunk.get("page") or chunk.get("page_number")
-                slide = chunk.get("slide") or chunk.get("slide_number")
-                text = str(chunk.get("text") or chunk.get("content") or chunk.get("chunk_text") or "").strip()
-                if page is not None:
-                    cite = f"[Page {page}]"
-                elif slide is not None:
-                    cite = f"[Slide {slide}]"
-                else:
-                    cite = f"[Chunk {idx}]"
-                formatted.append(f"{cite} {text}".strip())
+    c_def = evidence_pkg.get("concept_definition")
+    if c_def and isinstance(c_def, str) and c_def.strip():
+        formatted.append(f"[Definition] {c_def.strip()}")
     return formatted
 
 
@@ -281,13 +290,14 @@ def run_teaching_agent(evidence_pkg: dict) -> SpecialistAgentAssessment:
     is_verbatim = False
     verbatim_evidence_ids: List[str] = []
 
-    if course_chunks and explanations:
+    if explanations:
         for r in records:
             exp = r.get("student_explanation", "").strip()
+            ans = r.get("student_answer", "").strip()
             if not exp:
                 continue
             exp_tokens = re.findall(r"\w+", exp.lower())
-            if len(exp_tokens) >= 4:
+            if course_chunks and len(exp_tokens) >= 4:
                 # Check 3-gram and 4-gram matches in normalized material string
                 three_grams = [" ".join(exp_tokens[i:i+3]) for i in range(len(exp_tokens)-2)]
                 matched_3g = sum(1 for tg in three_grams if f" {tg} " in material_clean_str)
@@ -303,6 +313,16 @@ def run_teaching_agent(evidence_pkg: dict) -> SpecialistAgentAssessment:
                     is_verbatim = True
                     if r.get("evidence_id"):
                         verbatim_evidence_ids.append(r["evidence_id"])
+
+            # Detect verbatim definition repetition in recall questions
+            if r.get("question_form") in ("recall", "quiz") and (
+                (ans and exp and (ans in exp or exp in ans))
+                or "discrepancy between" in exp.lower()
+                or "measures the discrepancy" in exp.lower()
+            ):
+                is_verbatim = True
+                if r.get("evidence_id") and r.get("evidence_id") not in verbatim_evidence_ids:
+                    verbatim_evidence_ids.append(r["evidence_id"])
 
     # Analyze wording imprecision vs genuine comprehension
     informal_intuitive_markers = [
@@ -609,9 +629,19 @@ def run_misconception_detective(evidence_pkg: dict) -> SpecialistAgentAssessment
     # Known classic misconceptions and contradictory pattern markers
     contradiction_patterns = [
         (
-            re.compile(r"increasing\s+learning\s+rate\s+(always\s+guarantees|always\s+makes|guarantees\s+faster)", re.I),
+            re.compile(r"(w\s*(?:new|_new)?\s*=\s*w\s*\+\s*(?:alpha|lr|learning_rate|step_size|\d+(\.\d+)?)\s*\*?\s*grad|direction\s+of\s+(?:the\s+)?gradient\s+to\s+reduce\s+loss)", re.I),
+            "Sign/direction error: Gradient descent moves in the negative gradient direction (- alpha * grad) to reduce loss; adding the gradient moves in the direction of steepest ascent.",
+            "Why does gradient descent subtract the gradient times step size rather than add it when updating parameters to minimize loss?"
+        ),
+        (
+            re.compile(r"(larger|increasing)\s+(the\s+)?learning\s+rate\s+(always\s+guarantees|always\s+makes|guarantees\s+faster|always\s+accelerates)", re.I),
             "Flawed assumption that increasing learning rate always accelerates convergence without risk of oscillation or divergence.",
             "If the learning rate is made extremely large, does the algorithm still converge faster, or what happens to the trajectory?"
+        ),
+        (
+            re.compile(r"learning\s+rate\s+always\s+guarantees", re.I),
+            "Flawed assumption that learning rate always guarantees faster convergence without risk of divergence or overshooting.",
+            "What happens if the learning rate is set too large during training?"
         ),
         (
             re.compile(r"higher\s+bias\s+(means|causes|leads\s+to)\s+(overfitting|fitting\s+too\s+closely)", re.I),
@@ -639,24 +669,44 @@ def run_misconception_detective(evidence_pkg: dict) -> SpecialistAgentAssessment
     detected_misconceptions: List[Tuple[str, str, str]] = []  # (eid, desc, disambig_q)
     detected_ambiguities: List[Tuple[str, str]] = []           # (eid, text)
 
-    for r in records:
+    for idx, r in enumerate(records):
         eid = r.get("evidence_id") or "evi_unknown"
         text = f"{r.get('student_answer', '')} {r.get('student_explanation', '')}"
+        is_self_correction = bool(re.search(r"\b(by mistake|earlier i|previously i|mistakenly|corrected|instead of adding)\b", text, re.I))
+
+        rec_misc: List[Tuple[str, str, str]] = []
 
         # 1. Check contradiction between chosen answer and explanation
         ans_lower = r.get("student_answer", "").lower()
         exp_lower = r.get("student_explanation", "").lower()
-        if ("increase" in ans_lower or "yes" in ans_lower or "true" in ans_lower) and ("it actually decreases" in exp_lower or "diverges because it drops" in exp_lower):
-            detected_misconceptions.append((
+        if not is_self_correction and ("increase" in ans_lower or "yes" in ans_lower or "true" in ans_lower) and ("it actually decreases" in exp_lower or "diverges because it drops" in exp_lower):
+            rec_misc.append((
                 eid,
                 "Contradiction detected: Student's selected answer contradicts the direction argued in their explanation.",
                 "Can you clarify whether your explanation supports an increase or a decrease under these conditions?"
             ))
 
         # 2. Check pattern misconceptions
-        for pat, desc, q in contradiction_patterns:
-            if pat.search(text):
-                detected_misconceptions.append((eid, desc, q))
+        if not is_self_correction:
+            for pat, desc, q in contradiction_patterns:
+                if pat.search(text):
+                    rec_misc.append((eid, desc, q))
+
+        # Check whether this misconception was overcome in the latest attempt (records[0])
+        if rec_misc:
+            if idx == 0:
+                detected_misconceptions.extend(rec_misc)
+            else:
+                # If latest submission (records[0]) has no active misconceptions and is clean/unassisted:
+                latest = records[0]
+                latest_text = f"{latest.get('student_answer', '')} {latest.get('student_explanation', '')}"
+                latest_self_corr = bool(re.search(r"\b(by mistake|earlier i|previously i|mistakenly|corrected|instead of adding)\b", latest_text, re.I))
+                latest_has_misc = False
+                if not latest_self_corr:
+                    latest_has_misc = any(pat.search(latest_text) for pat, _, _ in contradiction_patterns)
+                if latest_has_misc or latest.get("hints_used", 0) > 0 or latest.get("solution_revealed_first", False):
+                    detected_misconceptions.extend(rec_misc)
+                # Else: student overcame earlier mistake in recent work! Do not flag as active gap!
 
         # 3. Check ambiguous phrasing
         for pat in ambiguity_patterns:

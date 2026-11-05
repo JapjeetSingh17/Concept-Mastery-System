@@ -344,3 +344,8 @@ def reset_exhaustion_state():
     _STATE["openrouter_exhausted"] = False
     _STATE["gemini_exhausted"] = False
     _STATE["groq_exhausted"] = False
+
+
+# Public aliases for testing & compatibility
+call_openrouter = _call_openrouter
+generate = complete

@@ -240,6 +240,8 @@ def evaluate_session(
 ) -> ActiveRecallResult:
     """Evaluate student active recall retrieval text & verification answer using AI Mastery Judge."""
     session = store.get_active_recall_session(session_id) if session_id else None
+    if session_id and not session:
+        raise store.UserError(f"Active recall session '{session_id}' not found.")
     if not session:
         sessions = store.list_active_recall_sessions(user_id=user_id, limit=20)
         matching = [s for s in sessions if s.get("concept_id") == concept_id]

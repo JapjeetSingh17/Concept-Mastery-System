@@ -641,16 +641,30 @@ def evaluate_submission(sub: QuizSubmission) -> QuizResult:
         correct_answer_display = f"{target_num} (±{tolerance})" if target_num is not None else ""
 
         user_val = sub.numeric_answer
+        if user_val is not None:
+            if math.isnan(user_val) or math.isinf(user_val):
+                user_val = None
+
         if user_val is None:
             raw = (sub.typed_answer or sub.student_reasoning or "").strip()
-            match = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", raw)
-            if match:
-                try:
-                    user_val = float(match.group(0))
-                except ValueError:
-                    user_val = None
+            # Reject literal poison tokens
+            if any(p in raw.lower() for p in ("nan", "inf")):
+                user_val = None
+            else:
+                match = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", raw)
+                if match:
+                    try:
+                        v = float(match.group(0))
+                        if not math.isnan(v) and not math.isinf(v):
+                            user_val = v
+                    except ValueError:
+                        user_val = None
 
-        user_answer_str = str(user_val) if user_val is not None else (sub.typed_answer or "No answer provided")
+        raw_str = (sub.typed_answer or "No answer provided")
+        if any(p in raw_str.lower() for p in ("nan", "inf")):
+            user_answer_str = "[Invalid numeric format]"
+        else:
+            user_answer_str = str(user_val) if user_val is not None else raw_str
         if user_val is not None and target_num is not None:
             diff = abs(user_val - target_num)
             is_correct = (diff <= tolerance)

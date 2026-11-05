@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from enum import Enum
 from typing import TypedDict, Literal, Optional, Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ── 1. Mastery Status Enum ─────────────────────────────────────────────────
@@ -127,7 +127,7 @@ class QuizQuestion(BaseModel):
     target_blank_answer: str = Field(default="", description="Target keyword for fill-in-the-blanks")
     rubric: str = Field(default="", description="Pedagogical rubric for evaluating open-ended typed answers")
     key_terms: list[str] = Field(default_factory=list, description="Essential concept keywords expected")
-    explanation: str
+    explanation: str = Field(default="", description="Grounded diagnostic explanation")
     source_page: int = Field(..., ge=1)
     given_parameters: Optional[dict[str, float]] = None
     formula_hint: Optional[str] = None
@@ -162,7 +162,7 @@ class QuizResult(BaseModel):
     correct_option_idx: int = 0
     correct_answer_display: str = ""
     user_answer: str = ""
-    explanation: str
+    explanation: str = Field(default="", description="Grounded diagnostic explanation")
     score: float
     misconceptions: list[str] = Field(default_factory=list)
     reasoning_clarity: float = Field(default=0.5)
@@ -451,6 +451,13 @@ class LearningEvidenceRecord(BaseModel):
     session_id: Optional[str] = None
     created_at: str = ""
 
+    @field_validator("student_answer", "student_explanation", "problem_solving_approach", mode="before")
+    @classmethod
+    def reject_oversized_payload(cls, v: Any) -> Any:
+        if isinstance(v, str) and len(v) > 50_000:
+            raise ValueError(f"Payload size ({len(v)} chars) exceeds maximum allowable limit of 50,000 characters.")
+        return v
+
 
 class SpecialistAgentAssessment(BaseModel):
     agent_role: Literal["teaching_agent", "assessment_agent", "misconception_detective", "learning_observer"]
@@ -492,6 +499,13 @@ class EvaluateEvidenceRequest(BaseModel):
     hints_used: Optional[int] = 0
     solution_revealed_first: Optional[bool] = False
     is_unfamiliar_example: Optional[bool] = False
+
+    @field_validator("student_answer", "student_explanation", "problem_solving_approach", mode="before")
+    @classmethod
+    def reject_oversized_payload(cls, v: Any) -> Any:
+        if isinstance(v, str) and len(v) > 50_000:
+            raise ValueError(f"Payload size ({len(v)} chars) exceeds maximum allowable limit of 50,000 characters.")
+        return v
 
 
 class EvaluateEvidenceResponse(BaseModel):

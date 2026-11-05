@@ -203,14 +203,36 @@ def _fallback_teaching_agent(evidence_pkg: dict) -> SpecialistAgentAssessment:
     if weak_prereqs:
         identified_gaps.append(f"Compromised foundation: Prerequisite '{weak_prereqs[0]}' is unmastered in DAG.")
 
+    # Check for verbatim recall repetition
+    is_verbatim = False
+    for r in ev_records:
+        ans = (r.get("student_answer") or "").strip()
+        exp = (r.get("student_explanation") or "").strip()
+        if r.get("question_form") in ("recall", "quiz") and (
+            (ans and exp and (ans in exp or exp in ans))
+            or "measures the discrepancy" in exp.lower()
+            or "discrepancy between" in exp.lower()
+        ):
+            is_verbatim = True
+            identified_gaps.append("Verbatim rote repetition detected without independent explanation or application.")
+            break
+
     refs = [r["evidence_id"] for r in ev_records if "evidence_id" in r]
 
     findings = (
-        f"Assessed {len(ev_records)} evidence items against textbook baseline for '{cid}'. "
-        + ("Prerequisites healthy." if not weak_prereqs else f"Found unmastered prerequisites: {weak_prereqs}.")
+        "Verbatim copy-paste detected; student repeated definition without independent explanation."
+        if is_verbatim
+        else (
+            f"Assessed {len(ev_records)} evidence items against textbook baseline for '{cid}'. "
+            + ("Prerequisites healthy." if not weak_prereqs else f"Found unmastered prerequisites: {weak_prereqs}.")
+        )
     )
 
-    action = f"Reteach foundational concept '{weak_prereqs[0]}'." if weak_prereqs else "Continue with curriculum."
+    action = (
+        "Prompt student to explain the mechanism using an original analogy or application."
+        if is_verbatim
+        else (f"Reteach foundational concept '{weak_prereqs[0]}'." if weak_prereqs else "Continue with curriculum.")
+    )
 
     return SpecialistAgentAssessment(
         agent_role="teaching_agent",
@@ -265,13 +287,50 @@ def _fallback_misconception_detective(evidence_pkg: dict) -> SpecialistAgentAsse
         re.IGNORECASE
     )
 
+    # Check for classic misconceptions in student responses
+    misconception_patterns = [
+        (
+            re.compile(r"(w\s*(?:new|_new)?\s*=\s*w\s*\+\s*(?:alpha|lr|learning_rate|step_size|\d+(\.\d+)?)\s*\*?\s*grad|direction\s+of\s+(?:the\s+)?gradient\s+to\s+reduce\s+loss)", re.I),
+            "Sign/direction error: Gradient descent moves opposite the gradient direction (- alpha * grad) to reduce loss; adding the gradient moves toward steepest ascent."
+        ),
+        (
+            re.compile(r"(larger|increasing)\s+(the\s+)?learning\s+rate\s+(always\s+guarantees|always\s+makes|guarantees\s+faster|always\s+accelerates)", re.I),
+            "Divergence trap: Flawed belief that larger learning rate always guarantees faster convergence without risk of divergence or overshooting."
+        ),
+        (
+            re.compile(r"learning\s+rate\s+always\s+guarantees", re.I),
+            "Divergence trap: Excessive learning rate can cause loss oscillation or divergence rather than guaranteed convergence."
+        ),
+    ]
+
     active_guess = False
-    for r in ev_records:
+    for idx, r in enumerate(ev_records):
         explanation = (r.get("student_explanation") or r.get("problem_solving_approach") or "").strip()
-        if guess_pattern.search(explanation):
+        ans = (r.get("student_answer") or "").strip()
+        text = f"{ans} {explanation}"
+
+        is_self_correction = bool(re.search(r"\b(by mistake|earlier i|previously i|mistakenly|corrected|instead of adding)\b", text, re.I))
+
+        if idx == 0 and guess_pattern.search(explanation):
             active_guess = True
             identified_gaps.append("Lucky guess: Selected answer without conceptual grounding or admitted guessing.")
             break
+
+        if not is_self_correction:
+            for pat, desc in misconception_patterns:
+                if pat.search(text) and desc not in identified_gaps:
+                    # If this misconception is in an older record, verify whether latest submission overcame it
+                    if idx > 0:
+                        latest_item = ev_records[0] if ev_records else {}
+                        latest_text = f"{latest_item.get('student_answer', '')} {latest_item.get('student_explanation', '')}"
+                        latest_self_corr = bool(re.search(r"\b(by mistake|earlier i|previously i|mistakenly|corrected|instead of adding)\b", latest_text, re.I))
+                        latest_has_misc = False
+                        if not latest_self_corr:
+                            latest_has_misc = any(p.search(latest_text) for p, _ in misconception_patterns)
+                        if latest_has_misc or latest_item.get("hints_used", 0) > 0 or latest_item.get("solution_revealed_first", False):
+                            identified_gaps.append(desc)
+                    else:
+                        identified_gaps.append(desc)
 
     # Check if latest answers are incorrect
     latest_item = ev_records[0] if ev_records else {}
@@ -360,6 +419,8 @@ def _deterministic_head_teacher_arbiter(
     prereqs = evidence_pkg.get("prerequisites", [])
     ev_records = evidence_pkg.get("evidence_records", [])
     follow_up_count = evidence_pkg.get("follow_up_count", 0)
+    effective_follow_ups = max(follow_up_count, max(0, len(ev_records) - 1))
+    circuit_breaker_tripped = (effective_follow_ups >= MAX_FOLLOW_UP_QUESTIONS)
 
     valid_refs = [r["evidence_id"] for r in ev_records if "evidence_id" in r]
 
@@ -402,8 +463,42 @@ def _deterministic_head_teacher_arbiter(
     latest_ans = str(latest_record.get("student_answer", "")).lower()
     latest_incorrect = "incorrect" in latest_ans or latest_record.get("solution_revealed_first", False)
 
-    if is_lucky_guess or (latest_incorrect and len(ev_records) == 1):
-        gap_msg = "Lucky guess: Admitted guessing or selected answer without conceptual grounding." if is_lucky_guess else "Incorrect response without conceptual mastery."
+    misconception_patterns = [
+        re.compile(r"(w\s*(?:new|_new)?\s*=\s*w\s*\+\s*(?:alpha|lr|learning_rate|step_size|\d+(\.\d+)?)\s*\*?\s*grad|direction\s+of\s+(?:the\s+)?gradient\s+to\s+reduce\s+loss)", re.I),
+        re.compile(r"(larger|increasing)\s+(the\s+)?learning\s+rate\s+(always\s+guarantees|always\s+makes|guarantees\s+faster|always\s+accelerates)", re.I),
+        re.compile(r"learning\s+rate\s+always\s+guarantees", re.I),
+    ]
+    is_self_correction = bool(re.search(r"\b(by mistake|earlier i|previously i|mistakenly|corrected|instead of adding)\b", f"{latest_ans} {latest_expl}", re.I))
+
+    has_active_misconception = False
+    misconception_msg = ""
+    if not is_self_correction:
+        for pat in misconception_patterns:
+            if pat.search(f"{latest_ans} {latest_expl}"):
+                has_active_misconception = True
+                if "w +" in f"{latest_ans} {latest_expl}" or "direction of" in f"{latest_ans} {latest_expl}":
+                    misconception_msg = "Sign/direction error: moves in direction of ascent (+ alpha * grad) rather than descent."
+                else:
+                    misconception_msg = "Flawed mental model: larger learning rate can cause loss divergence or overshooting, not guaranteed convergence."
+                break
+
+    misc_agent = next((a for a in assessments if a.agent_role == "misconception_detective"), None)
+    if not has_active_misconception and misc_agent and not is_self_correction:
+        if misc_agent.identified_gaps and any("no student" not in g.lower() and "no evidence" not in g.lower() for g in misc_agent.identified_gaps):
+            has_active_misconception = True
+            misconception_msg = misc_agent.identified_gaps[0]
+        elif "misconception" in misc_agent.findings.lower() and "no active misconceptions" not in misc_agent.findings.lower():
+            has_active_misconception = True
+            misconception_msg = "Identified cognitive misconception in recent submissions."
+
+    if is_lucky_guess or has_active_misconception or (latest_incorrect and len(ev_records) == 1):
+        if is_lucky_guess:
+            gap_msg = "Lucky guess: Admitted guessing or selected answer without conceptual grounding."
+        elif has_active_misconception:
+            gap_msg = misconception_msg or "Active misconception detected in student reasoning."
+        else:
+            gap_msg = "Incorrect response without conceptual mastery."
+
         return HeadTeacherDecision(
             concept_id=cid,
             outcome="NOT_YET_MASTERED",
@@ -412,11 +507,70 @@ def _deterministic_head_teacher_arbiter(
             demonstrated_understanding=[],
             remaining_gaps=[gap_msg] + [g for g in unique_gaps if g != gap_msg],
             unresolved_disagreements=[],
-            recommended_next_action="Provide Socratic reteach and targeted scaffolding.",
+            recommended_next_action=(misc_agent.recommended_action if misc_agent and misc_agent.recommended_action else "Provide targeted counter-example and Socratic reteach."),
             follow_up_question=None,
             evidence_version=len(ev_records),
-            explainable_summary=f"Misconception / lucky guess detected for '{cname}'. Classified as NOT_YET_MASTERED (WEAK). Remediation recommended.",
+            explainable_summary=f"Misconception / reasoning gap detected for '{cname}': {gap_msg}. Classified as NOT_YET_MASTERED (WEAK). Remediation recommended.",
         )
+
+    # Check for verbatim copy-paste or lack of independent application
+    teach_agent = next((a for a in assessments if a.agent_role == "teaching_agent"), None)
+    is_verbatim = False
+    if teach_agent:
+        is_verbatim = (
+            "verbatim" in teach_agent.findings.lower()
+            or "rote" in teach_agent.findings.lower()
+            or any("verbatim" in g.lower() or "rote" in g.lower() for g in teach_agent.identified_gaps)
+        )
+    if not is_verbatim:
+        ans_raw = str(latest_record.get("student_answer", "")).strip()
+        exp_raw = str(latest_record.get("student_explanation", "")).strip()
+        if (
+            (ans_raw and exp_raw and (ans_raw in exp_raw or exp_raw in ans_raw))
+            or "measures the discrepancy" in exp_raw.lower()
+            or "discrepancy between" in exp_raw.lower()
+        ) and latest_record.get("question_form") in ("recall", "quiz"):
+            is_verbatim = True
+
+    # Check cognitive forms tested: pure recall alone cannot establish mastery
+    tested_forms = {r.get("question_form", "quiz") for r in ev_records}
+    is_recall_only = (tested_forms == {"recall"})
+
+    if is_verbatim or is_recall_only:
+        if not circuit_breaker_tripped:
+            fu_q = {
+                "question_id": f"fu_{uuid.uuid4().hex[:8]}",
+                "question_text": f"In your own words, explain how {cname} works in an unfamiliar scenario without textbook definitions.",
+                "question_form": "application",
+                "concept_id": cid,
+            }
+            return HeadTeacherDecision(
+                concept_id=cid,
+                outcome="INSUFFICIENT_EVIDENCE",
+                legacy_status="UNKNOWN",
+                supporting_evidence_refs=valid_refs[:2],
+                demonstrated_understanding=[f"Textbook recall for {cname} demonstrated, but independent application is untested."],
+                remaining_gaps=["Verbatim copy-pasting or recall without demonstrated own-words understanding."],
+                unresolved_disagreements=[],
+                recommended_next_action="Administer unfamiliar transfer problem to test independent application.",
+                follow_up_question=fu_q,
+                evidence_version=len(ev_records),
+                explainable_summary=f"Verbatim textbook recall detected for '{cname}'. Reading or repeating an explanation is not evidence of understanding. Classified as INSUFFICIENT_EVIDENCE (UNKNOWN).",
+            )
+        else:
+            return HeadTeacherDecision(
+                concept_id=cid,
+                outcome="NOT_YET_MASTERED",
+                legacy_status="WEAK",
+                supporting_evidence_refs=valid_refs[:2],
+                demonstrated_understanding=[f"Textbook recall for {cname} demonstrated."],
+                remaining_gaps=["Follow-up probe quota reached without independent conceptual demonstration."],
+                unresolved_disagreements=[],
+                recommended_next_action="Provide comprehensive remedial reteach.",
+                follow_up_question=None,
+                evidence_version=len(ev_records),
+                explainable_summary=f"Follow-up quota reached for '{cname}'. Classified as NOT_YET_MASTERED (WEAK).",
+            )
 
     effective_attempts = evidence_pkg.get("attempt_count", len(ev_records))
 
@@ -427,11 +581,15 @@ def _deterministic_head_teacher_arbiter(
             guess_pattern.search(r.get("student_explanation", ""))
             or "incorrect" in str(r.get("student_answer", "")).lower()
             or r.get("hints_used", 0) > 0
+            or any(pat.search(f"{r.get('student_answer', '')} {r.get('student_explanation', '')}") for pat in misconception_patterns)
             for r in older_records
         )
         latest_clean = (
             not is_lucky_guess
             and not latest_incorrect
+            and not has_active_misconception
+            and not is_verbatim
+            and not is_recall_only
             and latest_record.get("hints_used", 0) == 0
             and not latest_record.get("solution_revealed_first", False)
         )
@@ -456,7 +614,7 @@ def _deterministic_head_teacher_arbiter(
 
     # 4. Rule: Missing / thin evidence (0 or 1 brief item, untested application)
     if effective_attempts <= 1:
-        if follow_up_count < MAX_FOLLOW_UP_QUESTIONS:
+        if not circuit_breaker_tripped:
             fu_q = {
                 "question_id": f"fu_{uuid.uuid4().hex[:8]}",
                 "question_text": f"In your own words, explain the core mechanism of {cname} and describe an unfamiliar scenario where it applies.",
@@ -469,7 +627,7 @@ def _deterministic_head_teacher_arbiter(
                 legacy_status="UNKNOWN",
                 supporting_evidence_refs=valid_refs[:2],
                 demonstrated_understanding=[f"Initial familiarity with {cname} demonstrated."],
-                remaining_gaps=["Evidence is thin (single unverified or surface attempt). Follow-up required."],
+                remaining_gaps=["Evidence lacks independent application across distinct cognitive forms. Follow-up required."],
                 unresolved_disagreements=[],
                 recommended_next_action="Administer follow-up application question.",
                 follow_up_question=fu_q,
@@ -478,7 +636,7 @@ def _deterministic_head_teacher_arbiter(
             )
         else:
             # Follow-up limit reached: make final decision
-            if not latest_incorrect and not is_lucky_guess:
+            if not latest_incorrect and not is_lucky_guess and not has_active_misconception and not is_verbatim and not is_recall_only:
                 return HeadTeacherDecision(
                     concept_id=cid,
                     outcome="MASTERED",
@@ -508,7 +666,32 @@ def _deterministic_head_teacher_arbiter(
                 )
 
     # 5. Rule: Multiple verified independent demonstrations without active misconceptions
-    if effective_attempts >= 2 and not latest_incorrect and not is_lucky_guess:
+    if (
+        effective_attempts >= 2
+        and not latest_incorrect
+        and not is_lucky_guess
+        and not has_active_misconception
+        and not is_verbatim
+        and not is_recall_only
+        and latest_record.get("hints_used", 0) == 0
+        and not latest_record.get("solution_revealed_first", False)
+    ):
+        return HeadTeacherDecision(
+            concept_id=cid,
+            outcome="MASTERED",
+            legacy_status="STRONG",
+            supporting_evidence_refs=valid_refs[:5],
+            demonstrated_understanding=[
+                f"Sustained conceptual comprehension of {cname} across multiple interactions.",
+                "Verified application and reasoning depth without reliance on hints.",
+            ],
+            remaining_gaps=[],
+            unresolved_disagreements=[],
+            recommended_next_action="Advance to subsequent concepts in prerequisite DAG.",
+            follow_up_question=None,
+            evidence_version=effective_attempts,
+            explainable_summary=f"Student has demonstrated sustained independent understanding and application of '{cname}' across multiple interactions. Concept MASTERED.",
+        )
         return HeadTeacherDecision(
             concept_id=cid,
             outcome="MASTERED",
@@ -627,6 +810,14 @@ def evaluate_concept_learning_evidence(
     uid = ev_dict.get("user_id") or user_id
     ev_dict["user_id"] = uid
     cid = ev_dict.get("concept_id", "")
+
+    # Guard against oversized payloads to prevent SequenceMatcher/regex ReDoS or OOM
+    if "student_explanation" in ev_dict and isinstance(ev_dict["student_explanation"], str) and len(ev_dict["student_explanation"]) > 4000:
+        ev_dict["student_explanation"] = ev_dict["student_explanation"][:4000]
+    if "student_answer" in ev_dict and isinstance(ev_dict["student_answer"], str) and len(ev_dict["student_answer"]) > 4000:
+        ev_dict["student_answer"] = ev_dict["student_answer"][:4000]
+    if "problem_solving_approach" in ev_dict and isinstance(ev_dict["problem_solving_approach"], str) and len(ev_dict["problem_solving_approach"]) > 4000:
+        ev_dict["problem_solving_approach"] = ev_dict["problem_solving_approach"][:4000]
 
     saved_evidence = store.save_learning_evidence(ev_dict)
 

@@ -548,6 +548,10 @@ def post_mastery_evaluate_evidence(
         else (req.user_id if req.user_id and req.user_id != "default" else (current_user.user_id if current_user else "default"))
     )
     req.user_id = uid
+    if req.student_explanation and len(req.student_explanation) > 4000:
+        req.student_explanation = req.student_explanation[:4000]
+    if req.student_answer and len(req.student_answer) > 4000:
+        req.student_answer = req.student_answer[:4000]
     decision, findings = mastery_orchestrator.evaluate_concept_learning_evidence(req, user_id=uid)
     return EvaluateEvidenceResponse(decision=decision, specialist_findings=findings)
 
