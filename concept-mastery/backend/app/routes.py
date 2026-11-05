@@ -826,7 +826,7 @@ class DiagnosticSubmitReq(BaseModel):
 @router.get("/loop/status/", include_in_schema=False)
 def get_loop_status(user_id: str = "default", current_user: User = Depends(get_current_user)):
     """Return closed-loop learning state, baseline diagnostic status, and concept count."""
-    uid = user_id if user_id != "default" else (current_user.user_id if current_user and current_user.user_id != "default" else "default")
+    uid = current_user.user_id
     kb = store.get_kb(uid)
     concepts_list = kb.get("concepts", []) if (kb and kb.get("ready")) else []
     if not concepts_list:
@@ -1061,7 +1061,7 @@ def get_study_materials(user_id: str = "default", current_user: User = Depends(g
 @router.get("/materials/{material_id}/preview/", response_model=StudyMaterialPreview)
 def get_study_material_preview(material_id: str, current_user: User = Depends(get_current_user)):
     """Return structured preview payload (pages, slides, timestamps, or reader view) for interactive inspection."""
-    mat = store.get_study_material(material_id)
+    mat = store.get_study_material(material_id, user_id=current_user.user_id)
     if not mat:
         raise HTTPException(status_code=404, detail=f"Study material '{material_id}' not found.")
     return StudyMaterialPreview(**mat)
@@ -1128,8 +1128,6 @@ def post_material_deep_audio(
     section_index = req.section_or_slide_index if req else 0
 
     mat = store.get_material(material_id, user_id=uid)
-    if not mat and uid != "default":
-        mat = store.get_material(material_id)
     if not mat:
         raise HTTPException(status_code=404, detail=f"Material '{material_id}' not found.")
 
