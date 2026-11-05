@@ -31,10 +31,12 @@ class ScreeningResult:
 # Strong phrase signals only. Do not flag isolated clinical terms such as
 # "breast", "penis", "vagina", "reproduction", "anatomy", or "sexual health".
 _EXPLICIT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("pornographic phrase", re.compile(r"\b(?:(?:hardcore|amateur|homemade)\s+)?porn(?:ography|ographic)?\b", re.I)),
-    ("explicit-content phrase", re.compile(r"\b(?:sexually explicit|explicit sexual (?:content|material|images?|videos?)|graphic sexual (?:content|material|images?|videos?)|sexual intercourse video)\b", re.I)),
-    ("sexual-act phrase", re.compile(r"\b(?:oral sex|anal sex|sexual acts? for arousal)\b", re.I)),
-    ("adult-content label", re.compile(r"\b(?:xxx|18\+\s*adult)\b", re.I)),
+    # Permit punctuation/spacing and common digit substitutions between letters
+    # so simple obfuscations (p.o.r.n, p0rn) do not bypass the text screen.
+    ("pornographic phrase", re.compile(r"\b(?:(?:hardcore|amateur|homemade)[\W_]+)?p[\W_]*[o0][\W_]*r[\W_]*n(?:[\W_]*(?:ography|ographic))?\b", re.I)),
+    ("explicit-content phrase", re.compile(r"\b(?:sexually[\W_]+explicit|explicit[\W_]+sexual[\W_]+(?:content|material|images?|videos?)|graphic[\W_]+sexual[\W_]+(?:content|material|images?|videos?)|sexual[\W_]+intercourse[\W_]+video)\b", re.I)),
+    ("sexual-act phrase", re.compile(r"\b(?:oral[\W_]+sex|anal[\W_]+sex|sexual[\W_]+acts?[\W_]+for[\W_]+arousal)\b", re.I)),
+    ("adult-content label", re.compile(r"\b(?:x[\W_]*x[\W_]*x|18\+[\W_]*adult)\b", re.I)),
 )
 _EDUCATIONAL_CONTEXT = re.compile(
     r"\b(?:medical|medicine|anatomy|physiology|histology|clinical|"
