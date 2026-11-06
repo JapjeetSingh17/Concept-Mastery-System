@@ -908,6 +908,7 @@
       AppState.studentName = res.user.full_name || res.user.email.split("@")[0];
       localStorage.setItem("cm_student_name", AppState.studentName);
       updateTopBarUser(AppState.currentUser);
+      await checkAndRefreshMedicalStatus();
       showAuthModal(false);
       showToast(`Welcome back, ${AppState.studentName}!`, "success");
       await syncActiveDocument();
@@ -924,6 +925,8 @@
     AppState.activeDoc = null;
     AppState.masteryList = [];
     AppState.graphData = null;
+    const badge = $("#medical-student-badge");
+    if (badge) badge.style.display = "none";
     updateTopBarUser(null);
     updateSidebarWidget({ ready: false, file: null });
     showToast("Signed out. Please sign in to resume studying.", "info");
@@ -933,6 +936,7 @@
 
   function initAuth() {
     updateTopBarUser(AppState.currentUser);
+    checkAndRefreshMedicalStatus();
 
     const logoutBtn = $("#logout-btn");
     if (logoutBtn) {
@@ -1064,7 +1068,138 @@
     renderMath(textEl);
   }
 
+  // ── SheerID Medical Verification Frontend State & Modal Handlers ─────────
+  let _pendingVerificationUpload = null;
+
+  function isMedicalVerificationRequired(err) {
+    if (!err) return false;
+    if (err.status === 403) return true;
+    if (err.code === "MEDICAL_VERIFICATION_REQUIRED") return true;
+    if (err.detail && typeof err.detail === "object" && err.detail.code === "MEDICAL_VERIFICATION_REQUIRED") return true;
+    const msg = String(err.message || "");
+    return msg.includes("MEDICAL_VERIFICATION_REQUIRED") || msg.includes("verified medical student");
+  }
+
+  async function checkAndRefreshMedicalStatus(notify = false) {
+    const badge = $("#medical-student-badge");
+    const statusText = $("#med-verif-status-text");
+    const retryBtn = $("#btn-retry-pending-upload");
+    const launchBtn = $("#btn-launch-sheerid");
+
+    try {
+      const res = await ApiService.getSheerIDStatus();
+      const isVerified = Boolean(res && (res.is_verified || res.status === "approved" || res.status === "verified"));
+      if (badge) {
+        badge.style.display = isVerified ? "inline-flex" : "none";
+      }
+      if (statusText) {
+        statusText.textContent = res ? res.status : "Unverified";
+        statusText.style.color = isVerified ? "#16a34a" : "#dc2626";
+      }
+      if (isVerified) {
+        if (_pendingVerificationUpload && retryBtn) {
+          retryBtn.style.display = "flex";
+          if (launchBtn) launchBtn.style.display = "none";
+        }
+        if (notify) showToast("✓ Verified Medical Student status confirmed!", "success");
+      } else {
+        if (retryBtn) retryBtn.style.display = "none";
+        if (launchBtn) launchBtn.style.display = "flex";
+        if (notify) showToast(`Verification status: ${res ? res.status : "pending"}`, "info");
+      }
+      return isVerified;
+    } catch (e) {
+      if (badge) badge.style.display = "none";
+      return false;
+    }
+  }
+
+  async function openMedicalVerificationModal(err = null) {
+    const modal = $("#medical-verification-modal");
+    if (!modal) return;
+    await checkAndRefreshMedicalStatus();
+    if (typeof modal.showModal === "function") {
+      if (!modal.open) modal.showModal();
+    } else {
+      modal.setAttribute("open", "");
+    }
+  }
+
+  function initMedicalVerificationModal() {
+    const modal = $("#medical-verification-modal");
+    const closeBtn = $("#medical-verification-modal-close");
+    const launchBtn = $("#btn-launch-sheerid");
+    const checkStatusBtn = $("#btn-check-med-status");
+    const retryBtn = $("#btn-retry-pending-upload");
+
+    if (closeBtn && modal) {
+      closeBtn.onclick = () => {
+        if (typeof modal.close === "function") modal.close();
+        else modal.removeAttribute("open");
+      };
+    }
+
+    if (checkStatusBtn) {
+      checkStatusBtn.onclick = async () => {
+        checkStatusBtn.disabled = true;
+        checkStatusBtn.textContent = "Checking...";
+        await checkAndRefreshMedicalStatus(true);
+        checkStatusBtn.disabled = false;
+        checkStatusBtn.textContent = "🔄 Refresh Status";
+      };
+    }
+
+    if (launchBtn) {
+      launchBtn.onclick = async () => {
+        try {
+          launchBtn.disabled = true;
+          launchBtn.textContent = "Initiating Session...";
+          const res = await ApiService.initiateSheerIDVerification();
+          const targetUrl = res.redirect_url || res.hosted_url || "https://services.sheerid.com/";
+          window.open(targetUrl, "_blank", "width=800,height=750");
+          showToast("SheerID verification window opened. Complete verification and click 'Refresh Status'.", "info");
+        } catch (e) {
+          showToast(`Could not open SheerID session: ${e.message}`, "danger");
+        } finally {
+          launchBtn.disabled = false;
+          launchBtn.textContent = "Verify with SheerID Portal";
+        }
+      };
+    }
+
+    if (retryBtn) {
+      retryBtn.onclick = async () => {
+        if (!_pendingVerificationUpload) return;
+        retryBtn.disabled = true;
+        retryBtn.textContent = "Retrying Ingestion...";
+        try {
+          if (_pendingVerificationUpload.type === "file") {
+            await ApiService.ingestMaterialFile(_pendingVerificationUpload.files, getCurrentUserId());
+            showToast("Material ingested successfully with verified medical access!", "success");
+          } else if (_pendingVerificationUpload.type === "url") {
+            const { url, sourceType, customTitle } = _pendingVerificationUpload;
+            await ApiService.ingestMaterialUrl(url, sourceType, getCurrentUserId(), customTitle);
+            showToast("URL material ingested successfully with verified medical access!", "success");
+          }
+          _pendingVerificationUpload = null;
+          if (modal) {
+            if (typeof modal.close === "function") modal.close();
+            else modal.removeAttribute("open");
+          }
+          await syncActiveDocument();
+          navigateTo("upload");
+        } catch (err) {
+          showToast(`Retry failed: ${err.message}`, "danger");
+        } finally {
+          retryBtn.disabled = false;
+          retryBtn.textContent = "✓ Resume Uploading Study Material";
+        }
+      };
+    }
+  }
+
   function initModals() {
+    initMedicalVerificationModal();
     const sourceClose = $("#source-modal-close");
     const sourceModal = $("#source-modal");
     if (sourceClose && sourceModal) {
@@ -3553,9 +3688,15 @@
             }, 800);
           } catch (err) {
             stages.forEach(s => s && (s.className = "stage-item"));
-            showToast(`Ingestion error: ${err.message}`, "danger");
+            if (isMedicalVerificationRequired(err)) {
+              _pendingVerificationUpload = { type: "file", files: selectedFiles };
+              showToast("Medical student verification required for this clinical material.", "warning");
+              openMedicalVerificationModal(err);
+            } else {
+              showToast(`Ingestion error: ${err.message}`, "danger");
+            }
             processBtn.disabled = false;
-            processBtn.textContent = "Retry Processing";
+            processBtn.textContent = "Process Study Material";
           }
         };
       }
@@ -3593,7 +3734,18 @@
             }, 800);
           } catch (err) {
             stages.forEach(s => s && (s.className = "stage-item"));
-            showToast(`Ingest URL error: ${err.message}`, "danger");
+            if (isMedicalVerificationRequired(err)) {
+              _pendingVerificationUpload = {
+                type: "url",
+                url: rawUrl,
+                sourceType: urlTypeSelect ? urlTypeSelect.value : "auto",
+                customTitle: urlTitleInput ? urlTitleInput.value.trim() : "",
+              };
+              showToast("Medical student verification required for this clinical material.", "warning");
+              openMedicalVerificationModal(err);
+            } else {
+              showToast(`Ingest URL error: ${err.message}`, "danger");
+            }
             ingestUrlBtn.disabled = false;
             ingestUrlBtn.textContent = "Ingest URL Source";
           }
