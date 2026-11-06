@@ -22,7 +22,15 @@ from pydantic import BaseModel
 
 from . import config
 from .core import store, tts
-from .core.content_safety import ContentDecision, extract_text_for_screening, screen_text
+from .core.content_safety import (
+    ContentDecision,
+    extract_text_for_screening,
+    screen_text,
+    screen_visual_content,
+    screen_text_async,
+)
+from .core.sheerid import DEFAULT_SHEERID_CLIENT, SheerIDError
+from .core.email_verification import DEFAULT_EMAIL_VERIFIER
 from .core.auth import get_current_user, create_access_token, verify_google_credential
 from .pipelines import ingest, tutor, quiz, mastery, recommend, loop, concepts, active_recall, notes, tools, mastery_orchestrator
 from .pipelines.concepts import export_graph
@@ -145,10 +153,27 @@ def get_auth_logs(current_user: User = Depends(get_current_user)):
     }
 
 
-# ── Medical-content access control ─────────────────────────────────────────
+# ── Medical-content access control & Verification ──────────────────────────
+
+class SheerIDInitiateRequest(BaseModel):
+    first_name: str = ""
+    last_name: str = ""
+    email: str = ""
+    birth_date: str | None = None
+    organization_name: str | None = None
+
+
+class EmailChallengeRequest(BaseModel):
+    email: str
+
+
+class EmailChallengeVerify(BaseModel):
+    email: str
+    code: str
+
 
 async def _enforce_content_policy(upload: UploadFile, user_id: str) -> None:
-    """Screen extracted document text before any content is persisted or indexed."""
+    """Screen extracted document text and visual elements before content is persisted or indexed."""
     if not upload.filename:
         raise HTTPException(status_code=400, detail="Uploaded file must have a filename.")
     raw = await upload.read()
@@ -159,25 +184,128 @@ async def _enforce_content_policy(upload: UploadFile, user_id: str) -> None:
         logger.warning("Could not screen uploaded file %s: %s", upload.filename, exc)
         raise HTTPException(
             status_code=422,
-            detail="This file could not be screened automatically. Upload a text-readable PDF/DOCX/PPTX/TXT/MD file or request manual review."
-        )
-    result = screen_text(extracted)
-    if result.decision == ContentDecision.REVIEW and not result.matched_signals:
-        raise HTTPException(
-            status_code=422,
-            detail="This file has no supported extractable text (for example, scanned PDFs or audio/video). It was not uploaded; manual moderation or OCR is required."
-        )
-    if result.matched_signals and not store.is_medical_verified(user_id):
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "MEDICAL_VERIFICATION_REQUIRED",
-                "message": "This material contains explicit-content signals. Only verified medical students can access it. Submit your medical student ID and institution-issued email for review.",
-                "verification_endpoint": "/api/auth/medical-verification",
-                "signals": list(result.matched_signals),
-            },
+            detail="This file could not be screened automatically. Upload a text-readable PDF/DOCX/PPTX/TXT/MD file."
         )
 
+    result = screen_text(extracted)
+    _vis_decision, _vis_msg, vis_signals = screen_visual_content(upload.filename, raw)
+
+    if result.decision == ContentDecision.REVIEW and not result.matched_signals and not vis_signals:
+        raise HTTPException(
+            status_code=422,
+            detail="This file has no supported extractable text or visual elements. It was not uploaded; text moderation or OCR is required."
+        )
+
+    all_signals = list(result.matched_signals) + list(vis_signals)
+    if result.decision == ContentDecision.RESTRICTED or (result.matched_signals and not store.is_medical_verified(user_id)):
+        if not store.is_medical_verified(user_id):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "MEDICAL_VERIFICATION_REQUIRED",
+                    "message": "This material contains explicit or clinical content. Access requires verified medical student status via SheerID.",
+                    "verification_endpoint": "/api/auth/sheerid/initiate",
+                    "signals": all_signals,
+                },
+            )
+
+
+# ── SheerID Medical Verification Endpoints ─────────────────────────────────
+
+@router.get("/auth/medical-verification")
+@router.get("/auth/sheerid/status")
+def get_medical_verification_status(current_user: User = Depends(get_current_user)):
+    """Return verified medical learner status and SheerID request details."""
+    request_record = store.get_medical_verification_request(current_user.user_id)
+    is_verified = store.is_medical_verified(current_user.user_id)
+    status = "approved" if is_verified else (request_record.get("status", "not_submitted") if request_record else "not_submitted")
+    return {
+        "status": status,
+        "is_verified": is_verified,
+        "provider": "sheerid",
+        "hosted_url": DEFAULT_SHEERID_CLIENT.get_hosted_url(current_user.user_id),
+        "request": request_record,
+    }
+
+
+@router.post("/auth/sheerid/initiate")
+async def initiate_sheerid_verification(
+    body: SheerIDInitiateRequest = Body(default_factory=SheerIDInitiateRequest),
+    current_user: User = Depends(get_current_user),
+):
+    """Initiate SheerID medical student verification session."""
+    email = (body.email or current_user.email).strip().lower()
+    first_name = body.first_name or current_user.full_name.split()[0] if current_user.full_name else "Student"
+    last_name = body.last_name or (current_user.full_name.split()[-1] if len(current_user.full_name.split()) > 1 else "Learner")
+
+    try:
+        res = await DEFAULT_SHEERID_CLIENT.initiate_verification(
+            user_id=current_user.user_id,
+            first_name=first_name,
+            last_name=last_name,
+            email=email,
+            birth_date=body.birth_date,
+            organization_name=body.organization_name,
+        )
+        return res
+    except SheerIDError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/auth/sheerid-webhook")
+async def sheerid_webhook(
+    request: Request,
+    x_sheerid_signature: str | None = Header(None),
+    x_sheerid_token: str | None = Header(None),
+):
+    """Authoritative SheerID webhook endpoint with signature verification, replay protection, and idempotent handling."""
+    raw_body = await request.body()
+    try:
+        result = await DEFAULT_SHEERID_CLIENT.process_webhook_event(
+            raw_payload=raw_body,
+            signature_header=x_sheerid_signature,
+            token_header=x_sheerid_token,
+        )
+        return {"ok": True, "result": result}
+    except SheerIDError as exc:
+        logger.warning("SheerID webhook processing rejected: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+# ── Institutional Email Mailbox Verification ────────────────────────────────
+
+@router.post("/auth/email-verification/request")
+def request_email_verification(
+    body: EmailChallengeRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Request verification OTP for an institutional mailbox."""
+    try:
+        return DEFAULT_EMAIL_VERIFIER.send_verification_challenge(
+            user_id=current_user.user_id,
+            email=body.email,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/auth/email-verification/verify")
+def verify_email_code(
+    body: EmailChallengeVerify,
+    current_user: User = Depends(get_current_user),
+):
+    """Verify submitted OTP code proving mailbox control."""
+    res = DEFAULT_EMAIL_VERIFIER.verify_challenge(
+        user_id=current_user.user_id,
+        email=body.email,
+        submitted_code=body.code,
+    )
+    if not res.get("verified"):
+        raise HTTPException(status_code=400, detail=res.get("reason", "Verification failed."))
+    return res
+
+
+# ── Safe Admin Verification Inspection (No ID Cards) ───────────────────────
 
 def _require_verification_reviewer(token: str | None) -> None:
     expected = config.MEDICAL_VERIFICATION_REVIEW_TOKEN
@@ -185,122 +313,13 @@ def _require_verification_reviewer(token: str | None) -> None:
         raise HTTPException(status_code=403, detail="Authorized verification reviewer access is required.")
 
 
-class MedicalVerificationReview(BaseModel):
-    status: Literal["verified", "rejected"]
-    notes: str = ""
-
-
-@router.get("/auth/medical-verification")
-def get_medical_verification_status(current_user: User = Depends(get_current_user)):
-    request_record = store.get_medical_verification_request(current_user.user_id)
-    return {
-        "status": request_record.get("status", "not_submitted") if request_record else "not_submitted",
-        "request": request_record,
-    }
-
-
-@router.post("/auth/medical-verification")
-async def submit_medical_verification(
-    institution: str = Form(...),
-    program: str = Form(...),
-    educational_email: str = Form(...),
-    id_card: UploadFile = File(...),
-    current_user: User = Depends(get_current_user),
-):
-    """Submit a medical ID card and institution email for manual verification."""
-    if not institution.strip() or not program.strip():
-        raise HTTPException(status_code=400, detail="Institution and medical program are required.")
-    email = educational_email.strip().lower()
-    if "@" not in email or "." not in email.rsplit("@", 1)[-1]:
-        raise HTTPException(status_code=400, detail="Enter a valid institution-issued email address.")
-    if email.endswith(("@gmail.com", "@yahoo.com", "@outlook.com", "@hotmail.com")):
-        raise HTTPException(status_code=400, detail="Use an institution-issued educational email, not a public email provider.")
-    suffix = Path(id_card.filename or "").suffix.lower()
-    if suffix not in {".png", ".jpg", ".jpeg", ".pdf"}:
-        raise HTTPException(status_code=400, detail="Student ID must be a PNG, JPG, or PDF file.")
-    evidence = await id_card.read()
-    if not evidence or len(evidence) > 5 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="Student ID file must be between 1 byte and 5 MB.")
-    if suffix == ".pdf" and not evidence.startswith(b"%PDF"):
-        raise HTTPException(status_code=400, detail="The uploaded ID does not appear to be a valid PDF.")
-    if suffix == ".png" and not evidence.startswith(bytes([137, 80, 78, 71])):
-        raise HTTPException(status_code=400, detail="The uploaded ID does not appear to be a valid PNG image.")
-    if suffix in {".jpg", ".jpeg"} and not evidence.startswith(bytes([255, 216, 255])):
-        raise HTTPException(status_code=400, detail="The uploaded ID does not appear to be a valid JPEG image.")
-    previous = next((r for r in store.list_medical_verification_requests() if r["user_id"] == current_user.user_id), None)
-    stored_name = f"{uuid.uuid4().hex}{suffix}"
-    evidence_path = config.MEDICAL_VERIFICATION_DIR / stored_name
-    evidence_path.write_bytes(evidence)
-    try:
-        evidence_path.chmod(0o600)
-    except OSError:
-        pass
-    store.submit_medical_verification_request(
-        user_id=current_user.user_id,
-        institution=institution.strip()[:200],
-        program=program.strip()[:160],
-        educational_email=email,
-        id_card_filename=stored_name,
-    )
-    if previous:
-        old_path = config.MEDICAL_VERIFICATION_DIR / Path(previous["id_card_filename"]).name
-        if old_path != evidence_path:
-            old_path.unlink(missing_ok=True)
-    return {
-        "ok": True,
-        "status": "pending",
-        "message": "Your request is pending manual review. Access remains restricted until the ID card and institution email are checked.",
-    }
-
-
 @router.get("/admin/medical-verification")
 def list_medical_verification_requests(
     x_verification_review_token: str | None = Header(None),
 ):
+    """List verification status audits without exposing identity document files."""
     _require_verification_reviewer(x_verification_review_token)
     return {"requests": store.list_medical_verification_requests()}
-
-
-@router.get("/admin/medical-verification/{user_id}/id-card")
-def get_medical_verification_id_card(
-    user_id: str,
-    x_verification_review_token: str | None = Header(None),
-):
-    _require_verification_reviewer(x_verification_review_token)
-    record = next((r for r in store.list_medical_verification_requests() if r["user_id"] == user_id), None)
-    if not record:
-        raise HTTPException(status_code=404, detail="Verification request not found.")
-    safe_name = Path(record["id_card_filename"]).name
-    path = (config.MEDICAL_VERIFICATION_DIR / safe_name).resolve()
-    if path.parent != config.MEDICAL_VERIFICATION_DIR.resolve() or not path.is_file():
-        raise HTTPException(status_code=404, detail="ID evidence not found.")
-    media_type = "application/pdf" if path.suffix.lower() == ".pdf" else "image/jpeg"
-    if path.suffix.lower() == ".png":
-        media_type = "image/png"
-    return FileResponse(str(path), media_type=media_type, filename="medical-student-id" + path.suffix)
-
-
-@router.post("/admin/medical-verification/{user_id}/review")
-def review_medical_verification(
-    user_id: str,
-    body: MedicalVerificationReview,
-    x_verification_review_token: str | None = Header(None),
-):
-    _require_verification_reviewer(x_verification_review_token)
-    record = next((r for r in store.list_medical_verification_requests() if r["user_id"] == user_id), None)
-    reviewed = store.review_medical_verification_request(
-        user_id=user_id,
-        status=body.status,
-        reviewer="configured-verification-reviewer",
-        notes=body.notes,
-    )
-    if record:
-        evidence_path = (config.MEDICAL_VERIFICATION_DIR / Path(record["id_card_filename"]).name).resolve()
-        if evidence_path.parent == config.MEDICAL_VERIFICATION_DIR.resolve():
-            evidence_path.unlink(missing_ok=True)
-    if not reviewed:
-        raise HTTPException(status_code=404, detail="Verification request not found.")
-    return {"ok": True, "request": reviewed}
 
 
 # ── 1. Document Ingestion & Vectorless Index ───────────────────────────────
@@ -1055,8 +1074,8 @@ async def post_materials_ingest_url(req: IngestUrlRequest, current_user: User = 
                 status_code=403,
                 detail={
                     "code": "MEDICAL_VERIFICATION_REQUIRED",
-                    "message": "This material contains explicit-content signals. Only verified medical students can access it. Submit your medical student ID and institution-issued email for review.",
-                    "verification_endpoint": "/api/auth/medical-verification",
+                    "message": "This material contains explicit or clinical content. Access requires verified medical student status via SheerID.",
+                    "verification_endpoint": "/api/auth/sheerid/initiate",
                     "signals": list(screening.matched_signals),
                 },
             )
@@ -1105,9 +1124,10 @@ def get_study_materials(user_id: str = "default", current_user: User = Depends(g
 
 @router.get("/materials/{material_id}/preview", response_model=StudyMaterialPreview)
 @router.get("/materials/{material_id}/preview/", response_model=StudyMaterialPreview)
-def get_study_material_preview(material_id: str, current_user: User = Depends(get_current_user)):
+def get_study_material_preview(material_id: str, user_id: str | None = None, current_user: User = Depends(get_current_user)):
     """Return structured preview payload (pages, slides, timestamps, or reader view) for interactive inspection."""
-    mat = store.get_study_material(material_id, user_id=current_user.user_id)
+    uid = user_id if (user_id and user_id != "default") else (current_user.user_id if (current_user and current_user.user_id != "default") else None)
+    mat = store.get_study_material(material_id, user_id=uid)
     if not mat:
         raise HTTPException(status_code=404, detail=f"Study material '{material_id}' not found.")
     return StudyMaterialPreview(**mat)

@@ -23,6 +23,15 @@ MEDICAL_VERIFICATION_REVIEW_TOKEN = _e("MEDICAL_VERIFICATION_REVIEW_TOKEN", "")
 FRONTEND_DIR = (BASE.parent / "frontend").resolve()
 SYNONYMS_FILE = BASE / "synonyms.json"
 
+# Medical & Content Moderation Config
+SHEERID_API_KEY = _e("SHEERID_API_KEY", "")
+SHEERID_PROGRAM_ID = _e("SHEERID_PROGRAM_ID", "")
+SHEERID_WEBHOOK_SECRET = _e("SHEERID_WEBHOOK_SECRET", "")
+SHEERID_BASE_URL = _e("SHEERID_BASE_URL", "https://services.sheerid.com/rest/v2")
+OPENAI_MODERATION_API_KEY = _e("OPENAI_MODERATION_API_KEY", _e("OPENAI_API_KEY", ""))
+OPENAI_MODERATION_URL = _e("OPENAI_MODERATION_URL", "https://api.openai.com/v1/moderations")
+EMAIL_VERIFICATION_SECRET = _e("EMAIL_VERIFICATION_SECRET", "email-verify-secret-key-salt")
+
 # PageIndex API
 PAGEINDEX_API_KEY = _e("PAGEINDEX_API_KEY", "")
 
@@ -67,8 +76,13 @@ ELEVENLABS_VOICE_ID = _e("ELEVENLABS_VOICE_ID", "JBFqnCBsd6RMkjVDRZzb")
 GENERATED_ARTIFACTS_DIR = (BASE / "generated_artifacts").resolve()
 GENERATED_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Direct OpenAI API
+OPENAI_API_KEY = _e("OPENAI_API_KEY", "")
+
 # Legacy / Generic Provider
-LLM_PROVIDER, LLM_API_KEY, LLM_MODEL = _e("LLM_PROVIDER", "openai").lower(), _e("LLM_API_KEY"), _e("LLM_MODEL")
+LLM_PROVIDER = _e("LLM_PROVIDER", "openai").lower()
+LLM_API_KEY = _e("LLM_API_KEY", OPENAI_API_KEY)
+LLM_MODEL = _e("LLM_MODEL", "gpt-4o-mini")
 LLM_BASE_URL = _e("LLM_BASE_URL", "https://api.openai.com/v1")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 VECTOR_STORE_PATH.mkdir(parents=True, exist_ok=True)
