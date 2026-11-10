@@ -26,6 +26,20 @@ _STATE = {
 }
 
 
+def reset_exhaustion_state():
+    """Reset provider exhaustion flags."""
+    _STATE["openrouter_exhausted"] = False
+    _STATE["gemini_exhausted"] = False
+    _STATE["groq_exhausted"] = False
+
+
+OPENROUTER_SLUG_ALIASES = {
+    "deepseek/deepseek-chat-v3-0324:free": "deepseek/deepseek-chat",
+    "meta-llama/llama-3.3-70b-instruct:free": "meta-llama/llama-3.3-70b-instruct",
+    "google/gemini-flash-1.5": "google/gemini-2.5-flash",
+}
+
+
 def is_offline() -> bool:
     """Return True if offline test mode is active."""
     if os.getenv("OPENROUTER_LIVE"):
@@ -88,7 +102,7 @@ def extract_json_payload(text: str) -> str:
 
 
 def _call_openrouter(system: str, user: str, max_tokens: int = 700) -> Optional[str]:
-    """Call OpenRouter Gateway with native auto-failover routing and model batching."""
+    """Call OpenRouter Gateway with automated per-model client-side failover."""
     if not config.OPENROUTER_API_KEY or _STATE["openrouter_exhausted"]:
         return None
 
@@ -101,60 +115,105 @@ def _call_openrouter(system: str, user: str, max_tokens: int = 700) -> Optional[
         "Content-Type": "application/json",
     }
 
-    models_pool = config.OPENROUTER_MODELS if config.OPENROUTER_MODELS else [config.OPENROUTER_PRIMARY_MODEL]
-    # OpenRouter limits 'models' array in fallback route to <= 3 items.
-    # We partition OPENROUTER_MODELS into sequential fallback batches of <= 3.
-    batches = [models_pool[i:i + 3] for i in range(0, len(models_pool), 3)]
+    models_pool = list(config.OPENROUTER_MODELS) if config.OPENROUTER_MODELS else [config.OPENROUTER_PRIMARY_MODEL]
 
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": user})
+    is_json = "json" in (system + " " + user).lower()
 
-    for batch_idx, batch in enumerate(batches, 1):
+    # Expand candidate models including aliases
+    candidate_models = []
+    for m in models_pool:
+        if m not in candidate_models:
+            candidate_models.append(m)
+        alias = OPENROUTER_SLUG_ALIASES.get(m)
+        if alias and alias not in candidate_models:
+            candidate_models.append(alias)
+
+    for idx, model in enumerate(candidate_models, 1):
         payload = {
-            "model": batch[0],
-            "models": batch,
-            "route": "fallback",
+            "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": 0.4,
         }
+        if is_json:
+            payload["response_format"] = {"type": "json_object"}
 
-        try:
-            r = httpx.post(
-                f"{config.OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=25.0,
-            )
-
-            # Check for quota exhaustion / rate limiting
-            if r.status_code in (429, 403) or "rate_limit_exceeded" in r.text:
-                logger.warning(
-                    f"OpenRouter rate limit / quota exceeded on batch {batch_idx} ({r.status_code})."
+        for attempt in (1, 2):
+            try:
+                # Per-model timeout: 8s so a hanging model doesn't stall the system
+                r = httpx.post(
+                    f"{config.OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=8.0,
                 )
-                continue
 
-            if r.status_code == 200:
-                data = r.json()
-                choices = data.get("choices", [])
-                if choices and "message" in choices[0]:
-                    content = choices[0]["message"].get("content", "")
-                    if content:
-                        logger.info(
-                            f"OpenRouter answered successfully via model: {data.get('model', batch[0])}"
-                        )
-                        return content.strip()
-            else:
+                if r.status_code == 200:
+                    data = r.json()
+                    choices = data.get("choices", [])
+                    if choices and "message" in choices[0]:
+                        msg = choices[0]["message"]
+                        content = msg.get("content") or msg.get("reasoning") or ""
+                        if content:
+                            resolved = data.get("model", model)
+                            logger.info(f"OpenRouter answered successfully via model: {resolved}")
+                            return content.strip()
+
+                # If 400 Bad Request, check if it's due to response_format
+                if r.status_code == 400 and attempt == 1 and "response_format" in payload:
+                    logger.info(f"OpenRouter model {model} rejected response_format; retrying without it...")
+                    payload.pop("response_format", None)
+                    continue
+
+                # Handle 402 Payment Required / Insufficient credits
+                if r.status_code == 402:
+                    logger.warning(
+                        f"[OpenRouter Failover] Model '{model}' returned 402 (Payment Required / Credit Exhausted). "
+                        f"Automatically switching to next model in priority chain..."
+                    )
+                    break
+
+                # Handle 404 Model Not Found / Retired
+                if r.status_code == 404:
+                    logger.warning(
+                        f"[OpenRouter Failover] Model '{model}' returned 404 (Retired/Unavailable). "
+                        f"Automatically switching to next model..."
+                    )
+                    break
+
+                # Handle 429/403 Rate Limit / Quota Exceeded
+                if r.status_code in (429, 403) or "rate_limit" in r.text.lower():
+                    logger.warning(
+                        f"[OpenRouter Failover] Model '{model}' returned {r.status_code} (Rate Limit). "
+                        f"Automatically switching to next model..."
+                    )
+                    break
+
+                # Other HTTP errors (5xx, etc.)
                 logger.warning(
-                    f"OpenRouter batch {batch_idx} returned {r.status_code}: {r.text[:120]}"
+                    f"[OpenRouter Failover] Model '{model}' returned HTTP {r.status_code}: {r.text[:120]}. "
+                    f"Switching to next model..."
                 )
-        except Exception as e:
-            logger.warning(f"OpenRouter batch {batch_idx} request failed ({e})")
+                break
 
-    logger.warning("All OpenRouter model fallback batches failed. Marking OpenRouter as exhausted.")
-    _STATE["openrouter_exhausted"] = True
+            except httpx.TimeoutException:
+                logger.warning(
+                    f"[OpenRouter Failover] Model '{model}' timed out after 8.0s. "
+                    f"Automatically switching to next model..."
+                )
+                break
+            except Exception as e:
+                logger.warning(
+                    f"[OpenRouter Failover] Model '{model}' request failed ({e}). "
+                    f"Switching to next model..."
+                )
+                break
+
+    logger.warning("All OpenRouter models failed or exhausted. Cascading to downstream providers...")
     return None
 
 

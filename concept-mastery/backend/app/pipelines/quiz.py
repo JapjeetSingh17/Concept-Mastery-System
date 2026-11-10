@@ -22,7 +22,7 @@ from typing import List, Tuple, Literal, Optional
 
 from ..core import store, llm
 from ..core.concept_index import GLOBAL_INDEX
-from ..core.text import sentences, tokens, normalize
+from ..core.text import sentences, tokens, normalize, STOP, GENERIC_NON_CONCEPTS
 from ..models.schemas import QuizQuestion, QuizSubmission, QuizResult
 from . import mastery
 from .concepts import pattern
@@ -255,13 +255,17 @@ def generate_diagnostic_quiz(
     count: int = 3,
     question_types: list[str] | None = None,
     user_id: str = "default",
+    chunks: list | None = None,
+    kb: dict | None = None,
+    offset: int | None = None
 ) -> list[QuizQuestion]:
     """Generate diagnostic assessment items strictly from vectorless chunks for concept_id.
     
     Produces a balanced mix across question types (MCQ, Fill-in-the-Blanks, Typed Q&A, and Numerical).
     Guarantees non-duplicate question variants across repeated calls per user and concept.
     """
-    kb = store.require(user_id=user_id)
+    if kb is None:
+        kb = store.require(user_id=user_id)
     by_id = {c["id"]: c for c in kb["concepts"]}
     concept = by_id.get(concept_id)
     if not concept:
@@ -270,7 +274,7 @@ def generate_diagnostic_quiz(
     history_key = f"{user_id}:{concept_id}"
     prior_served = SERVED_QUESTIONS.setdefault(history_key, [])
     prior_sentences = SERVED_SENTENCES.setdefault(history_key, set())
-    offset = len(prior_served)
+    calc_offset = offset if offset is not None else len(prior_served)
 
     # Determine desired question types
     if question_types:
@@ -283,20 +287,21 @@ def generate_diagnostic_quiz(
         cycle_types = ["mcq", "fill_in_the_blanks", "typed_qa"]
         target_types = [cycle_types[i % len(cycle_types)] for i in range(count)]
 
-    # 1. Retrieve vectorless chunks for this concept
-    chunks = GLOBAL_INDEX.retrieve_chunks(concept_id, max_chunks=3, user_id=user_id)
-    if not chunks and "index" in kb and kb["index"]:
-        all_chunks = getattr(kb["index"], "chunks", [])
-        chunks = [
-            type("ChunkMeta", (), {
-                "chunk_id": str(all_chunks[j]["id"]),
-                "page_number": all_chunks[j]["page"],
-                "section_title": all_chunks[j]["section"],
-                "text": all_chunks[j]["text"],
-            })()
-            for j in concept.get("chunks", [])[:3]
-            if j < len(all_chunks)
-        ]
+    # 1. Retrieve vectorless chunks for this concept if not provided
+    if chunks is None:
+        chunks = GLOBAL_INDEX.retrieve_chunks(concept_id, max_chunks=3, user_id=user_id)
+        if not chunks and "index" in kb and kb["index"]:
+            all_chunks = getattr(kb["index"], "chunks", [])
+            chunks = [
+                type("ChunkMeta", (), {
+                    "chunk_id": str(all_chunks[j]["id"]),
+                    "page_number": all_chunks[j]["page"],
+                    "section_title": all_chunks[j]["section"],
+                    "text": all_chunks[j]["text"],
+                })()
+                for j in concept.get("chunks", [])[:3]
+                if j < len(all_chunks)
+            ]
 
     if not chunks:
         raise store.UserError(f"No textual material available to generate questions for {concept['name']}.")
@@ -307,10 +312,18 @@ def generate_diagnostic_quiz(
     if llm.enabled():
         ctx_text = "\n\n".join(f"[{getattr(c, 'locator_label', None) or f'Page {c.page_number}'}] {c.text}" for c in chunks)
         system_prompt = (
-            "You are a psychometric assessment designer. Generate diverse diagnostic assessment items "
-            "strictly grounded in the provided textbook context. Support four question types:\n"
-            "  - 'mcq': Multiple-choice with 4 plausible options\n"
-            "  - 'fill_in_the_blanks': A cloze sentence containing '_____' with 'target_blank_answer'\n"
+            "You are a rigorous psychometric assessment designer for advanced technical education. "
+            "Generate high-signal diagnostic assessment items strictly grounded in the provided textbook context.\n\n"
+            "CRITICAL PEDAGOGICAL ANTI-BIAS RULES:\n"
+            "1. For 'mcq' questions, the correct option and distractors MUST BE DETAILED MECHANISMS, PROPERTIES, OR RUNTIMES.\n"
+            "2. THE CORRECT OPTION FOR MCQ MUST NEVER BE THE CONCEPT NAME ITSELF! (e.g., if testing 'Array', the correct answer "
+            "must NEVER simply be 'Array' or a concept title. Instead, it must be the accurate operational mechanism or invariant, "
+            "such as 'Allocates contiguous memory cells allowing O(1) random access via base address arithmetic').\n"
+            "3. Distractors must be plausible technical alternatives or common student misconceptions.\n"
+            "4. For 'fill_in_the_blanks', blank out an essential operational keyword, complexity, or property, NOT the concept name.\n"
+            "Support four question types:\n"
+            "  - 'mcq': Multiple-choice with 4 substantive mechanism options\n"
+            "  - 'fill_in_the_blanks': A cloze sentence containing '_____' testing an essential property/mechanism word\n"
             "  - 'typed_qa': An open-ended question testing conceptual mechanisms, with a 'rubric' and 'key_terms'\n"
             "  - 'numerical': A parameter calculation question with 'given_parameters', 'formula_hint', 'correct_numeric_answer', and 'step_by_step_solution'\n"
             "Reply strictly with a valid JSON array only."
@@ -329,9 +342,9 @@ def generate_diagnostic_quiz(
             f'  {{\n'
             f'    "question_type": "mcq" | "fill_in_the_blanks" | "typed_qa" | "numerical",\n'
             f'    "question_text": "<clear prompt, cloze sentence, or numerical problem>",\n'
-            f'    "options": ["<option 0>", "<option 1>", "<option 2>", "<option 3>"] (only for mcq, [] otherwise),\n'
+            f'    "options": ["<substantive option 0>", "<substantive option 1>", "<substantive option 2>", "<substantive option 3>"] (only for mcq, [] otherwise. NEVER use just concept names),\n'
             f'    "correct_option_idx": <0-3> (only for mcq, 0 otherwise),\n'
-            f'    "target_blank_answer": "<exact missing term>" (only for fill_in_the_blanks, "" otherwise),\n'
+            f'    "target_blank_answer": "<exact missing property or term>" (only for fill_in_the_blanks, "" otherwise),\n'
             f'    "rubric": "<evaluation criteria for typed_qa>" (only for typed_qa, "" otherwise),\n'
             f'    "key_terms": ["<term 1>", "<term 2>"] (only for typed_qa, [] otherwise),\n'
             f'    "given_parameters": {{"param1": 1.0}} (only for numerical, null otherwise),\n'
@@ -352,10 +365,19 @@ def generate_diagnostic_quiz(
             if raw:
                 clean_json = llm.extract_json_payload(raw)
                 arr = json.loads(clean_json)
+                c_name_lower = concept["name"].lower().strip()
                 for item in arr:
                     q_type = str(item.get("question_type", "mcq")).lower()
                     if q_type not in ("mcq", "fill_in_the_blanks", "typed_qa", "numerical"):
                         q_type = "mcq"
+
+                    # Anti-bias verification: reject MCQs where the correct option is just the concept name
+                    opts = [str(opt).strip() for opt in item.get("options", [])]
+                    c_idx = int(item.get("correct_option_idx", 0))
+                    if q_type == "mcq" and opts and 0 <= c_idx < len(opts):
+                        if opts[c_idx].lower().strip() == c_name_lower:
+                            # Rephrase or skip invalid trivial item
+                            continue
 
                     qid = f"diag_{uuid.uuid4().hex[:8]}"
                     params = item.get("given_parameters")
@@ -375,8 +397,8 @@ def generate_diagnostic_quiz(
                         concept_id=concept_id,
                         question_type=q_type,
                         question_text=str(item["question_text"]).strip(),
-                        options=[str(opt).strip() for opt in item.get("options", [])],
-                        correct_option_idx=int(item.get("correct_option_idx", 0)),
+                        options=opts,
+                        correct_option_idx=c_idx,
                         target_blank_answer=str(item.get("target_blank_answer", "")).strip(),
                         rubric=str(item.get("rubric", "")).strip(),
                         key_terms=[str(t).strip() for t in item.get("key_terms", [])],
@@ -403,12 +425,15 @@ def generate_diagnostic_quiz(
         distractor_pool = other_concepts if len(other_concepts) >= 3 else ["Optimization", "Overfitting", "Gradient", "Loss"]
 
         # Rotate starting chunk to ensure varied context across calls
-        chunk_start = offset % max(len(chunks), 1)
+        chunk_start = calc_offset % max(len(chunks), 1)
         ordered_chunks = chunks[chunk_start:] + chunks[:chunk_start]
 
-        for chunk in ordered_chunks:
-            if len(questions) >= count:
-                break
+        cycle_limit = 0
+        while len(questions) < count and cycle_limit < 5:
+            cycle_limit += 1
+            for chunk in ordered_chunks:
+                if len(questions) >= count:
+                    break
             
             chunk_sentences = sentences(chunk.text)
             matched_sentences = [s for s in chunk_sentences if pat.search(s) and 8 <= len(s.split()) <= 40]
@@ -423,7 +448,7 @@ def generate_diagnostic_quiz(
                 fresh_sentences = matched_sentences
 
             # Rotate starting sentence
-            sent_start = offset % max(len(fresh_sentences), 1)
+            sent_start = calc_offset % max(len(fresh_sentences), 1)
             ordered_sentences = fresh_sentences[sent_start:] + fresh_sentences[:sent_start]
 
             for sent in ordered_sentences:
@@ -435,18 +460,31 @@ def generate_diagnostic_quiz(
 
                 loc = getattr(chunk, "locator_label", None) or f"Page {chunk.page_number}"
                 if desired_type == "fill_in_the_blanks":
-                    masked_text = pat.sub("_____", sent) if pat.search(sent) else f"{sent.rsplit(' ', 3)[0]} _____."
+                    c_name_lower = concept["name"].lower()
+                    words_in_sent = [
+                        w for w in re.findall(r"[A-Za-z0-9\-]+", sent)
+                        if len(w) >= 4 and w.lower() not in STOP and w.lower() not in GENERIC_NON_CONCEPTS
+                        and c_name_lower not in w.lower() and w.lower() not in c_name_lower
+                    ]
+                    if words_in_sent:
+                        target_blank = max(words_in_sent, key=len)
+                        b_pat = re.compile(r"\b" + re.escape(target_blank) + r"\b", re.I)
+                        masked_text = b_pat.sub("_____", sent, count=1)
+                    else:
+                        target_blank = concept["name"]
+                        masked_text = pat.sub("_____", sent) if pat.search(sent) else f"{sent.rsplit(' ', 2)[0]} _____."
+
                     q = QuizQuestion(
                         question_id=qid,
                         concept_id=concept_id,
                         question_type="fill_in_the_blanks",
-                        question_text=f"Fill in the blank: \"{masked_text}\"",
+                        question_text=f"Complete the core mechanism of {concept['name']}: \"{masked_text}\"",
                         options=[],
                         correct_option_idx=0,
-                        target_blank_answer=concept["name"],
-                        rubric=f"Accepts '{concept['name']}' or exact canonical concept variations.",
-                        key_terms=[concept["name"].lower()],
-                        explanation=f"Correct keyword is '{concept['name']}'. Source sentence: {sent} (p. {chunk.page_number}) [{loc}]",
+                        target_blank_answer=target_blank,
+                        rubric=f"Accepts '{target_blank}' or close technical equivalents.",
+                        key_terms=[target_blank.lower()],
+                        explanation=f"Missing term is '{target_blank}'. Grounding sentence: {sent} (p. {chunk.page_number}) [{loc}]",
                         source_page=chunk.page_number,
                     )
                 elif desired_type == "typed_qa":
@@ -471,22 +509,53 @@ def generate_diagnostic_quiz(
                         source_page=chunk.page_number,
                     )
                 else:  # MCQ
-                    masked_text = pat.sub("_____", sent) if pat.search(sent) else f"{sent.rsplit(' ', 2)[0]} _____."
-                    options = random.sample(distractor_pool, 3) + [concept["name"]]
+                    # Never have concept["name"] as the correct option or distractors.
+                    # Formulate an operational mechanism question where options are substantive statements.
+                    mcq_stems = [
+                        f"Regarding {concept['name']}, which statement accurately describes its operational mechanism according to the study material?",
+                        f"In the context of {concept['name']}, which of the following best characterizes its computational principle or governing rule?",
+                        f"Which of the following statements correctly identifies how {concept['name']} functions within this curriculum?",
+                        f"When analyzing {concept['name']}, which operational property is verified by the study material?",
+                    ]
+                    question_text = mcq_stems[(calc_offset + len(questions)) % len(mcq_stems)]
+                    correct_opt = sent.strip()
+                    if not correct_opt.endswith((".", ";", "!")):
+                        correct_opt += "."
+
+                    d1 = f"Operates via non-contiguous pointer linking, requiring linear traversal for state retrieval."
+                    d2 = f"Executes unconstrained state transformations without preserving boundary invariance guarantees."
+                    d3 = f"Requires global re-indexing and quadratic space reallocation on each intermediate evaluation."
+
+                    alt_statements = []
+                    for oc in chunks:
+                        if oc != chunk:
+                            for osent in sentences(oc.text):
+                                if 10 <= len(osent.split()) <= 30 and osent != sent and not pat.search(osent):
+                                    alt_statements.append(osent.strip())
+                                    if len(alt_statements) >= 2:
+                                        break
+                    if len(alt_statements) >= 2:
+                        d1 = alt_statements[0]
+                        d2 = alt_statements[1]
+                    elif len(alt_statements) == 1:
+                        d1 = alt_statements[0]
+
+                    distractors = [d1, d2, d3]
+                    options = [correct_opt] + distractors
                     random.shuffle(options)
-                    correct_idx = options.index(concept["name"])
+                    correct_idx = options.index(correct_opt)
 
                     q = QuizQuestion(
                         question_id=qid,
                         concept_id=concept_id,
                         question_type="mcq",
-                        question_text=f"Which core concept completes this statement? \u201c{masked_text}\u201d",
+                        question_text=question_text,
                         options=options,
                         correct_option_idx=correct_idx,
                         target_blank_answer="",
                         rubric="",
                         key_terms=[],
-                        explanation=f"{sent} (p. {chunk.page_number}) [{loc}]",
+                        explanation=f"Grounded statement: {sent} (p. {chunk.page_number}) [{loc}]",
                         source_page=chunk.page_number,
                     )
 

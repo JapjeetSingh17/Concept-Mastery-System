@@ -254,12 +254,38 @@ def generate_visual_diagram_tool(
 
 # ── Tool 2: Presentation Deck Generator ────────────────────────────────────
 
+def _clean_pdf_text(text: str) -> str:
+    """Sanitize text to safe Latin-1 / ASCII printable range for ReportLab Type 1 fonts."""
+    if not text:
+        return ""
+    replacements = {
+        "\u2018": "'", "\u2019": "'",
+        "\u201c": '"', "\u201d": '"',
+        "\u2013": "-", "\u2014": "--",
+        "\u2022": "*", "\u2026": "...",
+        "\u00a0": " ", "\u2264": "<=", "\u2265": ">=",
+        "\u2260": "!=", "\u221e": "inf", "\u00b1": "+/-",
+        "\u2192": "->", "\u2190": "<-", "\u21d2": "=>",
+        "\u03b1": "alpha", "\u03b2": "beta", "\u03b3": "gamma",
+        "\u03b4": "delta", "\u03f5": "epsilon", "\u03b8": "theta",
+        "\u03bb": "lambda", "\u03bc": "mu", "\u03c3": "sigma",
+        "\u03c0": "pi", "\u03a9": "Omega", "\u2211": "sum",
+        "\u220f": "prod", "\u2208": "in", "\u2229": "cap",
+        "\u222a": "cup", "\u2282": "subset"
+    }
+    t = str(text)
+    for k, v in replacements.items():
+        t = t.replace(k, v)
+    return "".join(c if (32 <= ord(c) <= 126 or c in "\n\t") else " " for c in t)
+
+
 def generate_pptx_deck_tool(
     concept_id: str,
     user_id: str = "default",
-    slide_count: int = 5
+    slide_count: int = 5,
+    custom_slides: Optional[list[dict]] = None
 ) -> dict:
-    """Build a 5-slide .pptx deck using python-pptx grounded in concept chunks."""
+    """Build a rich .pptx deck using python-pptx grounded in concept notes and chunks."""
     concept_name, source_locator, context_text, chunks = _get_grounded_context(concept_id, user_id)
     title = f"{concept_name} - Concept Mastery Slide Deck"
     artifacts_dir = _get_artifacts_dir()
@@ -267,46 +293,46 @@ def generate_pptx_deck_tool(
     filename = f"deck_{_sanitize_name(concept_id)}_{uuid.uuid4().hex[:8]}"
     file_path = artifacts_dir / f"{filename}.pptx"
 
-    # Slide 1 to 5 specifications
-    slide_specs = [
+    # Use custom slide specifications if provided (from smart notes), else grounded default
+    slide_specs = custom_slides or [
         {
             "slide": 1,
-            "title": f"{concept_name}: Title & Concept",
+            "title": f"{concept_name}: Conceptual Architecture",
             "bullets": [
                 f"Course Subject: {concept_name}",
                 f"Grounded Source: {source_locator}",
                 "Adaptive Mastery Learning Deck",
-                "Prepared by Socratic AI Engine"
+                "Synthesized by Grounded Socratic Mastery Engine"
             ]
         },
         {
             "slide": 2,
-            "title": "Core Intuition",
+            "title": "Core Intuition & Mental Model",
             "bullets": [
-                f"Why {concept_name} matters: foundational mental model",
-                "High-level intuition connecting abstract formulas to physical systems",
-                "Analogous behavior in real-world scenarios",
+                f"Foundational role of {concept_name} in the system curriculum",
+                "Intuitive physical analogy connecting theory to operational execution",
+                "Invariant state representation across boundaries",
                 f"Grounding reference: {source_locator}"
             ]
         },
         {
             "slide": 3,
-            "title": "Mathematical & Formal Formulation",
+            "title": "Governing Mechanism & Formulations",
             "bullets": [
-                f"Rigorous definitions and governing equations for {concept_name}",
-                "Component breakdown of terms and state variables",
-                "Boundary conditions and domain constraints",
-                f"Textbook verification: {source_locator}"
+                f"Formal operational rules and mechanics governing {concept_name}",
+                "State transitions, inputs, and algorithmic transformations",
+                "Boundary conditions and runtime invariants",
+                f"Primary textbook citation: {source_locator}"
             ]
         },
         {
             "slide": 4,
-            "title": "Worked Example & Walkthrough",
+            "title": "Worked Walkthrough & Execution Trace",
             "bullets": [
-                "Concrete step-by-step example problem",
-                "Application of foundational equations to state transformations",
-                "Common student misconceptions and diagnostic traps",
-                "Verification checks and sanity tests"
+                "Concrete application scenario with step-by-step state trace",
+                "Intermediate state validation against domain constraints",
+                "Key diagnostic misconceptions and common student traps",
+                "Verification sanity checks and correctness bounds"
             ]
         },
         {
@@ -314,7 +340,7 @@ def generate_pptx_deck_tool(
             "title": "Key Takeaways & Citations",
             "bullets": [
                 f"Core synthesis for mastering {concept_name}",
-                "Prerequisite linkage to downstream advanced topics",
+                "Prerequisite linkage to downstream topics",
                 f"Source Citations: {source_locator}",
                 "Review complete: Proceed to diagnostic assessment"
             ]
@@ -397,11 +423,13 @@ def generate_pptx_deck_tool(
 def generate_pdf_handout_tool(
     concept_id: str,
     user_id: str = "default",
-    content_sections: Optional[list[dict]] = None
+    content_sections: Optional[list[dict]] = None,
+    custom_title: Optional[str] = None
 ) -> dict:
-    """Generate a clean .pdf study handout saved to config.GENERATED_ARTIFACTS_DIR."""
+    """Generate a clean, multi-page .pdf study handout saved to config.GENERATED_ARTIFACTS_DIR."""
     concept_name, source_locator, context_text, chunks = _get_grounded_context(concept_id, user_id)
-    title = f"{concept_name} - Study Handout"
+    title = _clean_pdf_text(custom_title or f"{concept_name} - Study Handout")
+    clean_locator = _clean_pdf_text(source_locator)
     artifacts_dir = _get_artifacts_dir()
 
     filename = f"handout_{_sanitize_name(concept_id)}_{uuid.uuid4().hex[:8]}"
@@ -410,23 +438,23 @@ def generate_pdf_handout_tool(
     sections = content_sections or [
         {
             "heading": "1. Overview & Formal Concept",
-            "body": f"{concept_name} represents a core theoretical concept. Grounded study material notes: {source_locator}."
+            "body": f"{concept_name} represents a core theoretical concept. Grounded study material notes: {clean_locator}."
         },
         {
             "heading": "2. Core Intuition & Principles",
             "body": f"When conceptualizing {concept_name}, relate the mechanics to foundational principles established in prerequisite modules. Focus on state transformations and underlying invariants."
         },
         {
-            "heading": "3. Mathematical Formulation",
+            "heading": "3. Mathematical & Operational Formulation",
             "body": f"The governing mechanics of {concept_name} follow structured formal models. Ensure all parameters and boundary criteria are validated against textbook definitions."
         },
         {
-            "heading": "4. Worked Example & Common Pitfalls",
+            "heading": "4. Worked Walkthrough & Common Pitfalls",
             "body": "Avoid superficial pattern matching. Verify intermediate steps systematically to prevent diagnostic misconceptions."
         },
         {
             "heading": "5. Citations & Further Exploration",
-            "body": f"Primary textbook citation: {source_locator}. For complete problem sets, consult the assigned course materials."
+            "body": f"Primary textbook citation: {clean_locator}. For complete problem sets, consult the assigned course materials."
         }
     ]
 
@@ -439,56 +467,82 @@ def generate_pdf_handout_tool(
         c = canvas.Canvas(str(file_path), pagesize=letter)
         width, height = letter
 
-        # Header Banner
+        # Header Banner on Page 1
         c.setFillColor(colors.HexColor("#1e293b"))
         c.rect(0, height - 90, width, 90, fill=1, stroke=0)
 
         c.setFillColor(colors.white)
-        c.setFont("Helvetica-Bold", 20)
-        c.drawString(54, height - 44, title[:50])
+        c.setFont("Helvetica-Bold", 18)
+        c.drawString(54, height - 42, title[:65])
 
         c.setFillColor(colors.HexColor("#38bdf8"))
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(54, height - 68, f"Source Grounding: {source_locator} · Adaptive Mastery Platform")
+        c.setFont("Helvetica-Bold", 10.5)
+        c.drawString(54, height - 66, f"Source Grounding: {clean_locator} · Adaptive Mastery Platform")
 
-        y_pos = height - 130
-        c.setFillColor(colors.HexColor("#0f172a"))
+        y_pos = height - 120
+        page_num = 1
 
         for sec in sections:
-            if y_pos < 100:
+            sec_heading = _clean_pdf_text(sec.get("heading", "Section"))
+            raw_body = _clean_pdf_text(sec.get("body", ""))
+
+            if y_pos < 90:
+                c.setFont("Helvetica-Oblique", 8)
+                c.setFillColor(colors.HexColor("#94a3b8"))
+                c.drawString(54, 30, f"Page {page_num} · {title[:40]} · Grounded strictly in {clean_locator}")
                 c.showPage()
+                page_num += 1
                 y_pos = height - 60
 
-            c.setFont("Helvetica-Bold", 14)
+            c.setFont("Helvetica-Bold", 13)
             c.setFillColor(colors.HexColor("#1e40af"))
-            c.drawString(54, y_pos, sec.get("heading", "Section"))
-            y_pos -= 20
+            c.drawString(54, y_pos, sec_heading[:80])
+            y_pos -= 18
 
-            c.setFont("Helvetica", 10.5)
+            c.setFont("Helvetica", 9.5)
             c.setFillColor(colors.HexColor("#334155"))
-            body_text = sec.get("body", "")
-            # Simple line wrapping
-            words = body_text.split()
-            current_line = []
-            for w in words:
-                current_line.append(w)
-                if len(" ".join(current_line)) > 75:
+
+            for paragraph in raw_body.split("\n"):
+                p_str = paragraph.strip()
+                if not p_str:
+                    y_pos -= 5
+                    continue
+                words = p_str.split()
+                current_line = []
+                for w in words:
+                    current_line.append(w)
+                    if len(" ".join(current_line)) > 84:
+                        c.drawString(64, y_pos, " ".join(current_line[:-1]))
+                        y_pos -= 13
+                        current_line = [w]
+                        if y_pos < 70:
+                            c.setFont("Helvetica-Oblique", 8)
+                            c.setFillColor(colors.HexColor("#94a3b8"))
+                            c.drawString(54, 30, f"Page {page_num} · {title[:40]} · Grounded strictly in {clean_locator}")
+                            c.showPage()
+                            page_num += 1
+                            y_pos = height - 60
+                            c.setFont("Helvetica", 9.5)
+                            c.setFillColor(colors.HexColor("#334155"))
+                if current_line:
                     c.drawString(64, y_pos, " ".join(current_line))
-                    y_pos -= 16
-                    current_line = []
-                    if y_pos < 80:
+                    y_pos -= 13
+                    if y_pos < 70:
+                        c.setFont("Helvetica-Oblique", 8)
+                        c.setFillColor(colors.HexColor("#94a3b8"))
+                        c.drawString(54, 30, f"Page {page_num} · {title[:40]} · Grounded strictly in {clean_locator}")
                         c.showPage()
+                        page_num += 1
                         y_pos = height - 60
-            if current_line:
-                c.drawString(64, y_pos, " ".join(current_line))
-                y_pos -= 16
+                        c.setFont("Helvetica", 9.5)
+                        c.setFillColor(colors.HexColor("#334155"))
 
-            y_pos -= 12
+            y_pos -= 10
 
-        # Footer
-        c.setFont("Helvetica-Oblique", 9)
+        # Footer on final page
+        c.setFont("Helvetica-Oblique", 8.5)
         c.setFillColor(colors.HexColor("#94a3b8"))
-        c.drawString(54, 40, f"Generated for {user_id} · Grounded strictly in {source_locator}")
+        c.drawString(54, 30, f"Page {page_num} · Generated for {user_id} · Grounded strictly in {clean_locator}")
 
         c.save()
         pdf_saved = True
@@ -497,8 +551,16 @@ def generate_pdf_handout_tool(
 
     # Robust pure-python PDF fallback if reportlab fails
     if not pdf_saved or not file_path.exists():
-        pdf_text = f"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> >>\nendobj\n4 0 obj\n<< /Length 120 >>\nstream\nBT\n/F1 16 Tf\n50 720 Td\n({title}) Tj\n/F1 12 Tf\n0 -30 Td\n(Grounded in {source_locator}) Tj\nET\nendstream\nendobj\nxref\n0 5\n0000000000 65535 f \n0000000010 00000 n \n0000000060 00000 n \n0000000117 00000 n \n0000000282 00000 n \ntrailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n450\n%%EOF\n"
-        file_path.write_bytes(pdf_text.encode("latin-1"))
+        safe_title = _clean_pdf_text(title)
+        safe_loc = _clean_pdf_text(source_locator)
+        pdf_text = (
+            f"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+            f"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+            f"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> >>\nendobj\n"
+            f"4 0 obj\n<< /Length 200 >>\nstream\nBT\n/F1 16 Tf\n50 720 Td\n({safe_title[:50]}) Tj\n/F1 11 Tf\n0 -30 Td\n(Grounded in {safe_loc[:50]}) Tj\nET\nendstream\nendobj\n"
+            f"xref\n0 5\n0000000000 65535 f \n0000000010 00000 n \n0000000060 00000 n \n0000000117 00000 n \n0000000282 00000 n \ntrailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n450\n%%EOF\n"
+        )
+        file_path.write_bytes(pdf_text.encode("latin-1", errors="replace"))
 
     rel_url = f"/api/artifacts/{filename}.pdf"
 

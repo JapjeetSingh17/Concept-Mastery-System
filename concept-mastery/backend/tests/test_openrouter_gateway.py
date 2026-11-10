@@ -129,3 +129,45 @@ def test_live_openrouter_execution(monkeypatch):
     payload = json.loads(llm.extract_json_payload(res))
     assert payload.get("status") == "ONLINE"
 
+
+def test_openrouter_automatic_model_switching_on_402_and_429(monkeypatch):
+    """Verify that when primary model returns 402 (Payment Required) or 429, the gateway automatically switches to next model."""
+    monkeypatch.setenv("OPENROUTER_LIVE", "1")
+    llm.reset_exhaustion_state()
+
+    call_models = []
+
+    def mock_post(url, headers=None, json=None, timeout=None):
+        model = json.get("model")
+        call_models.append(model)
+
+        class MockResponse:
+            def __init__(self, status_code, data_or_text):
+                self.status_code = status_code
+                self._data = data_or_text if isinstance(data_or_text, dict) else {}
+                self.text = json_lib.dumps(data_or_text) if isinstance(data_or_text, dict) else str(data_or_text)
+
+            def json(self):
+                return self._data
+
+        import json as json_lib
+        if model == "google/gemini-2.5-flash":
+            # Simulate 402 Payment Required on Gemini
+            return MockResponse(402, {"error": {"message": "Insufficient credits", "code": 402}})
+        elif model == "nvidia/nemotron-3-ultra-550b-a55b:free":
+            # Next model succeeds
+            return MockResponse(200, {
+                "model": model,
+                "choices": [{"message": {"role": "assistant", "content": '{"failover": "SUCCESS"}'}}]
+            })
+        return MockResponse(500, "Internal Server Error")
+
+    import httpx
+    monkeypatch.setattr(httpx, "post", mock_post)
+
+    result = llm._call_openrouter("System", "User prompt")
+    assert result == '{"failover": "SUCCESS"}'
+    assert call_models[0] == "google/gemini-2.5-flash"
+    assert call_models[1] == "nvidia/nemotron-3-ultra-550b-a55b:free"
+    assert llm._STATE["openrouter_exhausted"] is False
+

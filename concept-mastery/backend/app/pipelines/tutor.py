@@ -12,41 +12,45 @@ import logging
 from typing import Optional
 from ..core import store, llm, web_search
 from ..core.concept_index import GLOBAL_INDEX
-from ..core.text import NORMALIZER, tokens
+from ..core.text import NORMALIZER, tokens, sentences
 from ..models.schemas import TutorChatResponse, Citation
 from . import mastery, tools
 
 logger = logging.getLogger("concept_mastery.tutor")
 TutorResponse = TutorChatResponse
 
-SOCRATIC_GUARDRAIL_SYSTEM = """You are an expert Socratic tutor for an adaptive concept mastery platform.
+SOCRATIC_GUARDRAIL_SYSTEM = """You are an expert Socratic master tutor for an adaptive concept mastery platform.
+Your mission is to guide students to deep conceptual intuition, architectural understanding, and operational mastery.
 
-STRICT TWO-LAYER GUARDRAILS:
-1. NEVER provide direct quiz answers, full solution steps, or completed homework.
-2. If asked directly for an answer (e.g. "What is the answer to question 2?"), REFUSE politely and provide a scaffolding conceptual hint instead.
-3. Base your explanations ONLY on the provided textbook excerpt. DO NOT hallucinate facts outside the context.
-4. MANDATORY: You MUST cite the source page for every key fact, e.g. [Page 3] or (p. 3).
-5. Guide the student with one intuitive real-world analogy and one targeted follow-up question to test their understanding.
-6. Keep explanations concise, clear, and pedagogically sound (under 120 words)."""
+FOUR PEDAGOGICAL PILLARS FOR EVERY EXPLANATION:
+1. Intuitive Mental Model: Start with a vivid, relatable real-world analogy that demystifies abstract notation.
+2. Architecture & Governing Mechanism: Explain step-by-step how the concept actually operates under the hood, citing the exact textbook page or video timestamp (e.g. [Page X], [MM:SS]).
+3. Concrete Worked Walkthrough: Trace a tangible mini-example, calculation, or system scenario demonstrating the mechanism in action.
+4. Socratic Application Challenge: Conclude with a thought-provoking check-in question that tests whether the student can apply this mechanism to edge cases or novel scenarios.
+
+STRICT GUARDRAILS:
+- Ground all explanations strictly in the provided study material chunks.
+- NEVER give direct quiz solutions or homework answers; scaffold the student's problem-solving instead.
+- Provide comprehensive, clear, high-signal educational guidance (250 to 450 words)."""
 
 REMEDIAL_SYSTEM = """You are a patient remedial tutor helping a student overcome a diagnosed misconception.
 
-RULES:
-1. Explain the target concept step-by-step using simpler analogies.
-2. Directly address why the prerequisite foundational concept matters.
-3. Cite the exact textbook page using [Page X].
-4. DO NOT give direct quiz solutions.
-5. End with a simple check-in question."""
+REMEDIAL PEDAGOGICAL PILLARS:
+1. Deconstruct the target concept from first principles using an intuitive mental model.
+2. Explicitly explain why the prerequisite foundational concept is required to avoid confusion.
+3. Ground every step in the assigned study material citing exact locators [Page X] or [MM:SS].
+4. Provide a worked mini-example contrasting the correct mechanism against common student mistakes.
+5. End with an empowering Socratic check-in question to verify comprehension."""
 
 WEB_SOCRATIC_SYSTEM = """You are an expert Socratic tutor for an adaptive concept mastery platform.
-The student's question was researched using live web search (TinyFish Search) because it extends beyond the local study PDF or was requested.
+The student's question was researched using live web search because it extends beyond the local study material or was requested.
 
 STRICT SOCRATIC GUARDRAILS:
-1. NEVER provide direct quiz answers or completed homework.
-2. Ground your explanation in the provided web search excerpts.
-3. MANDATORY: Cite web sources in your explanation, e.g. [Source: Site Name] or [Web: Title].
-4. Guide the student with conceptual intuition, an analogy, and one targeted check-in question.
-5. Keep explanations concise, clear, and pedagogical (under 130 words)."""
+1. Explain the underlying mental model and operational mechanics using the web search excerpts.
+2. NEVER provide direct quiz answers or completed homework.
+3. MANDATORY: Cite web sources in your explanation, e.g. [Source: Site Name].
+4. Provide a clear worked example and conclude with a targeted Socratic follow-up question.
+5. Keep explanations structured, rigorous, and educational (250 to 400 words)."""
 
 GREETING_PATTERN = re.compile(
     r"^(hi|hello|hey|heya|howdy|greetings|good\s+(morning|afternoon|evening|day)|yo|sup|help|who\s+are\s+you)[!?.\s]*$",
@@ -103,11 +107,14 @@ def chat(
     message: str,
     concept_id: str | None = None,
     user_id: str = "default",
-    mode: str = "socratic"
+    mode: str = "socratic",
+    chunks: list | None = None,
+    kb: dict | None = None
 ) -> TutorChatResponse:
     """Socratic chat response grounded in vectorless chunks or live web search."""
     clean_message = message.strip()
-    kb = store.get_kb(user_id)
+    if kb is None:
+        kb = store.get_kb(user_id)
     kb_ready = kb.get("ready", False)
 
     # 0. Detect Student Intent for Artifacts or Curated Resources
@@ -172,8 +179,8 @@ def chat(
     wants_web_search = bool(WEB_SEARCH_TRIGGER.search(clean_message))
 
     # 1. Vectorless Retrieval from Local SQLite / KB (unless explicitly asked to search the web)
-    retrieved_chunks = []
-    if not wants_web_search:
+    retrieved_chunks = list(chunks) if chunks else []
+    if not wants_web_search and not retrieved_chunks:
         if concept_id:
             retrieved_chunks = GLOBAL_INDEX.retrieve_chunks(concept_id, max_chunks=3, user_id=user_id)
         if not retrieved_chunks:
@@ -266,14 +273,34 @@ def chat(
         f"Student Query: {clean_message}"
     )
 
-    raw_answer = llm.complete(system_prompt, user_prompt, max_tokens=600)
+    raw_answer = llm.complete(system_prompt, user_prompt, max_tokens=1200)
     if not raw_answer:
         top_chunk = retrieved_chunks[0]
         top_loc = _loc_str(top_chunk)
+        c_title = (top_chunk.section_title or concept_id or "Core Concept").replace("_", " ").title()
+
+        all_sents = []
+        for c in retrieved_chunks:
+            for s in sentences(c.text):
+                if 8 <= len(s.split()) <= 45:
+                    all_sents.append(s.strip())
+
+        summary_sent = all_sents[0] if all_sents else top_chunk.text[:220]
+        mechanism_sent = all_sents[1] if len(all_sents) > 1 else "State transformations occur through strictly bounded operational invariants."
+        example_sent = all_sents[2] if len(all_sents) > 2 else f"Applying {c_title} to sample inputs guarantees structured, deterministic execution."
+
         raw_answer = (
-            f"Based on the study material [{top_loc}], {top_chunk.section_title} "
-            f"states: \"{top_chunk.text[:220]}...\"\n\n"
-            f"How does this relate to your current question?"
+            f"### 1. Intuitive Mental Model\n"
+            f"Think of **{c_title}** as a structured blueprint: rather than treating operations as unpredictable ad-hoc steps, "
+            f"it enforces an underlying organizational model where each component occupies a predictable role.\n\n"
+            f"### 2. Architecture & Governing Mechanism\n"
+            f"According to your study material [{top_loc}], {summary_sent}\n\n"
+            f"Under the hood, {mechanism_sent} This ensures that operations adhere to verified system constraints.\n\n"
+            f"### 3. Concrete Worked Example\n"
+            f"Consider a concrete scenario from [{top_loc}]: {example_sent}\n\n"
+            f"Notice how each step transforms the state sequentially without violating foundational properties.\n\n"
+            f"### 4. Socratic Check-in Challenge\n"
+            f"Given how {c_title} operates in [{top_loc}], what edge case or structural constraint would break this guarantee if state inputs were unbounded?"
         )
 
     citations: list[Citation] = []

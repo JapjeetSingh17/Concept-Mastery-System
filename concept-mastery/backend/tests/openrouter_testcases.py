@@ -361,7 +361,8 @@ class OpenRouterAndUIHarness:
     @staticmethod
     def extract_youtube_id(url: str) -> str:
         patterns = [
-            r"(?:v=|youtu\.be/|youtube\.com/embed/|youtube\.com/shorts/)([A-Za-z0-9_-]{11})",
+            r"(?:v=|/v/|youtu\.be/|youtube\.com/embed/|youtube\.com/shorts/|youtube\.com/live/)([A-Za-z0-9_-]{11})",
+            r"^([A-Za-z0-9_-]{11})$",
         ]
         for p in patterns:
             m = re.search(p, url)

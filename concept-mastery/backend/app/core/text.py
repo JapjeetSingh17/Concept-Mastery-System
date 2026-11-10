@@ -11,7 +11,39 @@ from .. import config
 STOP = set("""a an the of to in on for and or is are was were be been being it its this that these those with as by at from
 which can has have had not but if then so such than into also when where how what why who whom we you they their our your
 more most one two do does did will would should could may might about over under between each other any all some very just
-use used using called often usually example""".split())
+use used using called often usually example get gets got getting make makes made making know knows known like see seen
+take takes took taken come comes came coming go goes went gone want wants say says said look looks looked tell tells told
+well really actually basically simply literally thing things stuff way ways stands stand standing
+because since although though unless until while where whereas whether neither nor either
+going creating asking understand understanding small number insert create created creates ask asked asks
+talking talked talk put puts putting calling call called work working worked show showing showed shown
+find finding found keep keeping kept try trying tried need needed needs think thinking thought
+guys guy helper helpers document documents paragraphs paragraph reader read reading extract extracting text pdf pptx docx txt mp3 mp4 wav m4a viewer viewers
+model models project projects test tests input inputs output outputs
+here there now then today tomorrow yesterday maybe perhaps okay ok yeah wait let lets
+once again""".split())
+
+GENERIC_NON_CONCEPTS = set("""
+segment video lecture voice note section chapter page slide unit overview introduction summary conclusion
+timestamp locator question answer problem solution exercise test quiz practice exam rubric score grade
+review study learn recall intuition mechanism formula worked essential keyword keywords update logical
+physical primary secondary system management revision guarantee storage instructor student teacher class
+method function object value result output input process code file data information detail aspect topic
+subject case point type kind part step stage phase level state time timer start end begin finish first
+second third next previous last core key main major minor simple complex easy hard good bad new old
+different similar general specific important useful various several many much less least
+going right because later already creating asking understand understanding small number insert
+create created creates ask asked asks go goes went gone get gets got getting
+want wants wanted saying say says said tell tells told look looks looked see seeing seen
+here there now then today tomorrow yesterday maybe perhaps okay ok yeah wait let lets
+talk talking talked come comes came coming put puts putting take takes taking took taken
+call called calling make makes making made work working worked show showing showed shown
+find finding found keep keeping kept try trying tried need needed needs think thinking thought
+actually basically simply literally really once once again guys guy helper helpers
+document documents paragraphs paragraph reader read reading extract extracting text pdf pptx docx txt mp3 mp4 wav m4a viewer viewers
+model models project projects test tests example examples input inputs output outputs
+bit lot lots kind parts ways things stuff line lines word words sentence sentences
+""".split())
 
 
 class SynonymNormalizer:
@@ -123,8 +155,56 @@ def stem(w: str) -> str:
             return w[: -len(suf)]
     return w
 
+def is_generic_term(term: str) -> bool:
+    """Check if a term or multi-word phrase is composed of generic words, conversational fillers, or locators."""
+    if not term or not term.strip():
+        return True
+    t_clean = term.strip()
+    if re.search(r"^(?:lecture\s+)?segment\b", t_clean, re.I):
+        return True
+    if re.search(r"^video\s*\[", t_clean, re.I):
+        return True
+    if re.search(r"^voice\s+note\b", t_clean, re.I):
+        return True
+    if re.search(r"^\d{1,2}:\d{2}(?::\d{2})?$", t_clean):
+        return True
+    if re.search(r"^(?:page|slide|section|unit|chapter)\s*\d*$", t_clean, re.I):
+        return True
+
+    parts = [p.strip() for p in re.findall(r"[a-z0-9]+", t_clean.lower())]
+    if not parts:
+        return True
+    # If all parts are digits or in STOP or GENERIC_NON_CONCEPTS, it's generic
+    if all(p.isdigit() or p in STOP or p in GENERIC_NON_CONCEPTS for p in parts):
+        return True
+
+    # If single word: strictly block generic verbs, adverbs, pronouns, adjectives, conversational fillers
+    if len(parts) == 1:
+        w = parts[0]
+        if w.isdigit() or len(w) < 4 or w in STOP or w in GENERIC_NON_CONCEPTS:
+            return True
+        # Reject common verb forms ending in -ing unless in technical allowlist
+        if w.endswith("ing") and w not in {
+            "embedding", "clustering", "pipelining", "caching", "routing",
+            "encoding", "indexing", "ranking", "training", "sampling",
+            "backtracking", "threading", "parsing", "branching", "pruning"
+        }:
+            return True
+        # Reject common past-tense/participle forms unless technical
+        if w.endswith("ed") and w not in {"feedforward", "embedded", "distributed", "normalized", "quantized"}:
+            return True
+
+    # Multi-word phrases: if it starts with conversational starters or consists mostly of fillers
+    if parts[0] in {"once", "let", "lets", "how", "why", "what", "when", "where", "who", "which", "tell", "show", "talk", "start", "stop"}:
+        return True
+    if any(p in {"guys", "again", "helper", "helpers", "wait"} for p in parts):
+        return True
+
+    return False
+
+
 def tokens(text: str) -> list[str]:
-    return [stem(w) for w in re.findall(r"[a-z][a-z0-9]+", normalize(text)) if w not in STOP and len(w) > 2]
+    return [stem(w) for w in re.findall(r"[a-z][a-z0-9]+", normalize(text)) if w not in STOP and w not in GENERIC_NON_CONCEPTS and len(w) > 2]
 
 def sentences(text: str) -> list[str]:
     return [s.strip() for s in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"“(])", text) if len(s.strip()) > 2]

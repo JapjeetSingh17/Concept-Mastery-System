@@ -31,6 +31,7 @@ ENVIRONMENT = _e("ENVIRONMENT", "development")
 # Unified OpenRouter Gateway & Fallback Models
 OPENROUTER_API_KEY = _e("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = _e("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+OPENROUTER_PRIMARY_MODEL = _e("OPENROUTER_MODEL", "google/gemini-2.5-flash")
 OPENROUTER_MODELS = [
     "google/gemini-2.5-flash",
     "nvidia/nemotron-3-ultra-550b-a55b:free",
@@ -39,7 +40,6 @@ OPENROUTER_MODELS = [
     "meta-llama/llama-3.3-70b-instruct:free",
     "openrouter/auto",
 ]
-OPENROUTER_PRIMARY_MODEL = _e("OPENROUTER_MODEL", "google/gemini-2.5-flash")
 
 # Primary Provider: Google Gemini (Legacy/Direct)
 GEMINI_API_KEY = _e("GEMINI_API_KEY", "")

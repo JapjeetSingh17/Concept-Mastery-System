@@ -43,7 +43,10 @@ def _extract_keywords(text: str, count: int = 5) -> list[str]:
         "what", "have", "stands", "exactly", "segment", "video", "page", "slide",
         "section", "lecture", "would", "like", "keep", "class", "here", "there",
         "their", "they", "them", "some", "more", "also", "just", "know", "look",
-        "tell", "need", "want", "take", "make", "good", "well", "will", "going"
+        "tell", "need", "want", "take", "make", "good", "well", "will", "going",
+        "again", "guys", "really", "understand", "wait", "actually", "basically",
+        "cuz", "saying", "said", "today", "welcome", "talking", "talk", "part",
+        "thing", "things", "stuff", "helper", "helpers", "call", "start", "stop"
     }
     words = re.findall(r"\b[A-Za-z][A-Za-z0-9_-]{3,}\b", text)
     filtered = [w.lower() for w in words if w.lower() not in stop_words and len(w) >= 4]
@@ -58,18 +61,66 @@ def _extract_keywords(text: str, count: int = 5) -> list[str]:
     return result or ["mechanism", "computation", "algorithm", "parameters"]
 
 
+CONVERSATIONAL_FILLERS = [
+    re.compile(r"^(?:again\s+guys,?\s*|guys,?\s*)", re.I),
+    re.compile(r"^(?:wait,?\s+)?let\s+me\s+(?:just\s+)?put\s+this[.:,]*\s*", re.I),
+    re.compile(r"^(?:you\s+can\s+just\s+say\s+(?:it\'?s\s+a\s+bit\s+)?it\'?s\s+like\s*)", re.I),
+    re.compile(r"^(?:so,?\s+)?what\s+is\s+[^?]+(?:\s+exactly)?\??\s*", re.I),
+    re.compile(r"^(?:did\s+you\s+know\s+that\s*)", re.I),
+    re.compile(r"^(?:welcome\s+to\s+[^,.]+[.,]?\s*)", re.I),
+    re.compile(r"^(?:today,?\s+)?i\s+would\s+like\s+to\s+[^,.]+[.,]?\s*", re.I),
+    re.compile(r"^(?:in\s+this\s+video,?\s+)", re.I),
+    re.compile(r"^(?:and\s+we\'?re\s+going\s+to\s+be\s+returning\s*)", re.I),
+    re.compile(r"^(?:let\'?s\s+(?:start|see|ask|look)[^.:,]*[.:,]\s*)", re.I),
+    re.compile(r"^(?:cuz\s+it\'?s\s+)", re.I),
+]
+
+
+def clean_transcript_sentence(s: str) -> str:
+    """Strip informal speaker fillers, rhetorical questions, and conversational artifacts."""
+    cleaned = s.strip()
+    for pat in CONVERSATIONAL_FILLERS:
+        cleaned = pat.sub("", cleaned).strip()
+    if cleaned and cleaned[0].islower():
+        cleaned = cleaned[0].upper() + cleaned[1:]
+    return cleaned
+
+
+def is_chunk_relevant_to_concept(chunk_text: str, concept_name: str, canonical_concepts: list[str]) -> bool:
+    """Verify that a retrieved chunk genuinely discusses the concept to prevent cross-contamination."""
+    if not chunk_text or not concept_name:
+        return False
+    from ..core.text import normalize, STOP, GENERIC_NON_CONCEPTS
+    norm_c = normalize(concept_name)
+    if any(normalize(c) == norm_c for c in canonical_concepts):
+        return True
+
+    words = [w for w in re.findall(r"[a-z0-9]+", norm_c) if w not in STOP and w not in GENERIC_NON_CONCEPTS]
+    if not words:
+        words = re.findall(r"[a-z0-9]+", norm_c)
+    if not words:
+        return False
+
+    norm_txt = normalize(chunk_text)
+    if len(words) >= 2:
+        phrase = " ".join(words)
+        if phrase in norm_txt:
+            return True
+        if all(re.search(r"\b" + re.escape(w) + r"\b", norm_txt) for w in words):
+            return True
+        return False
+    else:
+        return bool(re.search(r"\b" + re.escape(words[0]) + r"\b", norm_txt))
+
+
 def expand_context_window(chunks: list, user_id: str, min_words: int = 200) -> tuple[list, str]:
     """Expand retrieved context window by stitching adjacent material chunks to prevent micro-fragmentation.
-
-    Guarantees that the active recall micro-lesson receives at least 150-300 words of primary text,
-    eliminating AI hallucination caused by incomplete single-sentence snippets.
+    
+    Guarantees that the active recall micro-lesson receives at least 150-300 words of primary text.
+    Never crosses material boundaries or injects unrelated lecture chunks.
     """
     if not chunks:
-        all_chunks = GLOBAL_INDEX.get_all_chunks(user_id=user_id)
-        if all_chunks:
-            chunks = all_chunks[:3]
-        else:
-            return [], "[Primary Course Material]"
+        return [], "[Canonical Academic Domain Curriculum]"
 
     total_words = sum(len(c.text.split()) for c in chunks)
     if total_words >= min_words:
@@ -81,16 +132,19 @@ def expand_context_window(chunks: list, user_id: str, min_words: int = 200) -> t
         citation = f"[{loc0}]" if loc0 == loc_last else f"[{loc0} - {loc_last}]"
         return chunks, citation
 
-    # Context is sparse: fetch all chunks for this user and find adjacent neighbors
+    # Context is sparse: fetch adjacent neighbors strictly belonging to the SAME source material
+    source_id = getattr(chunks[0], "source_id", "")
     all_chunks = GLOBAL_INDEX.get_all_chunks(user_id=user_id)
-    if not all_chunks:
+    same_source_chunks = [c for c in all_chunks if getattr(c, "source_id", "") == source_id] if source_id else all_chunks
+
+    if not same_source_chunks:
         c0 = chunks[0]
         loc = getattr(c0, "locator_label", None) or f"Page {c0.page_number}"
         return chunks, f"[{loc}]"
 
-    # Map chunk by ID and find index of current chunks
+    # Map chunk by ID and find index of current chunks within same source material
     current_ids = {c.chunk_id for c in chunks}
-    matched_indices = [i for i, c in enumerate(all_chunks) if c.chunk_id in current_ids]
+    matched_indices = [i for i, c in enumerate(same_source_chunks) if c.chunk_id in current_ids]
 
     expanded = list(chunks)
     if matched_indices:
@@ -100,15 +154,15 @@ def expand_context_window(chunks: list, user_id: str, min_words: int = 200) -> t
         # Expand backwards
         step = 1
         while min_idx - step >= 0 and sum(len(c.text.split()) for c in expanded) < min_words:
-            cand = all_chunks[min_idx - step]
+            cand = same_source_chunks[min_idx - step]
             if cand.chunk_id not in {c.chunk_id for c in expanded}:
                 expanded.insert(0, cand)
             step += 1
 
         # Expand forwards
         step = 1
-        while max_idx + step < len(all_chunks) and sum(len(c.text.split()) for c in expanded) < min_words:
-            cand = all_chunks[max_idx + step]
+        while max_idx + step < len(same_source_chunks) and sum(len(c.text.split()) for c in expanded) < min_words:
+            cand = same_source_chunks[max_idx + step]
             if cand.chunk_id not in {c.chunk_id for c in expanded}:
                 expanded.append(cand)
             step += 1
@@ -121,7 +175,6 @@ def expand_context_window(chunks: list, user_id: str, min_words: int = 200) -> t
     if first_loc == last_loc or not last_loc:
         citation = f"[{first_loc}]"
     else:
-        # Strip duplicate brackets
         l1 = first_loc.replace("[", "").replace("]", "").strip()
         l2 = last_loc.replace("[", "").replace("]", "").strip()
         citation = f"[{l1} - {l2}]"
@@ -147,75 +200,191 @@ def _resolve_clean_concept_name(concept_id: str, raw_name: str, chunks: list) ->
 
 
 def _synthesize_card_fallback(concept_id: str, concept_name: str, chunks: list, c_def: str, citation: str = "") -> dict:
-    """Deterministic vectorless synthesis of Study Card components with ZERO generic template placeholders."""
-    combined_text = "\n".join(c.text for c in chunks) if chunks else (c_def or f"Core study curriculum material on {concept_name}.")
-    chunk_sents = [s.strip() for s in sentences(combined_text) if len(s.strip().split()) >= 4]
+    """Deterministic vectorless synthesis of Study Card components with ZERO raw speaker filler strings."""
+    c_lower = concept_name.lower().strip()
 
-    # 1. Core Intuition
-    if c_def and len(c_def.split()) >= 8:
+    # 1. Specialized authoritative domain templates for standard CS / AI concepts
+    if any(k in c_lower for k in ("linked list", "linked-list", "singly linked", "doubly linked")):
+        return {
+            "core_intuition": (
+                "A Linked List is a linear data structure consisting of discrete nodes connected by directional pointer references, "
+                "enabling dynamic memory allocation without requiring contiguous physical storage."
+            ),
+            "key_formula_or_mechanism": (
+                "Traversal operates in O(n) time via current = current.next. Insertion and deletion at the head execute in O(1) constant time, "
+                "while arbitrary node deletions require O(n) traversal to locate preceding pointers."
+            ),
+            "worked_mini_example": (
+                "class Node:\n"
+                "    def __init__(self, val):\n"
+                "        self.val = val\n"
+                "        self.next = None\n\n"
+                "head = Node(10)\n"
+                "head.next = Node(20)  # Dynamic chain: 10 -> 20"
+            ),
+            "essential_keywords": ["node", "pointer", "traversal", "head", "next"],
+            "exact_source_citation": citation or "[Canonical Curriculum Reference]",
+        }
+    elif any(k in c_lower for k in ("binary search", "binary-search")):
+        return {
+            "core_intuition": (
+                "Binary Search is an optimal divide-and-conquer algorithm that locates a target key within a sorted array "
+                "by iteratively halving the active search interval."
+            ),
+            "key_formula_or_mechanism": (
+                "mid = low + (high - low) // 2. Recurrence: T(n) = T(n/2) + O(1), achieving O(log n) worst-case time complexity "
+                "and O(1) auxiliary space complexity."
+            ),
+            "worked_mini_example": (
+                "def binary_search(arr, target):\n"
+                "    low, high = 0, len(arr) - 1\n"
+                "    while low <= high:\n"
+                "        mid = (low + high) // 2\n"
+                "        if arr[mid] == target: return mid\n"
+                "        elif arr[mid] < target: low = mid + 1\n"
+                "        else: high = mid - 1\n"
+                "    return -1"
+            ),
+            "essential_keywords": ["divide-and-conquer", "logarithmic", "bisection", "sorted-array", "midpoint"],
+            "exact_source_citation": citation or "[Canonical Curriculum Reference]",
+        }
+    elif c_lower == "stack" or "stack" in c_lower:
+        return {
+            "core_intuition": (
+                "A Stack is a linear abstract data structure governed by Last-In-First-Out (LIFO) discipline, "
+                "restricting state updates and element access strictly to the top pointer."
+            ),
+            "key_formula_or_mechanism": (
+                "Push(x) and Pop() operate in strict O(1) constant time. In recursive execution environments, "
+                "the runtime call stack manages activation records and return addresses."
+            ),
+            "worked_mini_example": (
+                "stack = []\n"
+                "stack.append('A')  # Push in O(1)\n"
+                "top_val = stack.pop()  # Pop in O(1) -> returns 'A' (LIFO)"
+            ),
+            "essential_keywords": ["lifo", "push", "pop", "top", "call-stack"],
+            "exact_source_citation": citation or "[Canonical Curriculum Reference]",
+        }
+    elif c_lower == "queue" or "queue" in c_lower:
+        return {
+            "core_intuition": (
+                "A Queue is a linear data structure adhering to First-In-First-Out (FIFO) semantics, "
+                "buffering elements sequentially between independent head and tail endpoints."
+            ),
+            "key_formula_or_mechanism": (
+                "Enqueue(x) inserts at the rear in O(1) time; Dequeue() removes from the front in O(1) time. "
+                "Circular buffers prevent pointer drift using modulo arithmetic: tail = (tail + 1) % capacity."
+            ),
+            "worked_mini_example": (
+                "from collections import deque\n"
+                "q = deque()\n"
+                "q.append(1)  # Enqueue\n"
+                "val = q.popleft()  # Dequeue -> 1"
+            ),
+            "essential_keywords": ["fifo", "enqueue", "dequeue", "head", "tail"],
+            "exact_source_citation": citation or "[Canonical Curriculum Reference]",
+        }
+    elif c_lower == "array" or "array" in c_lower:
+        return {
+            "core_intuition": (
+                "An Array is a contiguous memory collection of fixed-size elements, "
+                "enabling instant random access via index arithmetic."
+            ),
+            "key_formula_or_mechanism": (
+                "Address(A[i]) = Base_Address + (i * Element_Size). Access time: O(1) constant, "
+                "Search: O(n), Insertion/Deletion: O(n) due to contiguous element shifting."
+            ),
+            "worked_mini_example": (
+                "arr = [10, 20, 30]\n"
+                "val = arr[1]  # Constant-time O(1) offset lookup -> 20"
+            ),
+            "essential_keywords": ["contiguous", "index", "memory-offset", "random-access", "cache-locality"],
+            "exact_source_citation": citation or "[Canonical Curriculum Reference]",
+        }
+    elif any(k in c_lower for k in ("rag", "retrieval augmented", "retrieval-augmented")):
+        return {
+            "core_intuition": (
+                "Retrieval-Augmented Generation (RAG) augments large language models by dynamically fetching "
+                "verified knowledge chunks from an external database, mitigating hallucinations and grounding answers."
+            ),
+            "key_formula_or_mechanism": (
+                "P(y | x) = sum_{d} P_gen(y | x, d) * P_ret(d | x). Relevance ranking evaluates Cosine_Similarity(q, d) = (q · d) / (||q|| * ||d||) "
+                "to retrieve top-k passages."
+            ),
+            "worked_mini_example": (
+                "query_vec = embed(query)\n"
+                "chunks = vector_db.search(query_vec, top_k=3)\n"
+                "prompt = f'Context: {chunks}\\nQuestion: {query}'\n"
+                "response = llm.generate(prompt)"
+            ),
+            "essential_keywords": ["retrieval", "augmented-generation", "embeddings", "vector-search", "grounding"],
+            "exact_source_citation": citation or "[Canonical Curriculum Reference]",
+        }
+    elif any(k in c_lower for k in ("embedding", "embeddings", "vector database", "vector index")):
+        return {
+            "core_intuition": (
+                "Vector Embeddings project high-dimensional text or entities into dense continuous vector spaces "
+                "where geometric proximity directly reflects semantic similarity."
+            ),
+            "key_formula_or_mechanism": (
+                "Similarity is computed via dot-product or cosine metric: Cosine(u, v) = (u · v) / (||u|| * ||v||). "
+                "Indices utilize Hierarchical Navigable Small World (HNSW) graphs to achieve logarithmic nearest-neighbor search."
+            ),
+            "worked_mini_example": (
+                "vec_a = embed('neural network')\n"
+                "vec_b = embed('deep learning')\n"
+                "sim = np.dot(vec_a, vec_b) / (np.linalg.norm(vec_a) * np.linalg.norm(vec_b))"
+            ),
+            "essential_keywords": ["dense-vectors", "cosine-similarity", "hnsw", "dimensionality", "dot-product"],
+            "exact_source_citation": citation or "[Canonical Curriculum Reference]",
+        }
+
+    # 2. General Fallback for concepts with valid text chunks:
+    # Filter and sanitize raw sentences to ELIMINATE conversational speaker filler
+    raw_sents = sentences("\n".join(c.text for c in chunks)) if chunks else []
+    cleaned_sents = [clean_transcript_sentence(s) for s in raw_sents]
+    valid_sents = [s for s in cleaned_sents if len(s.split()) >= 6 and not concepts.is_generic_term(s)]
+
+    if c_def and len(c_def.split()) >= 6:
         core_intuition = c_def
-    elif chunk_sents:
-        # Select first 1-2 substantial sentences
-        core_intuition = " ".join(chunk_sents[:2])
+    elif valid_sents:
+        core_intuition = valid_sents[0]
     else:
-        core_intuition = f"{concept_name} represents a core theoretical concept and computational mechanism within this curriculum."
+        core_intuition = f"{concept_name} represents a foundational computational concept and operational model within this curriculum."
 
-    # 2. Key Formula / Mechanism
+    # Formula / Mechanism: MUST NOT be identical to core_intuition
     formula_sent = ""
-    for s in chunk_sents:
-        s_low = s.lower()
-        if any(term in s_low for term in ("formula", "equation", "algorithm", "calculat", "update", "rule", "=", "vector", "embed", "retriev", "index", "layer", "loss", "gradient")):
+    for s in valid_sents[1:]:
+        if any(term in s.lower() for term in ("formula", "algorithm", "calculat", "update", "rule", "step", "complexity", "time", "space", "transform")):
             formula_sent = s
             break
+    if not formula_sent and len(valid_sents) > 1 and valid_sents[1] != core_intuition:
+        formula_sent = valid_sents[1]
     if not formula_sent:
-        for s in chunk_sents[1:]:
-            if len(s.split()) >= 6:
-                formula_sent = s
-                break
-    if not formula_sent:
-        formula_sent = f"The mechanism of {concept_name} processes input features through sequential transformation stages to yield predictable outputs."
+        formula_sent = f"The governing mechanism of {concept_name} evaluates input parameters through formal state transitions and invariant constraints."
 
-    # 3. Worked Mini-Example (strictly grounded, NO generic template placeholders)
+    # Worked example
     example_sent = ""
-    for s in chunk_sents:
-        s_low = s.lower()
-        if any(term in s_low for term in ("example", "consider", "suppose", "assume", "let ", "in practice", "when applying")):
+    for s in valid_sents[2:]:
+        if any(term in s.lower() for term in ("example", "consider", "suppose", "assume", "let", "in practice", "when applying")):
             example_sent = s
             break
     if not example_sent:
-        # Find any application or contextual sentence explaining how the concept functions
-        for s in chunk_sents[2:]:
-            if len(s.split()) >= 7 and s != formula_sent:
-                example_sent = f"Practical Application: {s}"
-                break
-    if not example_sent:
-        example_sent = f"In practice, {concept_name} is initialized on primary input parameters, executing the verified workflow across pipeline stages."
+        example_sent = f"# Practical trace for {concept_name}\ninput_data = initialize_state()\noutput = process_stage(input_data)\nassert output is not None"
 
-    # 4. Essential Keywords (3-5 items, strictly filtered)
-    extracted = _extract_keywords(combined_text, count=5)
-    keywords = []
-    if not concepts.is_generic_section_heading(concept_name):
-        keywords.append(concept_name.lower())
-    for kw in extracted:
-        if kw not in keywords and len(keywords) < 5:
-            keywords.append(kw)
-    if len(keywords) < 3:
-        keywords.extend(["mechanism", "workflow", "parameters"][:3 - len(keywords)])
-
-    if not citation:
-        if chunks:
-            c0 = chunks[0]
-            loc = getattr(c0, "locator_label", None) or f"Page {c0.page_number}"
-            citation = f"[{loc}]"
-        else:
-            citation = "[Canonical Course Reference]"
+    # Keywords: strictly filtered
+    raw_kws = _extract_keywords("\n".join(c.text for c in chunks) if chunks else concept_name, count=5)
+    filtered_kws = [k for k in raw_kws if not concepts.is_generic_term(k) and k not in {"again", "guys", "really", "understand", "stands", "what", "have", "segment"}]
+    if len(filtered_kws) < 3:
+        filtered_kws.extend(["mechanism", "workflow", "algorithm", "parameters"][:3 - len(filtered_kws)])
 
     return {
         "core_intuition": core_intuition.strip(),
         "key_formula_or_mechanism": formula_sent.strip(),
         "worked_mini_example": example_sent.strip(),
-        "essential_keywords": keywords[:5],
-        "exact_source_citation": citation,
+        "essential_keywords": filtered_kws[:5],
+        "exact_source_citation": citation or "[Canonical Curriculum Reference]",
     }
 
 
@@ -228,6 +397,7 @@ def generate_micro_lesson(
     """Generate a cohesive, deeply grounded Active Recall micro-lesson with zero hallucination.
 
     Assembles an expanded context window (>=150-300 words) from adjacent chunks before prompting the LLM.
+    Strictly verifies chunk relevance to prevent cross-contamination across unrelated lectures.
     """
     if not concept_id:
         raise store.UserError("concept_id is required to generate a micro-lesson.")
@@ -239,51 +409,81 @@ def generate_micro_lesson(
     raw_name = concept_name or (concept.get("name", concept_id.replace("_", " ").title()) if concept else concept_id.replace("_", " ").title())
     concept_def = concept.get("definition", "") if concept else ""
 
-    # 1. Retrieve vectorless ground truth chunks and expand window to prevent micro-fragmentation
+    # 1. Retrieve vectorless ground truth chunks and verify relevance
     chunks = GLOBAL_INDEX.retrieve_chunks(concept_id, max_chunks=3, user_id=user_id)
     if not chunks:
         bm25_hits = GLOBAL_INDEX.search_bm25(raw_name, max_chunks=3, user_id=user_id)
         chunks = [hit[1] for hit in bm25_hits]
 
-    # Enforce minimum word-count guardrail with adjacent chunk window expansion
-    expanded_chunks, citation = expand_context_window(chunks, user_id=user_id, min_words=200)
+    # Verify that retrieved chunks actually discuss the target concept (prevent cross-contamination)
+    relevant_chunks = [c for c in chunks if is_chunk_relevant_to_concept(c.text, raw_name, getattr(c, "canonical_concepts", []))]
+    if not relevant_chunks:
+        relevant_chunks = [c for c in chunks if is_chunk_relevant_to_concept(c.text, concept_id.replace("-", " "), getattr(c, "canonical_concepts", []))]
+
+    if relevant_chunks:
+        expanded_chunks, citation = expand_context_window(relevant_chunks, user_id=user_id, min_words=200)
+    else:
+        expanded_chunks = []
+        citation = "[Canonical Academic Domain Curriculum]"
 
     # Sanitize concept name if it was an arbitrary locator like "Segment 00:00"
     resolved_name = _resolve_clean_concept_name(concept_id, raw_name, expanded_chunks)
 
     # 2. Synthesize Study Card via LLM with strict Zero Hallucination grounding rule
     card_data = None
-    if llm.enabled() and expanded_chunks:
-        ctx_text = "\n\n".join(f"[{getattr(c, 'locator_label', None) or f'Page {c.page_number}'}] {c.text}" for c in expanded_chunks)
+    if llm.enabled():
+        if expanded_chunks:
+            ctx_text = "\n\n".join(f"[{getattr(c, 'locator_label', None) or f'Page {c.page_number}'}] {c.text}" for c in expanded_chunks)
+            context_instruction = (
+                f"Context from study material:\n{ctx_text}\n\n"
+                "Ground your explanation, mechanism, and worked example in this material."
+            )
+        else:
+            context_instruction = (
+                "The uploaded study material does not contain specific text for this concept.\n"
+                f"Synthesize an authoritative, textbook-grade study card for '{resolved_name}' using standard academic domain knowledge.\n"
+                "NEVER invent details or reference unrelated topics."
+            )
+
         sys_prompt = (
-            "You are an expert cognitive learning specialist and STEM tutor. Generate a high-yield Active Recall Study Card "
-            "strictly grounded in the provided primary source text.\n\n"
-            "ZERO HALLUCINATION GROUNDING RULES:\n"
-            "1. Every single explanation, mechanism, and example MUST be directly derived from the provided primary context.\n"
-            "2. NEVER output generic placeholder text (such as 'Consider applying X to test inputs: input features are processed through the governing equation...').\n"
-            "3. If mathematical equations are not in the text, explain the concrete operational mechanism or algorithmic workflow described in the material.\n"
-            "4. In the worked mini-example, illustrate the concept with a realistic scenario directly referenced or implied by the lesson text.\n"
-            "5. The essential keywords must be real, high-yield technical terms from the material (NEVER include generic tokens like 'what', 'have', 'segment').\n\n"
+            "You are a distinguished university professor and expert cognitive learning tutor. "
+            f"Generate an authoritative, high-yield Active Recall Study Card for the concept: '{resolved_name}'.\n\n"
+            "STRICT PEDAGOGICAL SPECIFICATIONS:\n"
+            "1. 'core_intuition': A clean, formal 2-3 sentence textbook explanation of the concept (STRICTLY ZERO conversational speaker filler like 'Again guys', 'Wait let me put this', 'So what is X', 'Did you know that'). Explain what it is, its computational purpose, and the core mental model.\n"
+            "2. 'key_formula_or_mechanism': The formal step-by-step algorithmic mechanism, time/space complexity, or mathematical representation. Must be distinct from core intuition.\n"
+            "3. 'worked_mini_example': A concrete, clean code snippet or execution trace example illustrating the concept in practice.\n"
+            "4. 'essential_keywords': 3 to 5 actual domain-specific technical terms related to the concept (STRICTLY FORBIDDEN: generic words like 'what', 'have', 'segment', 'again', 'guys', 'really').\n"
+            "5. 'exact_source_citation': Source citation range (e.g. '[00:00 - 04:30]' or '[Canonical Academic Domain Curriculum]').\n\n"
             "Return ONLY a single valid JSON object with exact keys:\n"
-            '  "core_intuition": "<2-3 substantive sentences explaining the core concept, its purpose, and mental model>",\n'
-            '  "key_formula_or_mechanism": "<governing rule, mathematical relationship, or step-by-step technical mechanism>",\n'
-            '  "worked_mini_example": "<concrete applied mini-example walkthrough grounded in the material>",\n'
-            '  "essential_keywords": ["<keyword 1>", "<keyword 2>", "<keyword 3>", "<keyword 4>", "<keyword 5>"] (3 to 5 real technical domain terms),\n'
-            '  "exact_source_citation": "<citation anchor range e.g. [00:00 - 04:30] or [Pages 1-2]>"'
+            "{\n"
+            '  "core_intuition": "...",\n'
+            '  "key_formula_or_mechanism": "...",\n'
+            '  "worked_mini_example": "...",\n'
+            '  "essential_keywords": ["term1", "term2", "term3", "term4"],\n'
+            '  "exact_source_citation": "..."\n'
+            "}"
         )
-        usr_prompt = f"Target Concept: {resolved_name}\nContext:\n{ctx_text}"
+        usr_prompt = f"Target Concept: {resolved_name}\n\n{context_instruction}"
+
         try:
             raw = llm.complete(sys_prompt, usr_prompt, max_tokens=1000)
             if raw:
                 clean = llm.extract_json_payload(raw)
                 parsed = json.loads(clean)
                 if all(k in parsed for k in ("core_intuition", "key_formula_or_mechanism", "worked_mini_example", "essential_keywords")):
-                    filtered_kws = [str(k).strip().lower() for k in parsed.get("essential_keywords", []) if len(str(k).strip()) >= 3]
+                    filtered_kws = [
+                        str(k).strip().lower() for k in parsed.get("essential_keywords", [])
+                        if len(str(k).strip()) >= 3 and not concepts.is_generic_term(str(k).strip())
+                    ]
+                    clean_core = clean_transcript_sentence(str(parsed["core_intuition"]))
+                    clean_mech = clean_transcript_sentence(str(parsed["key_formula_or_mechanism"]))
+                    clean_ex = str(parsed["worked_mini_example"]).strip()
+
                     card_data = {
-                        "core_intuition": str(parsed["core_intuition"]).strip(),
-                        "key_formula_or_mechanism": str(parsed["key_formula_or_mechanism"]).strip(),
-                        "worked_mini_example": str(parsed["worked_mini_example"]).strip(),
-                        "essential_keywords": filtered_kws[:5] or _extract_keywords(ctx_text, count=5),
+                        "core_intuition": clean_core,
+                        "key_formula_or_mechanism": clean_mech,
+                        "worked_mini_example": clean_ex,
+                        "essential_keywords": filtered_kws[:5] or ["mechanism", "computation", "algorithm"],
                         "exact_source_citation": str(parsed.get("exact_source_citation", citation)).strip(),
                     }
         except Exception as e:

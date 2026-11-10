@@ -13,14 +13,38 @@ from collections import Counter
 from functools import lru_cache
 from pathlib import Path
 from typing import List, Tuple
+from pydantic import BaseModel, Field
 
 import networkx as nx
 
 from ..core import store, llm
-from ..core.text import normalize, STOP, SYN, NORMALIZER
+from ..core.text import normalize, STOP, GENERIC_NON_CONCEPTS, SYN, NORMALIZER, is_generic_term
 from ..models.schemas import ConceptNode, ConceptEdge, GraphExport
 
 MAX_CONCEPTS = 24
+
+ACADEMIC_CS_NOUNS = {
+    "array", "arrays", "queue", "queues", "stack", "stacks", "matrix", "matrices",
+    "tensor", "tensors", "vector", "vectors", "gradient", "gradients", "entropy",
+    "regression", "convolution", "perceptron", "perceptrons", "heuristic", "heuristics",
+    "recursion", "tree", "trees", "graph", "graphs", "node", "nodes", "edge", "edges",
+    "hash", "hashing", "pointer", "pointers", "memory", "cache", "caching", "mutex",
+    "semaphore", "semaphores", "thread", "threads", "process", "processes", "socket",
+    "schema", "schemas", "relation", "relations", "index", "indices", "transaction",
+    "transactions", "normalization", "database", "databases", "embedding", "embeddings",
+    "classifier", "clustering", "loss", "weights", "bias", "activation", "transformer",
+    "attention", "backpropagation", "regularization", "optimizer", "token", "tokens",
+    "tokenizer", "retrieval", "encoder", "decoder", "feedforward", "pipeline", "latency",
+    "throughput", "serializability", "concurrency", "deadlock", "algorithm", "algorithms"
+}
+
+class ExtractedConceptItem(BaseModel):
+    concept: str
+    definition: str = ""
+    prerequisites: List[str] = Field(default_factory=list)
+
+class ExtractedConceptsResponse(BaseModel):
+    concepts: List[ExtractedConceptItem] = Field(default_factory=list)
 
 GENERIC_SECTION_PATTERNS = [
     re.compile(r"^(?:lecture\s+)?segment\b", re.I),
@@ -35,6 +59,14 @@ GENERIC_SECTION_PATTERNS = [
     re.compile(r"^summary$", re.I),
     re.compile(r"^conclusion$", re.I),
     re.compile(r"^\d{1,2}:\d{2}(?::\d{2})?$", re.I),
+    re.compile(r"^core\s+intuition\b", re.I),
+    re.compile(r"^governing\s+mechanism\b", re.I),
+    re.compile(r"^worked\s+example\b", re.I),
+    re.compile(r"^essential\s+concept\b", re.I),
+    re.compile(r"^key\s+takeaways?\b", re.I),
+    re.compile(r"^formula\s*/?\s*mechanism\b", re.I),
+    re.compile(r"^diagnostic\s+check\b", re.I),
+    re.compile(r"^(?:video|audio|segment|slide|page)\s*\d*", re.I),
 ]
 
 
@@ -43,6 +75,8 @@ def is_generic_section_heading(heading: str) -> bool:
     if not heading or not heading.strip():
         return True
     h = heading.strip()
+    if is_generic_term(h):
+        return True
     return any(p.search(h) for p in GENERIC_SECTION_PATTERNS)
 
 # In-memory graph references
@@ -66,7 +100,10 @@ def _slug(s: str) -> str:
 
 
 def _candidate_terms(chunks: list[dict], limit: int) -> list[str]:
-    """Extract candidate domain terms from chunks, partitioning long materials across full timeline."""
+    """Extract candidate domain terms from chunks, partitioning long materials across full timeline.
+    
+    Strictly filters out conversational sentence-starters, verbs, adverbs, and single generic words.
+    """
     if not chunks:
         return []
 
@@ -87,25 +124,34 @@ def _candidate_terms(chunks: list[dict], limit: int) -> list[str]:
         for c in subset:
             words = re.findall(r"[a-z][a-z\-]*", normalize(c["text"]))
             seen = set()
-            for n_gram in (1, 2):
+            for n_gram in (2, 3, 1):
                 for i in range(len(words) - n_gram + 1):
                     g = words[i : i + n_gram]
-                    if g[0] in STOP or g[-1] in STOP or any(len(w) < 3 for w in g):
+                    if any(w in STOP or w in GENERIC_NON_CONCEPTS for w in g):
+                        continue
+                    # 1-grams: MUST be in the strict academic computer science / engineering vocabulary
+                    if n_gram == 1:
+                        w1 = g[0]
+                        if w1 not in ACADEMIC_CS_NOUNS or len(w1) < 4:
+                            continue
+                    if any(len(w) < 3 for w in g):
                         continue
                     t = " ".join(g)
+                    if is_generic_term(t) or is_generic_section_heading(t):
+                        continue
                     tf[t] += 1
                     seen.add(t)
             df.update(seen)
 
         sub_len = len(subset)
         ok = [
-            (tf[t] * (1.6 if " " in t else 1.0), t)
+            (tf[t] * (2.5 if " " in t else 1.0), t)
             for t in tf
-            if (1 <= df[t] <= max(0.85 * sub_len, 2)) and tf[t] >= (2 if sub_len <= 5 else 3)
+            if (1 <= df[t] <= max(0.85 * sub_len, 2)) and tf[t] >= (1 if " " in t else (2 if sub_len <= 5 else 3))
         ]
         res: list[str] = []
         for _, t in sorted(ok, reverse=True):
-            if is_generic_section_heading(t):
+            if is_generic_section_heading(t) or is_generic_term(t):
                 continue
             if not any(t in o or o in t for o in res):
                 res.append(t)
@@ -127,6 +173,90 @@ def _candidate_terms(chunks: list[dict], limit: int) -> list[str]:
         if len(out) >= limit:
             break
     return out
+
+
+def extract_concepts_with_llm(chunks: list[dict]) -> tuple[list[dict], list[tuple[str, str]]]:
+    """Extract authoritative domain concepts, definitions, and pedagogical prerequisites using OpenRouter LLM.
+    
+    Enforces strict Pydantic validation and rejects conversational fillers or timeline locators.
+    """
+    if not llm.enabled() or not chunks:
+        return [], []
+
+    # Sample chunks distributed evenly across beginning (0-33%), middle (33-66%), and end (66-100%)
+    if len(chunks) <= 12:
+        sampled = chunks
+    else:
+        step = len(chunks) / 12.0
+        sampled = [chunks[int(i * step)] for i in range(12)]
+
+    ctx_parts = []
+    for c in sampled:
+        loc = c.get("locator_label") or f"Page {c.get('page', 1)}"
+        sec = c.get("section", "")
+        txt = str(c.get("text", "")).strip()
+        ctx_parts.append(f"[{loc} · {sec}]\n{txt[:600]}")
+    ctx = "\n\n".join(ctx_parts)
+
+    system_prompt = (
+        "You are an expert university curriculum architect and computer science professor. "
+        "Analyze the provided course material chunks (from beginning to end) and extract 6 to 16 genuine "
+        "academic, technical, or scientific concepts taught in this lecture/material.\n\n"
+        "STRICT EXTRACTION RULES:\n"
+        "1. Extract ONLY authentic domain concepts (e.g. data structures, algorithms, mathematical models, system components, engineering frameworks).\n"
+        "2. NEVER extract conversational filler words, verbs, adverbs, or sentence starters (STRICTLY FORBIDDEN: 'Going', 'Right', 'Because', 'Later', 'Already', 'Creating', 'Asking', 'Once Again', 'Small', 'Understand', 'Number', 'Insert', 'Create', 'Model', 'Project', 'Paragraphs', 'Document', 'Extract Text').\n"
+        "3. NEVER extract timeline segments or arbitrary locators (STRICTLY FORBIDDEN: 'Segment 00:00', 'Video [01:15]', 'Page 1', 'Slide 2').\n"
+        "4. For each concept, provide:\n"
+        "   - 'concept': canonical technical concept name in Title Case (e.g. 'Retrieval-Augmented Generation', 'Vector Embeddings', 'Cosine Similarity', 'Binary Search', 'Linked List').\n"
+        "   - 'definition': concise, accurate 1-2 sentence textbook definition.\n"
+        "   - 'prerequisites': list of other extracted concepts that are direct pedagogical prerequisites (must be studied first).\n\n"
+        "Return a valid JSON object matching this schema:\n"
+        "{\n"
+        '  "concepts": [\n'
+        '    {"concept": "<Concept Name>", "definition": "<1-2 sentence definition>", "prerequisites": ["<Prerequisite Concept>", ...]}\n'
+        "  ]\n"
+        "}"
+    )
+
+    user_prompt = f"Study material excerpts across lecture timeline:\n\n{ctx}"
+
+    try:
+        raw = llm.complete(system_prompt, user_prompt, max_tokens=1200)
+        if not raw:
+            return [], []
+        clean_json = llm.extract_json_payload(raw)
+        data = json.loads(clean_json)
+        items_raw = data.get("concepts", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+
+        validated_response = ExtractedConceptsResponse(
+            concepts=[
+                ExtractedConceptItem(
+                    concept=str(item.get("concept", "")).strip().title(),
+                    definition=str(item.get("definition", "")).strip(),
+                    prerequisites=[str(p).strip().title() for p in item.get("prerequisites", []) if str(p).strip()]
+                )
+                for item in items_raw
+                if str(item.get("concept", "")).strip()
+            ]
+        )
+
+        valid_items: list[dict] = []
+        for item in validated_response.concepts:
+            c_name = item.concept
+            if not c_name or is_generic_term(c_name) or is_generic_section_heading(c_name):
+                continue
+            valid_items.append({
+                "concept": c_name,
+                "definition": item.definition,
+                "prerequisites": item.prerequisites,
+            })
+
+        if len(valid_items) < 3:
+            return [], []
+
+        return valid_items, []
+    except Exception as e:
+        return [], []
 
 
 def _llm_extract_definitions_and_prereqs(chunks: list[dict], concept_names: list[str]) -> dict[str, dict]:
@@ -224,38 +354,70 @@ def build(chunks: list[dict]) -> tuple[list[dict], list[list[str]]]:
     """Construct DAG: extract concepts, mine prerequisites, break cycles, and compute topological depth."""
     global _GRAPH, _CONCEPTS_MAP
 
-    names: list[str] = []
-    for c in chunks:
-        sec = str(c.get("section", "")).strip()
-        if not is_generic_section_heading(sec) and sec not in names:
-            names.append(sec)
+    if not chunks:
+        return [], []
 
-    names = names[:MAX_CONCEPTS]
-    if len(names) < MAX_CONCEPTS:
-        for t in _candidate_terms(chunks, MAX_CONCEPTS):
-            if len(names) >= MAX_CONCEPTS:
-                break
-            t_title = t.title()
-            if not is_generic_section_heading(t_title) and t_title not in names:
-                names.append(t_title)
+    chunk_map = {k.get("id", i): k for i, k in enumerate(chunks)}
+
+    # 1. Primary Concept Extraction via OpenRouter LLM (when enabled)
+    llm_concepts, _ = extract_concepts_with_llm(chunks)
+
+    names: list[str] = []
+    definitions: dict[str, str] = {}
+    llm_prereqs: dict[str, list[str]] = {}
+
+    if llm_concepts:
+        for item in llm_concepts:
+            name = item["concept"]
+            if not is_generic_section_heading(name) and not is_generic_term(name) and name not in names:
+                names.append(name)
+                definitions[name.lower()] = item.get("definition", "")
+                llm_prereqs[name.lower()] = item.get("prerequisites", [])
+
+    # If LLM extracted fewer than 4 concepts (or LLM is disabled/offline):
+    # Supplement with strictly filtered section names and candidate domain terms
+    if len(names) < 4:
+        for c in chunks:
+            sec = str(c.get("section", "")).strip()
+            if not is_generic_section_heading(sec) and not is_generic_term(sec) and sec not in names:
+                names.append(sec)
+
+        names = names[:MAX_CONCEPTS]
+        if len(names) < MAX_CONCEPTS:
+            for t in _candidate_terms(chunks, MAX_CONCEPTS):
+                if len(names) >= MAX_CONCEPTS:
+                    break
+                t_title = t.title()
+                if not is_generic_section_heading(t_title) and not is_generic_term(t_title) and t_title not in names:
+                    names.append(t_title)
+
+    # Final post-processing filter to guarantee NO generic terms or locators enter the DAG
+    names = [n for n in names if not is_generic_term(n) and not is_generic_section_heading(n)][:MAX_CONCEPTS]
 
     concepts: list[dict] = []
     used_ids: set[str] = set()
 
     for name in names:
-        c: dict = {"name": name, "key": normalize(name), "definition": ""}
+        c: dict = {"name": name, "key": normalize(name), "definition": definitions.get(name.lower(), "")}
         pat = pattern(c)
-        primary = [k["id"] for k in chunks if k["section"] == name]
-        mentions = [k["id"] for k in chunks if pat.search(normalize(k["text"]))]
+        primary = [k["id"] for k in chunks if k.get("section") == name]
+        mentions = [k["id"] for k in chunks if pat.search(normalize(k.get("text", "")))]
         ids = list(dict.fromkeys(primary + mentions))
         if not ids:
-            continue
+            words = [w for w in normalize(name).split() if w not in STOP and w not in GENERIC_NON_CONCEPTS and len(w) >= 3]
+            for w in words:
+                w_pat = re.compile(r"\b" + re.escape(w) + r"\b", re.I)
+                ids.extend([k["id"] for k in chunks if w_pat.search(normalize(k.get("text", "")))])
+            ids = list(dict.fromkeys(ids))
+        if not ids:
+            ids = [chunks[0]["id"]] if chunks else [0]
+
         cid = _slug(name)
         while cid in used_ids:
             cid += "-2"
         used_ids.add(cid)
 
-        source_pages = sorted(list({chunks[j]["page"] for j in (primary or ids)}))
+        source_pages = sorted(list({chunk_map[j]["page"] for j in (primary or ids) if j in chunk_map and "page" in chunk_map[j]}))
         c.update({
             "id": cid,
             "concept_id": cid,
@@ -271,32 +433,41 @@ def build(chunks: list[dict]) -> tuple[list[dict], list[list[str]]]:
     if not concepts:
         return [], []
 
-    # 1. Structural co-occurrence prerequisite candidate edges
+    # Build validated prerequisite edges:
     edges: set[tuple[str, str]] = set()
-    for b in concepts:
-        text = normalize(" ".join(chunks[j]["text"] for j in (b["primary"] or b["chunks"][:2])))
-        pre = [a for a in concepts if a["order"] < b["order"] and pattern(a).search(text)]
-        edges.update((a["id"], b["id"]) for a in pre[-2:])
-
-    # Dense fallback if sparse
-    if len(edges) < len(concepts) / 2:
-        edges.update((p["id"], q["id"]) for p, q in zip(concepts, concepts[1:]))
-
-    # 2. LLM grounded definitions and verified prerequisites
-    llm_enrichment = _llm_extract_definitions_and_prereqs(chunks, [c["name"] for c in concepts])
     by_name = {c["name"].lower(): c for c in concepts}
-    for name_lower, info in llm_enrichment.items():
-        c = by_name.get(name_lower)
-        if not c:
-            continue
-        if info.get("definition"):
-            c["definition"] = info["definition"]
-        for p_name in info.get("prerequisites", []):
-            p_node = by_name.get(p_name.lower())
-            if p_node and p_node["id"] != c["id"]:
-                edges.add((p_node["id"], c["id"]))
 
-    # 3. Construct NetworkX DiGraph & Break Cycles
+    # 1. Edges from LLM extraction (explicit pedagogical dependencies)
+    for c_item in concepts:
+        p_list = llm_prereqs.get(c_item["name"].lower(), [])
+        for p_name in p_list:
+            p_node = by_name.get(p_name.lower())
+            if p_node and p_node["id"] != c_item["id"]:
+                edges.add((p_node["id"], c_item["id"]))
+
+    # 2. Structural co-occurrence prerequisite candidate edges (only between genuine domain concepts)
+    for b in concepts:
+        text = normalize(" ".join(chunk_map[j]["text"] for j in (b["primary"] or b["chunks"][:2]) if j in chunk_map and "text" in chunk_map[j]))
+        pre = [a for a in concepts if a["order"] < b["order"] and pattern(a).search(text)]
+        for a in pre[-2:]:
+            if a["id"] != b["id"]:
+                edges.add((a["id"], b["id"]))
+
+    # 3. LLM grounded definitions and verified prerequisites enrichment if sparse
+    if not edges and llm.enabled():
+        llm_enrichment = _llm_extract_definitions_and_prereqs(chunks, [c["name"] for c in concepts])
+        for name_lower, info in llm_enrichment.items():
+            c = by_name.get(name_lower)
+            if not c:
+                continue
+            if info.get("definition") and not c["definition"]:
+                c["definition"] = info["definition"]
+            for p_name in info.get("prerequisites", []):
+                p_node = by_name.get(p_name.lower())
+                if p_node and p_node["id"] != c["id"]:
+                    edges.add((p_node["id"], c["id"]))
+
+    # 4. Construct NetworkX DiGraph & Break Cycles
     G = nx.DiGraph()
     page_map = {c["id"]: c["page"] for c in concepts}
     for c in concepts:
@@ -306,7 +477,7 @@ def build(chunks: list[dict]) -> tuple[list[dict], list[list[str]]]:
 
     G = _break_cycles(G, page_map)
 
-    # 4. Compute depths from validated DAG
+    # 5. Compute depths from validated DAG
     depths: dict[str, int] = {}
     for node in nx.topological_sort(G):
         preds = list(G.predecessors(node))

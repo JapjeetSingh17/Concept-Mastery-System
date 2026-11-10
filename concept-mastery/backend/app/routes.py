@@ -1014,6 +1014,7 @@ def post_notes_generate(
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"Failed to generate smart note: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to generate smart note: {e}")
 
 

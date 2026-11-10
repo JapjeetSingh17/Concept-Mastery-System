@@ -222,12 +222,20 @@ class ConceptIndex:
     def search_bm25(self, query: str, max_chunks: int = 4, user_id: str = "default") -> list[tuple[float, ChunkMetadata]]:
         """Vectorless BM25 ranking over inverted full-text index scoped to user_id."""
         import re
+        from .text import STOP, GENERIC_NON_CONCEPTS
         cleaned_query = re.sub(r"[^\w\s]", " ", query).strip()
-        terms = [t for t in cleaned_query.split() if len(t) > 2]
+        non_generic_terms = [t for t in cleaned_query.split() if len(t) > 2 and t.lower() not in STOP and t.lower() not in GENERIC_NON_CONCEPTS]
+        terms = non_generic_terms or [t for t in cleaned_query.split() if len(t) > 2]
         if not terms:
             return []
 
-        fts_match_query = " OR ".join(f'"{t}"' for t in terms[:10])
+        # For multi-word queries, prioritize exact phrase and AND intersection to prevent cross-contamination
+        if len(terms) >= 2:
+            exact_phrase = " ".join(terms)
+            and_clause = " AND ".join(f'"{t}"' for t in terms[:6])
+            fts_match_query = f'"{exact_phrase}" OR ({and_clause})'
+        else:
+            fts_match_query = f'"{terms[0]}"'
 
         with get_db() as conn:
             try:
