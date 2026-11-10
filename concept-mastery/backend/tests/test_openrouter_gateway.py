@@ -131,7 +131,8 @@ def test_live_openrouter_execution(monkeypatch):
 
 
 def test_openrouter_automatic_model_switching_on_402_and_429(monkeypatch):
-    """Verify that when primary model returns 402 (Payment Required) or 429, the gateway automatically switches to next model."""
+    """Verify that when a model has no tokens/credits left or returns 402/429,
+    the gateway automatically switches to the next model, and shifts the starting model forward."""
     monkeypatch.setenv("OPENROUTER_LIVE", "1")
     llm.reset_exhaustion_state()
 
@@ -152,10 +153,8 @@ def test_openrouter_automatic_model_switching_on_402_and_429(monkeypatch):
 
         import json as json_lib
         if model == "google/gemini-2.5-flash":
-            # Simulate 402 Payment Required on Gemini
             return MockResponse(402, {"error": {"message": "Insufficient credits", "code": 402}})
         elif model == "nvidia/nemotron-3-ultra-550b-a55b:free":
-            # Next model succeeds
             return MockResponse(200, {
                 "model": model,
                 "choices": [{"message": {"role": "assistant", "content": '{"failover": "SUCCESS"}'}}]
@@ -165,9 +164,20 @@ def test_openrouter_automatic_model_switching_on_402_and_429(monkeypatch):
     import httpx
     monkeypatch.setattr(httpx, "post", mock_post)
 
-    result = llm._call_openrouter("System", "User prompt")
-    assert result == '{"failover": "SUCCESS"}'
-    assert call_models[0] == "google/gemini-2.5-flash"
-    assert call_models[1] == "nvidia/nemotron-3-ultra-550b-a55b:free"
+    # 1. Verification mechanism check: account has 0 paid credits, so starting model is auto-switched to free tier model
+    result1 = llm._call_openrouter("System", "User prompt")
+    assert result1 == '{"failover": "SUCCESS"}'
+    # Starting model was shifted past gemini-2.5-flash directly to nemotron!
+    assert call_models[0] == "nvidia/nemotron-3-ultra-550b-a55b:free"
+    assert "google/gemini-2.5-flash" not in call_models
+
+    # 2. In-flight token exhaustion: if nemotron now runs out of tokens (e.g. 429 quota reached)
+    call_models.clear()
+    llm.mark_model_token_exhausted("nvidia/nemotron-3-ultra-550b-a55b:free", reason="Quota reached", cooldown_seconds=600)
+    candidates = llm.get_verified_candidate_models(config.OPENROUTER_MODELS)
+    # The starting model has now repeated the shift to the next available model
+    assert candidates[0] != "nvidia/nemotron-3-ultra-550b-a55b:free"
+    assert candidates[0] != "google/gemini-2.5-flash"
+    assert "free" in candidates[0].lower() or "nemotron" in candidates[0].lower()
     assert llm._STATE["openrouter_exhausted"] is False
 

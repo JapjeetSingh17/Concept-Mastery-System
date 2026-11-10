@@ -13,6 +13,7 @@ Execution Order:
 import logging
 import os
 import re
+import time
 from typing import Optional
 from .. import config
 
@@ -25,12 +26,117 @@ _STATE = {
     "groq_exhausted": False,
 }
 
+# In-memory token/credit health tracking per model
+# Format: {model_name: {"has_tokens": bool, "cooldown_until": float, "reason": str}}
+_MODEL_TOKEN_STATUS: dict[str, dict] = {}
+_LAST_CREDITS_CHECK: float = 0.0
+_ACCOUNT_HAS_PAID_CREDITS: Optional[bool] = None
+
 
 def reset_exhaustion_state():
-    """Reset provider exhaustion flags."""
+    """Reset provider exhaustion flags and model token health caches."""
+    global _LAST_CREDITS_CHECK, _ACCOUNT_HAS_PAID_CREDITS
     _STATE["openrouter_exhausted"] = False
     _STATE["gemini_exhausted"] = False
     _STATE["groq_exhausted"] = False
+    _MODEL_TOKEN_STATUS.clear()
+    _LAST_CREDITS_CHECK = 0.0
+    _ACCOUNT_HAS_PAID_CREDITS = None
+
+
+def mark_model_token_exhausted(model: str, reason: str = "402 Payment Required / Out of Credits", cooldown_seconds: int = 3600):
+    """Mark a model as having 0 tokens/credits left so it is immediately skipped at the start."""
+    now = time.time()
+    _MODEL_TOKEN_STATUS[model] = {
+        "has_tokens": False,
+        "cooldown_until": now + cooldown_seconds,
+        "reason": reason,
+    }
+    logger.info(
+        f"[OpenRouter Model Verifier] Marked '{model}' as exhausted ({reason}). "
+        f"Permanently switching starting model to next in priority chain."
+    )
+
+
+def verify_account_has_credits(timeout: float = 4.0) -> bool:
+    """Query OpenRouter credits API to verify if the account has paid credits remaining.
+    Caches result for 60 seconds to avoid spamming the credits endpoint.
+    """
+    global _LAST_CREDITS_CHECK, _ACCOUNT_HAS_PAID_CREDITS
+    now = time.time()
+    if _ACCOUNT_HAS_PAID_CREDITS is not None and (now - _LAST_CREDITS_CHECK) < 60.0:
+        return _ACCOUNT_HAS_PAID_CREDITS
+
+    if is_offline() or os.getenv("PYTEST_CURRENT_TEST"):
+        return True
+
+    if not config.OPENROUTER_API_KEY:
+        _ACCOUNT_HAS_PAID_CREDITS = False
+        return False
+
+    import httpx
+    try:
+        r = httpx.get(
+            f"{config.OPENROUTER_BASE_URL.rstrip('/')}/credits",
+            headers={"Authorization": f"Bearer {config.OPENROUTER_API_KEY}"},
+            timeout=timeout,
+        )
+        if r.status_code == 200:
+            data = r.json().get("data", {})
+            total_credits = float(data.get("total_credits", 0))
+            _ACCOUNT_HAS_PAID_CREDITS = total_credits > 0.0001
+            _LAST_CREDITS_CHECK = now
+            return _ACCOUNT_HAS_PAID_CREDITS
+    except Exception as e:
+        logger.debug(f"[OpenRouter Verifier] Credits preflight check skipped: {e}")
+
+    return _ACCOUNT_HAS_PAID_CREDITS if _ACCOUNT_HAS_PAID_CREDITS is not None else True
+
+
+def is_free_model(model_name: str) -> bool:
+    """Return True if model slug denotes a known free tier model on OpenRouter."""
+    return ":free" in model_name.lower() or "free" in model_name.lower()
+
+
+def get_verified_candidate_models(models_pool: list[str]) -> list[str]:
+    """Verify and order models so that models with active tokens come FIRST.
+
+    If a model (like Model 1) is verified to have 0 tokens/credits, it is moved past
+    so the pipeline starts directly with Model 2. If Model 2 also runs out, it repeats
+    the same and switches the start to Model 3.
+    """
+    now = time.time()
+    candidates = []
+    for m in models_pool:
+        if m not in candidates:
+            candidates.append(m)
+        alias = OPENROUTER_SLUG_ALIASES.get(m)
+        if alias and alias not in candidates:
+            candidates.append(alias)
+
+    # Preflight check: If OpenRouter account has 0 paid credits, mark paid models as out of tokens
+    if not verify_account_has_credits():
+        for m in candidates:
+            if not is_free_model(m) and m not in _MODEL_TOKEN_STATUS:
+                _MODEL_TOKEN_STATUS[m] = {
+                    "has_tokens": False,
+                    "cooldown_until": now + 3600,
+                    "reason": "OpenRouter account balance is $0.00",
+                }
+
+    available_models = []
+    exhausted_models = []
+
+    for m in candidates:
+        st = _MODEL_TOKEN_STATUS.get(m)
+        if st and st.get("cooldown_until", 0) > now and not st.get("has_tokens", True):
+            exhausted_models.append(m)
+        else:
+            available_models.append(m)
+
+    # Models with tokens available come first at the start!
+    # Any exhausted models are placed at the end as a last-resort fallback.
+    return available_models + exhausted_models
 
 
 OPENROUTER_SLUG_ALIASES = {
@@ -123,14 +229,9 @@ def _call_openrouter(system: str, user: str, max_tokens: int = 700) -> Optional[
     messages.append({"role": "user", "content": user})
     is_json = "json" in (system + " " + user).lower()
 
-    # Expand candidate models including aliases
-    candidate_models = []
-    for m in models_pool:
-        if m not in candidate_models:
-            candidate_models.append(m)
-        alias = OPENROUTER_SLUG_ALIASES.get(m)
-        if alias and alias not in candidate_models:
-            candidate_models.append(alias)
+    # Use verified candidate models so models with active tokens start FIRST.
+    # If Model 1 has 0 tokens, Model 2 starts first; if Model 2 runs out, Model 3 starts, repeating down the chain.
+    candidate_models = get_verified_candidate_models(models_pool)
 
     for idx, model in enumerate(candidate_models, 1):
         payload = {
@@ -171,25 +272,28 @@ def _call_openrouter(system: str, user: str, max_tokens: int = 700) -> Optional[
 
                 # Handle 402 Payment Required / Insufficient credits
                 if r.status_code == 402:
+                    mark_model_token_exhausted(model, reason="402 Payment Required / Credit Exhausted", cooldown_seconds=3600)
                     logger.warning(
                         f"[OpenRouter Failover] Model '{model}' returned 402 (Payment Required / Credit Exhausted). "
-                        f"Automatically switching to next model in priority chain..."
+                        f"Permanently switching starting model to next in priority chain..."
                     )
                     break
 
                 # Handle 404 Model Not Found / Retired
                 if r.status_code == 404:
+                    mark_model_token_exhausted(model, reason="404 Model Retired / Unavailable", cooldown_seconds=86400)
                     logger.warning(
                         f"[OpenRouter Failover] Model '{model}' returned 404 (Retired/Unavailable). "
-                        f"Automatically switching to next model..."
+                        f"Permanently switching starting model to next in priority chain..."
                     )
                     break
 
                 # Handle 429/403 Rate Limit / Quota Exceeded
                 if r.status_code in (429, 403) or "rate_limit" in r.text.lower():
+                    mark_model_token_exhausted(model, reason=f"HTTP {r.status_code} Rate Limit / Quota Exceeded", cooldown_seconds=600)
                     logger.warning(
                         f"[OpenRouter Failover] Model '{model}' returned {r.status_code} (Rate Limit). "
-                        f"Automatically switching to next model..."
+                        f"Automatically switching starting model to next in priority chain..."
                     )
                     break
 
@@ -201,9 +305,10 @@ def _call_openrouter(system: str, user: str, max_tokens: int = 700) -> Optional[
                 break
 
             except httpx.TimeoutException:
+                mark_model_token_exhausted(model, reason="Timeout after 8.0s", cooldown_seconds=300)
                 logger.warning(
                     f"[OpenRouter Failover] Model '{model}' timed out after 8.0s. "
-                    f"Automatically switching to next model..."
+                    f"Automatically switching starting model to next in priority chain..."
                 )
                 break
             except Exception as e:
