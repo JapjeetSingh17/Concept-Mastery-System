@@ -129,8 +129,9 @@ def generate_quiz_node(state: LoopState) -> LoopState:
         state["next_step"] = "DIAGNOSE"
         return state
 
+    uid = state.get("user_id", "default")
     try:
-        questions = quiz.generate_diagnostic_quiz(target_cid, count=3)
+        questions = quiz.generate_diagnostic_quiz(target_cid, count=3, user_id=uid)
         state["quiz_questions"] = [q.model_dump() for q in questions]
         state["next_step"] = "WAITING_FOR_SUBMISSION"
     except Exception as e:

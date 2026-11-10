@@ -733,7 +733,7 @@ def post_diagnostic_start(body: dict | None = None, current_user: User = Depends
     seen_qids = set()
     for cid in target_cids:
         try:
-            qs = quiz.generate_diagnostic_quiz(cid, count=1)
+            qs = quiz.generate_diagnostic_quiz(cid, count=1, user_id=uid, kb=kb)
             for q in qs:
                 if q.question_id not in seen_qids:
                     seen_qids.add(q.question_id)
@@ -744,10 +744,39 @@ def post_diagnostic_start(body: dict | None = None, current_user: User = Depends
                     questions.append(qd)
                     if len(questions) >= 6:
                         break
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed generating diagnostic question for {cid}: {e}")
         if len(questions) >= 6:
             break
+
+    # If still fewer than 6 questions, cycle through available concepts to complete the set
+    if len(questions) < 6 and concepts_list:
+        idx = 0
+        attempts = 0
+        while len(questions) < 6 and attempts < 15:
+            c = concepts_list[idx % len(concepts_list)]
+            cid = c.get("id")
+            idx += 1
+            attempts += 1
+            try:
+                qs = quiz.generate_diagnostic_quiz(cid, count=1, user_id=uid, kb=kb, offset=len(questions))
+                for q in qs:
+                    if q.question_id not in seen_qids:
+                        seen_qids.add(q.question_id)
+                        qd = q.model_dump()
+                        qd["conceptName"] = c.get("name", cid)
+                        qd["conceptId"] = cid
+                        questions.append(qd)
+                        if len(questions) >= 6:
+                            break
+            except Exception as e:
+                logger.warning(f"Fallback diagnostic question for {cid} failed: {e}")
+
+    if not questions:
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to generate diagnostic questions from the active study material."
+        )
 
     return {
         "ok": True,

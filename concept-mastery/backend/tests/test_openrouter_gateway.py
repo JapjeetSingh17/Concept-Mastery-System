@@ -162,6 +162,16 @@ def test_openrouter_automatic_model_switching_on_402_and_429(monkeypatch):
         return MockResponse(500, "Internal Server Error")
 
     import httpx
+
+    def mock_get(url, headers=None, timeout=None):
+        class MockGetResponse:
+            def __init__(self):
+                self.status_code = 200
+            def json(self):
+                return {"data": {"total_credits": 0.0}}
+        return MockGetResponse()
+
+    monkeypatch.setattr(httpx, "get", mock_get)
     monkeypatch.setattr(httpx, "post", mock_post)
 
     # 1. Verification mechanism check: account has 0 paid credits, so starting model is auto-switched to free tier model

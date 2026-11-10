@@ -236,3 +236,58 @@ def test_non_duplicate_quiz_variants_and_remedial(clean_diagnostic_student, tmp_
     assert remedial_data["is_remedial"] is True
     assert remedial_data["root_cause_concept"] == "gradient-descent"
     assert remedial_data["remedial_lesson"] is not None
+
+
+def test_non_default_user_diagnostic_start_generates_six_questions(tmp_path):
+    """Verifies that non-default users (e.g. Google OAuth user_id) generate 6 diagnostic questions.
+
+    Guarantees that POST /api/diagnostic/start correctly passes user_id and kb to
+    generate_diagnostic_quiz, avoiding the 'No diagnostic questions could be generated' modal error.
+    """
+    student_id = "google_alan_turing_test"
+    headers = {"X-Dev-User-Id": student_id}
+
+    store.clear_all_study_materials(student_id)
+    store.clear_kb(student_id)
+
+    # Ingest study material for this specific user
+    study_file = tmp_path / "cpp_dsa_arrays.md"
+    study_file.write_text(
+        "# C++ DSA Arrays and Memory\n\n"
+        "## Array Data Structure\n"
+        "An array is a collection of elements stored at contiguous memory locations. "
+        "It provides O(1) random access time using zero-based index arithmetic.\n\n"
+        "## Static Memory Allocation\n"
+        "Static memory allocation occurs on the stack at compile-time with fixed size.\n\n"
+        "## Dynamic Memory Allocation\n"
+        "Dynamic memory allocation uses the heap via new and delete operators in C++.\n\n"
+        "## Linear Search\n"
+        "Linear search sequentially checks each element of an array until a match is found. "
+        "The time complexity of linear search in the worst case is O(n).\n\n"
+        "## Array Traversal\n"
+        "Array traversal visits each element sequentially from index 0 to size minus one.\n\n"
+        "## Two Sum Problem\n"
+        "The Two Sum problem finds two numbers in an array that add up to a specific target value.\n"
+    )
+
+    UniversalMaterialIngestor.ingest_file(study_file, user_id=student_id, title="C++ DSA Arrays and Memory")
+
+    # Call POST /api/diagnostic/start as the non-default user
+    res = client.post("/api/diagnostic/start", headers=headers, json={"user_id": student_id})
+    assert res.status_code == 200, f"Expected 200, got {res.status_code}: {res.text}"
+
+    data = res.json()
+    assert data["ok"] is True
+    assert "questions" in data
+    assert len(data["questions"]) == 6, f"Expected 6 questions, got {len(data['questions'])}"
+
+    for q in data["questions"]:
+        assert q.get("question_id") or q.get("id"), "Missing question ID"
+        assert q.get("question_text"), "Missing question text"
+        assert q.get("conceptId"), "Missing conceptId"
+        assert q.get("conceptName"), "Missing conceptName"
+
+    # Cleanup
+    store.clear_all_study_materials(student_id)
+    store.clear_kb(student_id)
+

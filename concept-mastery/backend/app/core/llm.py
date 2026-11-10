@@ -68,7 +68,7 @@ def verify_account_has_credits(timeout: float = 4.0) -> bool:
     if _ACCOUNT_HAS_PAID_CREDITS is not None and (now - _LAST_CREDITS_CHECK) < 60.0:
         return _ACCOUNT_HAS_PAID_CREDITS
 
-    if is_offline() or os.getenv("PYTEST_CURRENT_TEST"):
+    if is_offline() or (os.getenv("PYTEST_CURRENT_TEST") and not os.getenv("OPENROUTER_LIVE")):
         return True
 
     if not config.OPENROUTER_API_KEY:
@@ -660,9 +660,13 @@ def complete(system: str, user: str, max_tokens: int = 700) -> Optional[str]:
 
 def reset_exhaustion_state():
     """Reset failover flags to allow retrying providers."""
+    global _ACCOUNT_HAS_PAID_CREDITS, _LAST_CREDITS_CHECK
     _STATE["openrouter_exhausted"] = False
     _STATE["gemini_exhausted"] = False
     _STATE["groq_exhausted"] = False
+    _MODEL_TOKEN_STATUS.clear()
+    _ACCOUNT_HAS_PAID_CREDITS = None
+    _LAST_CREDITS_CHECK = 0.0
 
 
 # Public aliases for testing & compatibility

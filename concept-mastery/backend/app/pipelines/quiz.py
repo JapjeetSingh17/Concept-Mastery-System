@@ -304,7 +304,11 @@ def generate_diagnostic_quiz(
             ]
 
     if not chunks:
-        raise store.UserError(f"No textual material available to generate questions for {concept['name']}.")
+        all_user_chunks = GLOBAL_INDEX.get_all_chunks(user_id=user_id)
+        if all_user_chunks:
+            chunks = all_user_chunks[:2]
+        else:
+            raise store.UserError(f"No textual material available to generate questions for {concept['name']}.")
 
     questions: list[QuizQuestion] = []
 
