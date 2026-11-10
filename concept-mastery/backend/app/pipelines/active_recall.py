@@ -468,9 +468,11 @@ def generate_micro_lesson(
         try:
             raw = llm.complete(sys_prompt, usr_prompt, max_tokens=1000)
             if raw:
-                clean = llm.extract_json_payload(raw)
-                parsed = json.loads(clean)
-                if all(k in parsed for k in ("core_intuition", "key_formula_or_mechanism", "worked_mini_example", "essential_keywords")):
+                parsed = llm.safe_json_loads(raw)
+                if not isinstance(parsed, dict):
+                    clean = llm.extract_json_payload(raw)
+                    parsed = json.loads(clean, strict=False) if clean else {}
+                if isinstance(parsed, dict) and all(k in parsed for k in ("core_intuition", "key_formula_or_mechanism", "worked_mini_example", "essential_keywords")):
                     filtered_kws = [
                         str(k).strip().lower() for k in parsed.get("essential_keywords", [])
                         if len(str(k).strip()) >= 3 and not concepts.is_generic_term(str(k).strip())
@@ -717,15 +719,18 @@ def evaluate_session(
         try:
             raw = llm.complete(judge_sys, judge_usr, max_tokens=800)
             if raw:
-                clean_json = llm.extract_json_payload(raw)
-                eval_data = json.loads(clean_json)
-                retrieval_score = max(0.0, min(1.0, float(eval_data.get("retrieval_score", 0.5))))
-                depth = str(eval_data.get("reasoning_depth_level", "DEVELOPING")).upper()
-                if depth in ("SURFACE_ROTE", "DEVELOPING", "DEEP_CONCEPTUAL"):
-                    reasoning_depth_level = depth
-                retained_concepts = [str(c).strip() for c in eval_data.get("retained_concepts", [])]
-                missed_gaps = [str(g).strip() for g in eval_data.get("missed_gaps", [])]
-                feedback = str(eval_data.get("feedback", "")).strip()
+                eval_data = llm.safe_json_loads(raw)
+                if not isinstance(eval_data, dict):
+                    clean_json = llm.extract_json_payload(raw)
+                    eval_data = json.loads(clean_json, strict=False) if clean_json else {}
+                if isinstance(eval_data, dict):
+                    retrieval_score = max(0.0, min(1.0, float(eval_data.get("retrieval_score", 0.5))))
+                    depth = str(eval_data.get("reasoning_depth_level", "DEVELOPING")).upper()
+                    if depth in ("SURFACE_ROTE", "DEVELOPING", "DEEP_CONCEPTUAL"):
+                        reasoning_depth_level = depth
+                    retained_concepts = [str(c).strip() for c in eval_data.get("retained_concepts", [])]
+                    missed_gaps = [str(g).strip() for g in eval_data.get("missed_gaps", [])]
+                    feedback = str(eval_data.get("feedback", "")).strip()
         except Exception as e:
             logger.warning(f"LLM AI Mastery Judge fallback triggered: {e}")
 

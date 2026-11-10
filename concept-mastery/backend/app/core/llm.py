@@ -10,11 +10,12 @@ Execution Order:
   5. Offline: Extractive / heuristic deterministic pipelines
 """
 
+import json
 import logging
 import os
 import re
 import time
-from typing import Optional
+from typing import Any, Optional
 from .. import config
 
 logger = logging.getLogger("concept_mastery.llm")
@@ -180,31 +181,185 @@ def sanitize_llm_response(text: str) -> str:
     return cleaned.strip()
 
 
-def extract_json_payload(text: str) -> str:
-    """Sanitize output, remove markdown code fences, and extract raw JSON object or array."""
-    if not text:
+def repair_json_string(s: str) -> str:
+    """Repair common malformations in LLM-generated JSON strings.
+
+    Fixes:
+      1. Strips markdown fences (```json ... ```) and reasoning tags (<think>...</think>).
+      2. Locates opening object '{' or array '['.
+      3. Normalizes Python literals (None -> null, True -> true, False -> false).
+      4. Fixes escaped quotes immediately preceding delimiters or closures (e.g. \\"} -> "}).
+      5. Fixes unescaped internal double quotes inside string values.
+      6. Converts literal newlines and control characters inside strings into valid escape sequences.
+      7. Balances unclosed quotes and unclosed curly/square brackets caused by token truncation.
+      8. Strips invalid trailing commas before '}' and ']'.
+    """
+    if not s or not s.strip():
         return ""
-    cleaned = sanitize_llm_response(text)
+    cleaned = sanitize_llm_response(s)
 
-    # Strip markdown code fences if present (```json ... ``` or ``` ... ```)
-    fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, re.IGNORECASE)
-    if fence_match:
-        cleaned = fence_match.group(1).strip()
+    # 1. Strip markdown fences if present
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, re.IGNORECASE)
+    if fence:
+        cleaned = fence.group(1).strip()
 
-    # Locate outermost JSON structure ({...} or [...])
+    # 2. Slice from first opening { or [
     first_obj = cleaned.find("{")
     first_arr = cleaned.find("[")
-
     if first_obj != -1 and (first_arr == -1 or first_obj < first_arr):
-        last_obj = cleaned.rfind("}")
-        if last_obj != -1 and last_obj > first_obj:
-            return cleaned[first_obj:last_obj + 1].strip()
+        cleaned = cleaned[first_obj:]
     elif first_arr != -1:
-        last_arr = cleaned.rfind("]")
-        if last_arr != -1 and last_arr > first_arr:
-            return cleaned[first_arr:last_arr + 1].strip()
+        cleaned = cleaned[first_arr:]
 
-    return cleaned.strip()
+    # 3. Replace common Python constants if present outside quotes
+    cleaned = re.sub(r':\s*None\b', ': null', cleaned)
+    cleaned = re.sub(r':\s*True\b', ': true', cleaned)
+    cleaned = re.sub(r':\s*False\b', ': false', cleaned)
+
+    # 4. Pre-pass: replace \" before delimiters or closures
+    cleaned = re.sub(r'\\\"(\s*[,\}\]])', r'"\1', cleaned)
+    # Strip trailing commas before closures
+    cleaned = re.sub(r",\s*([\]}])", r"\1", cleaned)
+
+    # 5. Token scanner to balance quotes, escape inner quotes, and close brackets
+    in_string = False
+    escape = False
+    stack = []
+    repaired_chars = []
+
+    i = 0
+    n = len(cleaned)
+    while i < n:
+        c = cleaned[i]
+        if in_string:
+            if escape:
+                escape = False
+                repaired_chars.append(c)
+            elif c == "\\":
+                escape = True
+                repaired_chars.append(c)
+            elif c == '"':
+                # Check if this quote closes the string
+                rest = cleaned[i + 1:].lstrip()
+                if not rest or rest[0] in ":,}]":
+                    in_string = False
+                    repaired_chars.append(c)
+                else:
+                    # Inner unescaped quote -> escape it
+                    repaired_chars.append('\\"')
+            elif c == "\n":
+                repaired_chars.append("\\n")
+            elif c == "\r":
+                pass
+            elif c == "\t":
+                repaired_chars.append("\\t")
+            else:
+                repaired_chars.append(c)
+        else:
+            if c == '"':
+                in_string = True
+                repaired_chars.append(c)
+            elif c in "{[":
+                stack.append(c)
+                repaired_chars.append(c)
+            elif c == "}":
+                if stack and stack[-1] == "{":
+                    stack.pop()
+                    repaired_chars.append(c)
+            elif c == "]":
+                if stack and stack[-1] == "[":
+                    stack.pop()
+                    repaired_chars.append(c)
+            else:
+                repaired_chars.append(c)
+        i += 1
+
+    result = "".join(repaired_chars)
+
+    # If still in string at end of text (e.g. truncated generation), terminate string
+    if in_string:
+        while result.endswith("\\"):
+            result = result[:-1]
+        result += '"'
+
+    result = re.sub(r",\s*$", "", result.strip())
+
+    # Close remaining open brackets
+    while stack:
+        b = stack.pop()
+        if b == "{":
+            result += "}"
+        elif b == "[":
+            result += "]"
+
+    result = re.sub(r",\s*([\]}])", r"\1", result)
+    return result
+
+
+def _regex_extract_json_dict(text: str) -> Optional[dict]:
+    """Fallback extraction of top-level key-values from partially mangled JSON strings."""
+    res = {}
+    for m in re.finditer(r'["\']([a-zA-Z0-9_]+)["\']\s*:\s*["\']([^"\']*)["\']', text):
+        res[m.group(1)] = m.group(2)
+    for m in re.finditer(r'["\']([a-zA-Z0-9_]+)["\']\s*:\s*\[(.*?)\]', text, flags=re.DOTALL):
+        k = m.group(1)
+        raw_list = m.group(2)
+        items = re.findall(r'["\']([^"\']+)["\']', raw_list)
+        res[k] = items
+    return res if res else None
+
+
+def safe_json_loads(text: str) -> Any:
+    """Safely parse JSON from LLM output, applying tiered repair passes if standard parsing fails."""
+    if not text or not text.strip():
+        return None
+
+    cleaned = sanitize_llm_response(text)
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, re.IGNORECASE)
+    candidate = fence.group(1).strip() if fence else cleaned.strip()
+
+    # Pass 1: Direct strict=False json.loads (fast path for well-formed JSON)
+    try:
+        return json.loads(candidate, strict=False)
+    except Exception:
+        pass
+
+    # Pass 2: Syntactic repair (escaped quotes, unclosed strings, truncated braces, trailing commas)
+    try:
+        repaired = repair_json_string(cleaned)
+        if repaired:
+            return json.loads(repaired, strict=False)
+    except Exception:
+        pass
+
+    # Pass 3: Python AST literal evaluation (if LLM returned Python-formatted dict or list)
+    try:
+        import ast
+        data = ast.literal_eval(candidate)
+        if isinstance(data, (dict, list)):
+            return data
+    except Exception:
+        pass
+
+    # Pass 4: Regex-based recovery for dictionary fields
+    try:
+        extracted = _regex_extract_json_dict(cleaned)
+        if extracted:
+            return extracted
+    except Exception:
+        pass
+
+    return None
+
+
+def extract_json_payload(text: str) -> str:
+    """Sanitize output, remove markdown code fences, and extract repaired raw JSON object or array."""
+    if not text:
+        return ""
+    repaired = repair_json_string(text)
+    if repaired:
+        return repaired
+    return sanitize_llm_response(text).strip()
 
 
 def _call_openrouter(system: str, user: str, max_tokens: int = 700) -> Optional[str]:

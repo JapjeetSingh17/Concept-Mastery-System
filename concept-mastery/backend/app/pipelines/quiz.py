@@ -363,8 +363,12 @@ def generate_diagnostic_quiz(
         try:
             raw = llm.complete(system_prompt, user_prompt, max_tokens=1400)
             if raw:
-                clean_json = llm.extract_json_payload(raw)
-                arr = json.loads(clean_json)
+                arr = llm.safe_json_loads(raw)
+                if not isinstance(arr, list):
+                    clean_json = llm.extract_json_payload(raw)
+                    arr = json.loads(clean_json, strict=False) if clean_json else []
+                if not isinstance(arr, list):
+                    arr = []
                 c_name_lower = concept["name"].lower().strip()
                 for item in arr:
                     q_type = str(item.get("question_type", "mcq")).lower()

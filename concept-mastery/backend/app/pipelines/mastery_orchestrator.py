@@ -77,6 +77,12 @@ Respond with ONLY a single valid JSON object matching this schema:
   },
   "explainable_summary": "<str>"
 }
+
+CRITICAL FORMATTING & SYNTAX CONSTRAINTS:
+- Deliver ONLY a single raw valid JSON object. Do not include markdown code fences or conversational text.
+- NEVER use unescaped double quotes inside string values; use single quotes (') for any quoted terms or words inside values.
+- Keep all string values on a single line without raw newlines.
+- Ensure all brackets, braces, and quotes are properly balanced and closed.
 """
 
 
@@ -755,26 +761,53 @@ Deliver your authoritative Head Teacher deliberation strictly in JSON format."""
 
             raw = llm.complete(system=HEAD_TEACHER_SYSTEM, user=user_prompt, max_tokens=1200)
             if raw:
-                payload = json.loads(llm.extract_json_payload(raw))
-                parsed_decision = HeadTeacherDecision(**payload)
+                payload = llm.safe_json_loads(raw)
+                if not payload or not isinstance(payload, dict):
+                    clean_str = llm.extract_json_payload(raw)
+                    payload = json.loads(clean_str, strict=False)
 
-                # Hard architectural safety overrides on LLM response
-                prereqs = evidence_pkg.get("prerequisites", [])
-                weak_prereqs = [p for p in prereqs if p.get("status") == "WEAK" or p.get("outcome") == "NOT_YET_MASTERED"]
-                if weak_prereqs and parsed_decision.outcome == "MASTERED":
-                    parsed_decision.outcome = "NOT_YET_MASTERED"
-                    parsed_decision.legacy_status = "WEAK"
-                    parsed_decision.remaining_gaps.append(
-                        f"Compromised foundation: Prerequisite '{weak_prereqs[0]['concept_id']}' is WEAK in DAG."
-                    )
-                    parsed_decision.recommended_next_action = f"Backtrack to prerequisite '{weak_prereqs[0]['concept_id']}'."
+                if isinstance(payload, dict):
+                    if "concept_id" not in payload or not payload["concept_id"]:
+                        payload["concept_id"] = cid
 
-                # If thin evidence and LLM gave MASTERED, guardrail it
-                if len(ev_records) <= 1 and parsed_decision.outcome == "MASTERED":
-                    parsed_decision.outcome = "INSUFFICIENT_EVIDENCE"
-                    parsed_decision.legacy_status = "UNKNOWN"
+                    # Normalize outcome and legacy_status to uppercase literals
+                    if isinstance(payload.get("outcome"), str):
+                        out_upper = payload["outcome"].strip().upper()
+                        if out_upper in ("MASTERED", "NOT_YET_MASTERED", "INSUFFICIENT_EVIDENCE"):
+                            payload["outcome"] = out_upper
+                        else:
+                            payload["outcome"] = "INSUFFICIENT_EVIDENCE"
 
-                return parsed_decision
+                    if isinstance(payload.get("legacy_status"), str):
+                        leg_upper = payload["legacy_status"].strip().upper()
+                        if leg_upper in ("STRONG", "WEAK", "UNKNOWN"):
+                            payload["legacy_status"] = leg_upper
+                        else:
+                            payload["legacy_status"] = "STRONG" if payload.get("outcome") == "MASTERED" else "WEAK"
+
+                    for lk in ("demonstrated_understanding", "remaining_gaps", "supporting_evidence_refs", "unresolved_disagreements"):
+                        if not isinstance(payload.get(lk), list):
+                            payload[lk] = [str(payload[lk])] if payload.get(lk) else []
+
+                    parsed_decision = HeadTeacherDecision(**payload)
+
+                    # Hard architectural safety overrides on LLM response
+                    prereqs = evidence_pkg.get("prerequisites", [])
+                    weak_prereqs = [p for p in prereqs if p.get("status") == "WEAK" or p.get("outcome") == "NOT_YET_MASTERED"]
+                    if weak_prereqs and parsed_decision.outcome == "MASTERED":
+                        parsed_decision.outcome = "NOT_YET_MASTERED"
+                        parsed_decision.legacy_status = "WEAK"
+                        parsed_decision.remaining_gaps.append(
+                            f"Compromised foundation: Prerequisite '{weak_prereqs[0]['concept_id']}' is WEAK in DAG."
+                        )
+                        parsed_decision.recommended_next_action = f"Backtrack to prerequisite '{weak_prereqs[0]['concept_id']}'."
+
+                    # If thin evidence and LLM gave MASTERED, guardrail it
+                    if len(ev_records) <= 1 and parsed_decision.outcome == "MASTERED":
+                        parsed_decision.outcome = "INSUFFICIENT_EVIDENCE"
+                        parsed_decision.legacy_status = "UNKNOWN"
+
+                    return parsed_decision
         except Exception as e:
             logger.warning(f"LLM Head Teacher deliberation failed ({e}); falling back to deterministic arbiter.")
 

@@ -224,8 +224,10 @@ def extract_concepts_with_llm(chunks: list[dict]) -> tuple[list[dict], list[tupl
         raw = llm.complete(system_prompt, user_prompt, max_tokens=1200)
         if not raw:
             return [], []
-        clean_json = llm.extract_json_payload(raw)
-        data = json.loads(clean_json)
+        data = llm.safe_json_loads(raw)
+        if not data:
+            clean_json = llm.extract_json_payload(raw)
+            data = json.loads(clean_json, strict=False) if clean_json else {}
         items_raw = data.get("concepts", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
 
         validated_response = ExtractedConceptsResponse(
@@ -295,8 +297,12 @@ def _llm_extract_definitions_and_prereqs(chunks: list[dict], concept_names: list
         raw = llm.complete(system_prompt, user_prompt, max_tokens=800)
         if not raw:
             return {}
-        clean_json = llm.extract_json_payload(raw)
-        arr = json.loads(clean_json)
+        arr = llm.safe_json_loads(raw)
+        if not isinstance(arr, list):
+            clean_json = llm.extract_json_payload(raw)
+            arr = json.loads(clean_json, strict=False) if clean_json else []
+        if not isinstance(arr, list):
+            arr = []
         results = {}
         valid = {n.lower() for n in concept_names}
         for item in arr:

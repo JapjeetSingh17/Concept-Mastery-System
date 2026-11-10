@@ -378,18 +378,21 @@ Generate the smart note JSON now:"""
         try:
             raw_res = llm.complete(system_prompt, user_prompt, max_tokens=1500)
             if raw_res:
-                parsed_json = llm.extract_json_payload(raw_res)
-                if parsed_json:
-                    try:
-                        data = json.loads(parsed_json)
-                        title = data.get("title", f"Smart Notes: {concept_name}")
-                        markdown_content = data.get("markdown_content", "")
-                        key_takeaways = data.get("key_takeaways", [])
-                        res_citations = data.get("citations", [])
-                        if res_citations:
-                            citations = res_citations
-                    except Exception:
-                        parsed_json = None
+                data = llm.safe_json_loads(raw_res)
+                if not isinstance(data, dict):
+                    parsed_json = llm.extract_json_payload(raw_res)
+                    if parsed_json:
+                        try:
+                            data = json.loads(parsed_json, strict=False)
+                        except Exception:
+                            data = None
+                if isinstance(data, dict):
+                    title = data.get("title", f"Smart Notes: {concept_name}")
+                    markdown_content = data.get("markdown_content", "")
+                    key_takeaways = data.get("key_takeaways", [])
+                    res_citations = data.get("citations", [])
+                    if res_citations:
+                        citations = res_citations
 
                 # Fallback to direct Markdown extraction if JSON parsing didn't produce markdown_content
                 if not markdown_content:

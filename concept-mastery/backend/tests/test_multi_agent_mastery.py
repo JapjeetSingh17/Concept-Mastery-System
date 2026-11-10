@@ -616,3 +616,104 @@ def test_specialist_agent_roles_and_confidence():
         assert specialist.concept_id == concept_id
         assert specialist.assessment_confidence in ("low", "moderate", "high")
         assert len(specialist.findings) > 0
+
+
+# ── Test 18: Head Teacher Unterminated String & Unescaped Quotes Repair ──────
+def test_head_teacher_repair_unterminated_string_and_unescaped_quotes():
+    """Verifies Head Teacher deliberation handles unterminated strings and unescaped quotes without crashing.
+
+    Directly addresses terminal error:
+      'LLM Head Teacher deliberation failed (Unterminated string starting at: line 1 column 139 (char 138))'
+    """
+    from app.core import llm
+
+    concept_id = "vector_database"
+    pkg = {
+        "concept_id": concept_id,
+        "concept_name": "Vector Database",
+        "evidence_history": [
+            {"evidence_id": "ev1", "student_answer": "embed", "hints_used": 0},
+            {"evidence_id": "ev2", "student_answer": "cosine", "hints_used": 0},
+        ],
+        "evidence_records": [
+            {"evidence_id": "ev1", "student_answer": "embed", "hints_used": 0},
+            {"evidence_id": "ev2", "student_answer": "cosine", "hints_used": 0},
+        ],
+        "prerequisites": [],
+        "follow_up_count": 0,
+    }
+
+    # Case A: Unterminated string at char 138 (cut off by max_tokens)
+    raw_unterminated = (
+        '{\n'
+        '  "concept_id": "vector_database",\n'
+        '  "outcome": "MASTERED",\n'
+        '  "legacy_status": "STRONG",\n'
+        '  "supporting_evidence_refs": ["ev1"],\n'
+        '  "demonstrated_understanding": ["Student understands embeddings", "Applied cosine similarity accurately"],\n'
+        '  "remaining_gaps": [],\n'
+        '  "unresolved_disagreements": [],\n'
+        '  "recommended_next_action": "Proceed to ANN index",\n'
+        '  "explainable_summary": "The student demonstrated clear mastery over Vector Database without any hesita'
+    )
+
+    with patch.object(llm, "complete", return_value=raw_unterminated):
+        with patch.object(llm, "enabled", return_value=True):
+            decision = mastery_orchestrator.run_head_teacher_arbiter(pkg, [])
+            assert isinstance(decision, HeadTeacherDecision)
+            assert decision.concept_id == "vector_database"
+            assert decision.outcome == "MASTERED"
+            assert decision.legacy_status == "STRONG"
+            assert "Vector Database" in decision.explainable_summary
+
+    # Case B: Unescaped internal double quotes inside string fields
+    raw_unescaped_quotes = (
+        '{\n'
+        '  "concept_id": "vector_database",\n'
+        '  "outcome": "NOT_YET_MASTERED",\n'
+        '  "legacy_status": "WEAK",\n'
+        '  "supporting_evidence_refs": ["ev1"],\n'
+        '  "demonstrated_understanding": ["The student said "Vector Database" is just a normal hash map"],\n'
+        '  "remaining_gaps": ["Student confused "embeddings" with "hash keys""],\n'
+        '  "unresolved_disagreements": [],\n'
+        '  "recommended_next_action": "Review high-dimensional vector space",\n'
+        '  "explainable_summary": "Misconception detected: "Vector Database" is not a hash map."\n'
+        '}'
+    )
+
+    with patch.object(llm, "complete", return_value=raw_unescaped_quotes):
+        with patch.object(llm, "enabled", return_value=True):
+            decision = mastery_orchestrator.run_head_teacher_arbiter(pkg, [])
+            assert isinstance(decision, HeadTeacherDecision)
+            assert decision.outcome == "NOT_YET_MASTERED"
+            assert decision.legacy_status == "WEAK"
+            assert len(decision.demonstrated_understanding) > 0
+
+
+# ── Test 19: Comprehensive safe_json_loads Resiliency ────────────────────────
+def test_safe_json_loads_resiliency():
+    """Verifies app.core.llm.safe_json_loads handles diverse LLM syntactic anomalies."""
+    from app.core import llm
+
+    # 1. Trailing commas
+    res = llm.safe_json_loads('{"a": 1, "b": [2, 3, ], }')
+    assert res == {"a": 1, "b": [2, 3]}
+
+    # 2. Literal newlines in string
+    res = llm.safe_json_loads('{"summary": "Line 1\nLine 2"}')
+    assert res == {"summary": "Line 1\nLine 2"}
+
+    # 3. Escaped quote followed by brace (\"})
+    res = llm.safe_json_loads('{"summary": "hello\\"}')
+    assert res == {"summary": "hello"}
+
+    # 4. Truncated array
+    res = llm.safe_json_loads('[{"concept": "A"}, {"concept": "B"')
+    assert isinstance(res, list) and len(res) == 2
+
+    # 5. Single-quoted Python representation
+    res = llm.safe_json_loads("{'concept_id': 'c1', 'outcome': 'MASTERED', 'flag': True, 'val': None}")
+    assert res["concept_id"] == "c1"
+    assert res["flag"] is True
+    assert res["val"] is None
+

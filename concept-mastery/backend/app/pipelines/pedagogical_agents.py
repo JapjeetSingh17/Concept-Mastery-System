@@ -194,13 +194,14 @@ def _call_llm_json(system_prompt: str, user_prompt: str, max_tokens: int = 1000)
         if not raw:
             return None
 
-        clean = llm.extract_json_payload(raw)
-        if not clean:
-            return None
-
-        parsed = json.loads(clean)
+        parsed = llm.safe_json_loads(raw)
         if isinstance(parsed, dict):
             return parsed
+        clean = llm.extract_json_payload(raw)
+        if clean:
+            parsed = json.loads(clean, strict=False)
+            if isinstance(parsed, dict):
+                return parsed
     except Exception as exc:
         logger.debug(f"LLM call fell back to heuristic: {exc}")
     return None
