@@ -123,13 +123,13 @@ OPENROUTER_MODELS = (
 # ── Secondary LLM Providers ────────────────────────────────────────────────────
 # Primary Provider: Google Gemini (Legacy/Direct)
 GEMINI_API_KEY = _e("GEMINI_API_KEY", "")
-GEMINI_MODEL = _e("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_MODEL = _e("GEMINI_MODEL", "gemini-3.5-flash-lite")
 GEMINI_TTS_MODEL = _e("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
 GEMINI_TTS_VOICE = _e("GEMINI_TTS_VOICE", "Kore")
 
 # Fallback Provider: Groq Cloud
 GROQ_API_KEY = _e("GROQ_API_KEY", "")
-GROQ_MODEL = _e("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = _e("GROQ_MODEL", "qwen/qwen3.8-27b")
 GROQ_BASE_URL = _e("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 GROQ_TTS_MODEL = _e("GROQ_TTS_MODEL", "canopylabs/orpheus-v1-english")
 GROQ_TTS_VOICE = _e("GROQ_TTS_VOICE", "troy")

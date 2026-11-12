@@ -33,17 +33,19 @@ _STATE = {
 _MODEL_TOKEN_STATUS: dict[str, dict] = {}
 _LAST_CREDITS_CHECK: float = 0.0
 _ACCOUNT_HAS_PAID_CREDITS: Optional[bool] = None
+_ACCOUNT_STATUS: Optional[dict[str, Any]] = None
 
 
 def reset_exhaustion_state():
     """Reset provider exhaustion flags and model token health caches."""
-    global _LAST_CREDITS_CHECK, _ACCOUNT_HAS_PAID_CREDITS
+    global _LAST_CREDITS_CHECK, _ACCOUNT_HAS_PAID_CREDITS, _ACCOUNT_STATUS
     _STATE["openrouter_exhausted"] = False
     _STATE["gemini_exhausted"] = False
     _STATE["groq_exhausted"] = False
     _MODEL_TOKEN_STATUS.clear()
     _LAST_CREDITS_CHECK = 0.0
     _ACCOUNT_HAS_PAID_CREDITS = None
+    _ACCOUNT_STATUS = None
 
 
 def mark_model_token_exhausted(model: str, reason: str = "402 Payment Required / Out of Credits", cooldown_seconds: int = 3600):
@@ -60,23 +62,27 @@ def mark_model_token_exhausted(model: str, reason: str = "402 Payment Required /
     )
 
 
-def verify_account_has_credits(timeout: float = 4.0) -> bool:
-    """Query OpenRouter credits API to verify if the account has paid credits remaining.
-    Caches result for 60 seconds to avoid spamming the credits endpoint.
+def check_openrouter_account_status(timeout: float = 4.0) -> dict[str, Any]:
+    """Query OpenRouter credits API and auth key status to verify if account has paid credits
+    or free-tier requests remaining. Caches result for 60 seconds to avoid latency overhead.
     """
-    global _LAST_CREDITS_CHECK, _ACCOUNT_HAS_PAID_CREDITS
+    global _LAST_CREDITS_CHECK, _ACCOUNT_HAS_PAID_CREDITS, _ACCOUNT_STATUS
     now = time.time()
-    if _ACCOUNT_HAS_PAID_CREDITS is not None and (now - _LAST_CREDITS_CHECK) < 60.0:
-        return _ACCOUNT_HAS_PAID_CREDITS
+    if _ACCOUNT_STATUS is not None and (now - _LAST_CREDITS_CHECK) < 60.0:
+        return _ACCOUNT_STATUS
 
     if is_offline() or (os.getenv("PYTEST_CURRENT_TEST") and not os.getenv("OPENROUTER_LIVE")):
-        return True
+        return {"has_paid_credits": True, "free_remaining": 50, "fully_exhausted": False}
 
     if not config.OPENROUTER_API_KEY:
+        _ACCOUNT_STATUS = {"has_paid_credits": False, "free_remaining": 0, "fully_exhausted": True}
         _ACCOUNT_HAS_PAID_CREDITS = False
-        return False
+        return _ACCOUNT_STATUS
 
     import httpx
+    has_paid = False
+    free_remaining = 50
+
     try:
         r = httpx.get(
             f"{config.OPENROUTER_BASE_URL.rstrip('/')}/credits",
@@ -86,13 +92,40 @@ def verify_account_has_credits(timeout: float = 4.0) -> bool:
         if r.status_code == 200:
             data = r.json().get("data", {})
             total_credits = float(data.get("total_credits", 0))
-            _ACCOUNT_HAS_PAID_CREDITS = total_credits > 0.0001
-            _LAST_CREDITS_CHECK = now
-            return _ACCOUNT_HAS_PAID_CREDITS
+            has_paid = total_credits > 0.0001
     except Exception as e:
         logger.debug(f"[OpenRouter Verifier] Credits preflight check skipped: {e}")
+        has_paid = True
 
-    return _ACCOUNT_HAS_PAID_CREDITS if _ACCOUNT_HAS_PAID_CREDITS is not None else True
+    try:
+        r = httpx.get(
+            f"{config.OPENROUTER_BASE_URL.rstrip('/')}/auth/key",
+            headers={"Authorization": f"Bearer {config.OPENROUTER_API_KEY}"},
+            timeout=timeout,
+        )
+        if r.status_code == 200:
+            key_data = r.json().get("data", {})
+            free_reqs = key_data.get("free_model_daily_requests")
+            if isinstance(free_reqs, dict) and "remaining" in free_reqs:
+                free_remaining = int(free_reqs.get("remaining", 0))
+    except Exception as e:
+        logger.debug(f"[OpenRouter Verifier] Key status check skipped: {e}")
+
+    fully_exhausted = (not has_paid) and (free_remaining <= 0)
+    _ACCOUNT_STATUS = {
+        "has_paid_credits": has_paid,
+        "free_remaining": free_remaining,
+        "fully_exhausted": fully_exhausted,
+    }
+    _ACCOUNT_HAS_PAID_CREDITS = has_paid
+    _LAST_CREDITS_CHECK = now
+    return _ACCOUNT_STATUS
+
+
+def verify_account_has_credits(timeout: float = 4.0) -> bool:
+    """Query OpenRouter credits API to verify if the account has paid credits remaining."""
+    status = check_openrouter_account_status(timeout=timeout)
+    return bool(status.get("has_paid_credits", True))
 
 
 def is_free_model(model_name: str) -> bool:
@@ -116,14 +149,28 @@ def get_verified_candidate_models(models_pool: list[str]) -> list[str]:
         if alias and alias not in candidates:
             candidates.append(alias)
 
+    status = check_openrouter_account_status()
+    has_paid = status.get("has_paid_credits", True)
+    free_remaining = status.get("free_remaining", 50)
+
     # Preflight check: If OpenRouter account has 0 paid credits, mark paid models as out of tokens
-    if not verify_account_has_credits():
+    if not has_paid:
         for m in candidates:
             if not is_free_model(m) and m not in _MODEL_TOKEN_STATUS:
                 _MODEL_TOKEN_STATUS[m] = {
                     "has_tokens": False,
                     "cooldown_until": now + 3600,
                     "reason": "OpenRouter account balance is $0.00",
+                }
+
+    # If free tier daily quota is 0, mark free models as exhausted
+    if free_remaining <= 0:
+        for m in candidates:
+            if is_free_model(m) and m not in _MODEL_TOKEN_STATUS:
+                _MODEL_TOKEN_STATUS[m] = {
+                    "has_tokens": False,
+                    "cooldown_until": now + 3600,
+                    "reason": "OpenRouter daily free requests limit reached (0 remaining)",
                 }
 
     available_models = []
@@ -137,8 +184,9 @@ def get_verified_candidate_models(models_pool: list[str]) -> list[str]:
             available_models.append(m)
 
     # Models with tokens available come first at the start!
-    # Any exhausted models are placed at the end as a last-resort fallback.
-    return available_models + exhausted_models
+    if available_models:
+        return available_models
+    return exhausted_models
 
 
 OPENROUTER_SLUG_ALIASES = {
@@ -671,6 +719,17 @@ def _call_openrouter(system: str, user: str, max_tokens: int = 700, timeout: Opt
     start_t = time.time()
     per_model_timeout = min(timeout, 8.0) if timeout is not None else 8.0
 
+    # Fast-path preflight: if account has $0 paid credits and 0 free daily quota remaining,
+    # skip doomed sequential HTTP attempts and route immediately to secondary provider.
+    status = check_openrouter_account_status()
+    if status.get("fully_exhausted"):
+        logger.info(
+            f"[OpenRouter Gateway] Account has $0.00 credits and free tier daily limit reached "
+            f"({status.get('free_remaining', 0)} free remaining). "
+            f"Immediately cascading to secondary provider (Gemini / Groq) with 0ms delay."
+        )
+        return None
+
     headers = {
         "Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
         "HTTP-Referer": "http://localhost:8000",
@@ -689,6 +748,9 @@ def _call_openrouter(system: str, user: str, max_tokens: int = 700, timeout: Opt
     # Use verified candidate models so models with active tokens start FIRST.
     # If Model 1 has 0 tokens, Model 2 starts first; if Model 2 runs out, Model 3 starts, repeating down the chain.
     candidate_models = get_verified_candidate_models(models_pool)
+    if not candidate_models:
+        logger.info("[OpenRouter Gateway] No eligible candidate models available. Cascading to secondary provider...")
+        return None
 
     for idx, model in enumerate(candidate_models, 1):
         if timeout is not None and (timeout - (time.time() - start_t)) < 1.0:
@@ -742,6 +804,10 @@ def _call_openrouter(system: str, user: str, max_tokens: int = 700, timeout: Opt
                         f"[OpenRouter Failover] Model '{model}' returned 402 (Payment Required / Credit Exhausted). "
                         f"Permanently switching starting model to next in priority chain..."
                     )
+                    # Account has 0 paid credits; mark all paid models so we don't repeat 402 calls
+                    for cm in candidate_models:
+                        if not is_free_model(cm):
+                            mark_model_token_exhausted(cm, reason="Account has $0.00 credits", cooldown_seconds=3600)
                     break
 
                 # Handle 404 Model Not Found / Retired
@@ -760,6 +826,11 @@ def _call_openrouter(system: str, user: str, max_tokens: int = 700, timeout: Opt
                         f"[OpenRouter Failover] Model '{model}' returned {r.status_code} (Rate Limit). "
                         f"Automatically switching starting model to next in priority chain..."
                     )
+                    if is_free_model(model) and ("free" in r.text.lower() or "limit" in r.text.lower() or r.status_code == 429):
+                        # Daily free quota reached; mark other free models to avoid redundant HTTP requests
+                        for cm in candidate_models:
+                            if is_free_model(cm):
+                                mark_model_token_exhausted(cm, reason="Daily free requests limit reached", cooldown_seconds=600)
                     break
 
                 # Other HTTP errors (5xx, etc.)
@@ -788,39 +859,41 @@ def _call_openrouter(system: str, user: str, max_tokens: int = 700, timeout: Opt
 
 
 def _call_gemini(system: str, user: str, max_tokens: int = 700, timeout: Optional[float] = None) -> Optional[str]:
-    """Call Google Gemini REST API."""
+    """Call Google Gemini REST API with multi-model fallback."""
     if not config.GEMINI_API_KEY or _STATE["gemini_exhausted"]:
         return None
 
     import httpx
 
     start_t = time.time()
-    # Models to try: primary first, followed by stable 3.5-flash
-    models = [config.GEMINI_MODEL]
-    if config.GEMINI_MODEL != "gemini-3.5-flash":
-        models.append("gemini-3.5-flash")
+    # High-availability Gemini models: 3.5-flash-lite and 3.5-flash respond cleanly
+    preferred_models = ["gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.1-flash-lite", config.GEMINI_MODEL]
+    models = []
+    for m in preferred_models:
+        if m and m not in models:
+            models.append(m)
+
+    is_json = "json" in (system + " " + user).lower()
 
     for model in models:
         if timeout is not None and (timeout - (time.time() - start_t)) < 1.0:
             break
 
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={config.GEMINI_API_KEY}"
+        generation_cfg = {"maxOutputTokens": max_tokens, "temperature": 0.4}
+        if is_json:
+            generation_cfg["responseMimeType"] = "application/json"
+
         body = {
             "systemInstruction": {"parts": [{"text": system}]},
             "contents": [{"parts": [{"text": user}]}],
-            "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.4},
+            "generationConfig": generation_cfg,
         }
 
         try:
-            base_timeout = 8.0 if model == config.GEMINI_MODEL and model != "gemini-3.5-flash" else 15.0
-            cur_rem = timeout - (time.time() - start_t) if timeout is not None else base_timeout
-            call_timeout = min(base_timeout, cur_rem) if timeout is not None else base_timeout
+            cur_rem = timeout - (time.time() - start_t) if timeout is not None else 8.0
+            call_timeout = min(8.0, cur_rem) if timeout is not None else 8.0
             r = httpx.post(url, json=body, timeout=call_timeout)
-
-            if r.status_code in (429, 403) or "RESOURCE_EXHAUSTED" in r.text:
-                logger.warning(f"Gemini quota/limit reached ({r.status_code}). Marking Gemini as exhausted.")
-                _STATE["gemini_exhausted"] = True
-                return None
 
             if r.status_code == 200:
                 data = r.json()
@@ -828,11 +901,20 @@ def _call_gemini(system: str, user: str, max_tokens: int = 700, timeout: Optiona
                 if candidates:
                     parts = candidates[0].get("content", {}).get("parts", [])
                     if parts and "text" in parts[0]:
-                        return parts[0]["text"].strip()
+                        text = parts[0]["text"].strip()
+                        if text:
+                            logger.info(f"Gemini answered successfully via model: {model}")
+                            return text
+            elif r.status_code in (429, 503) or "RESOURCE_EXHAUSTED" in r.text:
+                logger.info(f"Gemini model {model} busy or quota reached ({r.status_code}); trying next Gemini model...")
+                continue
+            elif r.status_code == 404:
+                logger.info(f"Gemini model {model} not found; trying next Gemini model...")
+                continue
             else:
-                logger.info(f"Gemini {model} returned {r.status_code}, trying next option...")
+                logger.warning(f"Gemini {model} returned HTTP {r.status_code}: {r.text[:100]}")
         except Exception as e:
-            logger.info(f"Gemini {model} call timed out or failed ({e}), trying next option...")
+            logger.info(f"Gemini {model} call timed out or failed ({e}); trying next Gemini model...")
 
     return None
 
@@ -845,50 +927,68 @@ def _call_groq(system: str, user: str, max_tokens: int = 700, timeout: Optional[
     import httpx
 
     start_t = time.time()
-    models = [config.GROQ_MODEL]
-    if config.GROQ_MODEL != "openai/gpt-oss-120b":
-        models.append("openai/gpt-oss-120b")
-    if "qwen/qwen3.8-27b" not in models:
-        models.append("qwen/qwen3.8-27b")
+    # High-availability Groq models: qwen3.8-27b works cleanly on this key
+    candidate_models = ["qwen/qwen3.8-27b", config.GROQ_MODEL, "openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+    models = []
+    for m in candidate_models:
+        if m and m not in models:
+            models.append(m)
+
+    is_json = "json" in (system + " " + user).lower()
 
     for model in models:
         if timeout is not None and (timeout - (time.time() - start_t)) < 1.0:
             break
 
-        try:
-            cur_rem = timeout - (time.time() - start_t) if timeout is not None else 20.0
-            call_timeout = min(20.0, cur_rem) if timeout is not None else 20.0
-            r = httpx.post(
-                f"{config.GROQ_BASE_URL.rstrip('/')}/chat/completions",
-                headers={"Authorization": f"Bearer {config.GROQ_API_KEY}"},
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    "max_tokens": max_tokens,
-                    "temperature": 0.4,
-                },
-                timeout=call_timeout,
-            )
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "max_tokens": max_tokens,
+            "temperature": 0.4,
+        }
+        if is_json:
+            payload["response_format"] = {"type": "json_object"}
 
-            if r.status_code in (429, 403) or "rate_limit_exceeded" in r.text:
-                logger.warning(f"Groq quota/rate limit reached ({r.status_code}). Marking Groq as exhausted.")
-                _STATE["groq_exhausted"] = True
-                return None
+        for attempt in (1, 2):
+            try:
+                cur_rem = timeout - (time.time() - start_t) if timeout is not None else 8.0
+                call_timeout = min(8.0, cur_rem) if timeout is not None else 8.0
+                r = httpx.post(
+                    f"{config.GROQ_BASE_URL.rstrip('/')}/chat/completions",
+                    headers={"Authorization": f"Bearer {config.GROQ_API_KEY}"},
+                    json=payload,
+                    timeout=call_timeout,
+                )
 
-            if r.status_code == 200:
-                data = r.json()
-                choices = data.get("choices", [])
-                if choices and "message" in choices[0]:
-                    return choices[0]["message"]["content"].strip()
-            elif r.status_code == 404:
-                logger.info(f"Groq model {model} not found, trying fallback...")
-            else:
-                logger.warning(f"Groq {model} returned {r.status_code}: {r.text[:100]}")
-        except Exception as e:
-            logger.warning(f"Groq {model} request failed: {e}")
+                if r.status_code == 200:
+                    data = r.json()
+                    choices = data.get("choices", [])
+                    if choices and "message" in choices[0]:
+                        msg = choices[0]["message"]
+                        content = (msg.get("content") or msg.get("reasoning") or "").strip()
+                        if content:
+                            logger.info(f"Groq answered successfully via model: {model}")
+                            return content
+
+                if r.status_code == 400 and attempt == 1 and "response_format" in payload:
+                    payload.pop("response_format", None)
+                    continue
+
+                if r.status_code in (429, 403) or "rate_limit_exceeded" in r.text:
+                    logger.info(f"Groq model {model} rate limited ({r.status_code}); trying next Groq model...")
+                    break
+                elif r.status_code == 404:
+                    logger.info(f"Groq model {model} not found; trying next Groq model...")
+                    break
+                else:
+                    logger.warning(f"Groq {model} returned {r.status_code}: {r.text[:100]}")
+                    break
+            except Exception as e:
+                logger.warning(f"Groq {model} request failed: {e}")
+                break
 
     return None
 
