@@ -81,6 +81,7 @@ const ENDPOINTS = {
   masteryReset:     { method: "POST", path: "/api/mastery/reset" },
   loopNextAction:   { method: "POST", path: "/api/loop/next-action" },
   recommend:        { method: "POST", path: "/api/recommend" },
+  dashboardSummary: { method: "GET",  path: "/api/dashboard-summary" },
   materialsList:       { method: "GET",    path: "/api/materials" },
   materialsIngestFile: { method: "POST",   path: "/api/materials/ingest-file" },
   materialsIngestUrl:  { method: "POST",   path: "/api/materials/ingest-url" },
@@ -109,6 +110,42 @@ const ENDPOINTS = {
 
 const IN_FLIGHT_REQUESTS = new Map();
 const ABORT_SCOPES = new Map();
+const SWR_MEMORY_CACHE = new Map();
+
+function getSwrStorage() {
+  try {
+    if (typeof window !== "undefined" && window.sessionStorage) return window.sessionStorage;
+    if (typeof sessionStorage !== "undefined") return sessionStorage;
+  } catch {}
+  return null;
+}
+
+function buildSwrKey(endpointKey, userId = "", materialId = "", options = {}) {
+  let uid = userId || (options && (options.userId || options.user_id)) || (options && options.params && (options.params.userId || options.params.user_id));
+  if (!uid && typeof ApiService !== "undefined" && typeof ApiService.getUser === "function") {
+    const u = ApiService.getUser();
+    uid = u ? (u.user_id || u.id) : "";
+  }
+  uid = uid || "default";
+  const mid = materialId || (options && (options.materialId || options.material_id)) || (options && options.params && (options.params.materialId || options.params.material_id)) || (options && options.pathParams && options.pathParams.material_id) || "all";
+  let query = "";
+  if (options && options.params) {
+    try {
+      const filteredParams = { ...options.params };
+      delete filteredParams.user_id;
+      delete filteredParams.userId;
+      delete filteredParams.material_id;
+      delete filteredParams.materialId;
+      const keys = Object.keys(filteredParams).sort();
+      if (keys.length > 0) {
+        const sortedObj = {};
+        keys.forEach(k => { sortedObj[k] = filteredParams[k]; });
+        query = JSON.stringify(sortedObj);
+      }
+    } catch {}
+  }
+  return `cm_swr:${uid}:${mid}:${endpointKey}${query ? `:${query}` : ""}`;
+}
 
 function createAbortError(message = "Request aborted") {
   if (typeof DOMException !== "undefined") {
@@ -264,6 +301,18 @@ async function callApi(endpointKey, payload = null, options = {}) {
         throw err;
       }
 
+      if (ep.method === "GET" && (!options || options.swr !== false)) {
+        try {
+          const swrKey = buildSwrKey(endpointKey, options && (options.userId || options.user_id), options && options.materialId, options);
+          const entry = { data, timestamp: Date.now() };
+          SWR_MEMORY_CACHE.set(swrKey, entry);
+          const storage = getSwrStorage();
+          if (storage) {
+            storage.setItem(swrKey, JSON.stringify(entry));
+          }
+        } catch {}
+      }
+
       return data;
     })().finally(() => {
       if (dedupeKey && IN_FLIGHT_REQUESTS.get(dedupeKey) === entry) {
@@ -346,6 +395,94 @@ const ApiService = {
       active.abort();
     }
     ABORT_SCOPES.delete(scopeKey);
+  },
+
+  getSwr(endpointKey, options = {}) {
+    const swrKey = buildSwrKey(endpointKey, options.userId || options.user_id, options.materialId, options);
+    if (SWR_MEMORY_CACHE.has(swrKey)) {
+      const entry = SWR_MEMORY_CACHE.get(swrKey);
+      return entry ? entry.data : null;
+    }
+    const storage = getSwrStorage();
+    if (storage) {
+      try {
+        const raw = storage.getItem(swrKey);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === "object" && "data" in parsed) {
+            SWR_MEMORY_CACHE.set(swrKey, parsed);
+            return parsed.data;
+          }
+        }
+      } catch {}
+    }
+    return null;
+  },
+
+  setSwr(endpointKey, data, options = {}) {
+    if (data === undefined || data === null) return;
+    const swrKey = buildSwrKey(endpointKey, options.userId || options.user_id, options.materialId, options);
+    const entry = { data, timestamp: Date.now() };
+    SWR_MEMORY_CACHE.set(swrKey, entry);
+    const storage = getSwrStorage();
+    if (storage) {
+      try {
+        storage.setItem(swrKey, JSON.stringify(entry));
+      } catch {}
+    }
+  },
+
+  clearSwr(filter = "") {
+    if (!filter) {
+      SWR_MEMORY_CACHE.clear();
+      const storage = getSwrStorage();
+      if (storage) {
+        try {
+          const toRemove = [];
+          for (let i = 0; i < storage.length; i++) {
+            const k = storage.key(i);
+            if (k && k.startsWith("cm_swr:")) toRemove.push(k);
+          }
+          toRemove.forEach(k => storage.removeItem(k));
+        } catch {}
+      }
+    } else {
+      for (const k of SWR_MEMORY_CACHE.keys()) {
+        if (k.includes(filter)) SWR_MEMORY_CACHE.delete(k);
+      }
+      const storage = getSwrStorage();
+      if (storage) {
+        try {
+          const toRemove = [];
+          for (let i = 0; i < storage.length; i++) {
+            const k = storage.key(i);
+            if (k && k.includes(filter)) toRemove.push(k);
+          }
+          toRemove.forEach(k => storage.removeItem(k));
+        } catch {}
+      }
+    }
+  },
+
+  async fetchWithSwr(endpointKey, payload = null, options = {}, onRevalidate = null) {
+    const cached = this.getSwr(endpointKey, options);
+    const backgroundPromise = callApi(endpointKey, payload, options).then(fresh => {
+      this.setSwr(endpointKey, fresh, options);
+      if (typeof onRevalidate === "function") {
+        try { onRevalidate(fresh); } catch (e) { console.warn("SWR onRevalidate error", e); }
+      }
+      return fresh;
+    });
+
+    if (cached !== null && cached !== undefined) {
+      backgroundPromise.catch(() => {});
+      return cached;
+    }
+    return await backgroundPromise;
+  },
+
+  async listNotes(userId = null, options = {}) {
+    return this.getNotes(null, userId, options);
   },
 
   getInFlightCount() {
@@ -475,8 +612,17 @@ const ApiService = {
     return callApi("masteryReset", null, options);
   },
 
+  async getDashboardSummary(userId = "default", materialId = null, options = {}) {
+    const params = { user_id: userId };
+    if (materialId) params.material_id = materialId;
+    if (options && (options.refresh_ai || options.refreshAi)) params.refresh_ai = true;
+    return callApi("dashboardSummary", null, { ...options, params: { ...(options.params || {}), ...params } });
+  },
+
   async getRecommendations(options = {}) {
-    return callApi("recommend", null, options);
+    const params = {};
+    if (options && (options.refresh_ai || options.refreshAi)) params.refresh_ai = true;
+    return callApi("recommend", null, { ...options, params: { ...(options.params || {}), ...params } });
   },
 
   async listMaterials(userId = "default", options = {}) {
@@ -551,7 +697,14 @@ const ApiService = {
     const fmt = exportFormat.toLowerCase().trim();
     const params = { export_format: fmt };
     if (userId) params.user_id = userId;
-    return callApi("notesExport", { export_format: fmt }, {
+    const body = {
+      export_format: fmt,
+      ...(options.markdown_content ? { markdown_content: options.markdown_content } : {}),
+      ...(options.title ? { title: options.title } : {}),
+      ...(options.concept_id ? { concept_id: options.concept_id } : {}),
+      ...(options.body || {})
+    };
+    return callApi("notesExport", body, {
       ...options,
       pathParams: { note_id: noteId },
       params
@@ -589,6 +742,109 @@ const ApiService = {
       clean = `/api/artifacts/${clean}`;
     }
     return base ? `${base}${clean}` : clean;
+  },
+
+  async fetchAudioBlob(audioUrl, options = {}) {
+    if (!audioUrl) throw new Error("Audio URL is required");
+    const fullUrl = this.getArtifactUrl(audioUrl);
+    const response = await fetch(fullUrl, options);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: Failed to load audio stream`);
+    }
+    const rawBlob = await response.blob();
+    const contentTypeHeader = (response.headers && typeof response.headers.get === "function")
+      ? (response.headers.get("content-type") || "").toLowerCase()
+      : "";
+    const isWav = fullUrl.toLowerCase().endsWith(".wav") || contentTypeHeader.includes("wav");
+    const minBytes = isWav ? 44 : 100;
+    if (!rawBlob || rawBlob.size <= minBytes) {
+      throw new Error(`Invalid or empty audio stream (${rawBlob ? rawBlob.size : 0} bytes)`);
+    }
+    const targetType = isWav ? "audio/wav" : "audio/mpeg";
+    const BlobCtor = (typeof Blob !== "undefined")
+      ? Blob
+      : (typeof window !== "undefined" && window.Blob ? window.Blob : null);
+    if (BlobCtor) {
+      return new BlobCtor([rawBlob], { type: targetType });
+    }
+    return rawBlob;
+  },
+
+  async downloadArtifact(url, filename = "", options = {}) {
+    if (!url) return null;
+    const safeFilename = filename || url.split("/").pop().split("?")[0] || "download";
+    try {
+      const response = await fetch(url, options);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      let contentType = (response.headers && typeof response.headers.get === "function")
+        ? (response.headers.get("content-type") || "")
+        : "";
+      if (!contentType) {
+        if (safeFilename.endsWith(".pdf")) contentType = "application/pdf";
+        else if (safeFilename.endsWith(".pptx")) contentType = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+        else if (safeFilename.endsWith(".mp3")) contentType = "audio/mpeg";
+        else if (safeFilename.endsWith(".wav")) contentType = "audio/wav";
+        else if (safeFilename.endsWith(".svg")) contentType = "image/svg+xml";
+        else contentType = "application/octet-stream";
+      }
+      const rawBlob = await response.blob();
+      if ((safeFilename.endsWith(".mp3") && (!rawBlob || rawBlob.size <= 100)) ||
+          (safeFilename.endsWith(".wav") && (!rawBlob || rawBlob.size <= 44))) {
+        throw new Error(`Audio download failed: invalid audio stream (${rawBlob ? rawBlob.size : 0} bytes)`);
+      }
+      const BlobCtor = (typeof Blob !== "undefined")
+        ? Blob
+        : (typeof window !== "undefined" && window.Blob ? window.Blob : null);
+      const blob = BlobCtor ? new BlobCtor([rawBlob], { type: contentType }) : rawBlob;
+      if (typeof window !== "undefined" && typeof document !== "undefined" && document.createElement) {
+        const objectUrl = (window.URL && typeof window.URL.createObjectURL === "function")
+          ? window.URL.createObjectURL(blob)
+          : url;
+        const a = document.createElement("a");
+        a.style.display = "none";
+        a.href = objectUrl;
+        a.download = safeFilename;
+        if (document.body && typeof document.body.appendChild === "function") {
+          document.body.appendChild(a);
+        }
+        if (typeof a.click === "function") a.click();
+        setTimeout(() => {
+          try {
+            if (typeof a.remove === "function") a.remove();
+            else if (a.parentNode && typeof a.parentNode.removeChild === "function") a.parentNode.removeChild(a);
+          } catch {}
+          try {
+            if (window.URL && typeof window.URL.revokeObjectURL === "function") {
+              window.URL.revokeObjectURL(objectUrl);
+            }
+          } catch {}
+        }, 60000);
+      }
+      return blob;
+    } catch (err) {
+      console.warn("Direct blob download failed, falling back to anchor:", err);
+      if (typeof window !== "undefined" && typeof document !== "undefined" && document.createElement) {
+        const a = document.createElement("a");
+        a.style.display = "none";
+        a.href = url;
+        a.download = safeFilename;
+        if (document.body && typeof document.body.appendChild === "function") {
+          document.body.appendChild(a);
+        }
+        if (typeof a.click === "function") a.click();
+        setTimeout(() => {
+          try {
+            if (typeof a.remove === "function") a.remove();
+            else if (a.parentNode && typeof a.parentNode.removeChild === "function") a.parentNode.removeChild(a);
+          } catch {}
+        }, 60000);
+      }
+      throw err;
+    }
+  },
+
+  async downloadFile(url, filename = "", options = {}) {
+    return this.downloadArtifact(url, filename, options);
   },
 
   // ── Authentication & Session Management ─────────────────────────────────────

@@ -759,7 +759,7 @@ Learning Observer: {next((a.model_dump() for a in assessments if a.agent_role ==
 
 Deliver your authoritative Head Teacher deliberation strictly in JSON format."""
 
-            raw = llm.complete(system=HEAD_TEACHER_SYSTEM, user=user_prompt, max_tokens=1200)
+            raw = llm.complete(system=HEAD_TEACHER_SYSTEM, user=user_prompt, max_tokens=1200, timeout=3.5)
             if raw:
                 payload = llm.safe_json_loads(raw)
                 if not payload or not isinstance(payload, dict):

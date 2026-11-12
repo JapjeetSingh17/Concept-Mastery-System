@@ -14,11 +14,14 @@ from __future__ import annotations
 import difflib
 import itertools
 import json
+import logging
 import math
 import random
 import re
 import uuid
 from typing import List, Tuple, Literal, Optional
+
+logger = logging.getLogger(__name__)
 
 from ..core import store, llm
 from ..core.concept_index import GLOBAL_INDEX
@@ -257,7 +260,8 @@ def generate_diagnostic_quiz(
     user_id: str = "default",
     chunks: list | None = None,
     kb: dict | None = None,
-    offset: int | None = None
+    offset: int | None = None,
+    use_llm: bool = True,
 ) -> list[QuizQuestion]:
     """Generate diagnostic assessment items strictly from vectorless chunks for concept_id.
     
@@ -289,6 +293,7 @@ def generate_diagnostic_quiz(
 
     # 1. Retrieve vectorless chunks for this concept if not provided
     if chunks is None:
+        store.ensure_retrieval_index_if_needed(user_id=user_id)
         chunks = GLOBAL_INDEX.retrieve_chunks(concept_id, max_chunks=3, user_id=user_id)
         if not chunks and "index" in kb and kb["index"]:
             all_chunks = getattr(kb["index"], "chunks", [])
@@ -308,12 +313,21 @@ def generate_diagnostic_quiz(
         if all_user_chunks:
             chunks = all_user_chunks[:2]
         else:
-            raise store.UserError(f"No textual material available to generate questions for {concept['name']}.")
+            def_text = concept.get("definition") or f"{concept['name']} is a foundational concept in this course."
+            chunks = [
+                type("ChunkMeta", (), {
+                    "chunk_id": f"chunk_{concept_id}",
+                    "page_number": 1,
+                    "section_title": concept["name"],
+                    "text": def_text,
+                    "locator_label": "Overview"
+                })()
+            ]
 
     questions: list[QuizQuestion] = []
 
     # 2. Try LLM generation for diverse question types if enabled
-    if llm.enabled():
+    if use_llm and llm.enabled():
         ctx_text = "\n\n".join(f"[{getattr(c, 'locator_label', None) or f'Page {c.page_number}'}] {c.text}" for c in chunks)
         system_prompt = (
             "You are a rigorous psychometric assessment designer for advanced technical education. "
@@ -365,12 +379,15 @@ def generate_diagnostic_quiz(
         )
 
         try:
-            raw = llm.complete(system_prompt, user_prompt, max_tokens=1400)
+            raw = llm.complete(system_prompt, user_prompt, max_tokens=1400, timeout=3.5)
             if raw:
                 arr = llm.safe_json_loads(raw)
                 if not isinstance(arr, list):
-                    clean_json = llm.extract_json_payload(raw)
-                    arr = json.loads(clean_json, strict=False) if clean_json else []
+                    try:
+                        clean_json = llm.extract_json_payload(raw)
+                        arr = json.loads(clean_json, strict=False) if clean_json else []
+                    except Exception:
+                        arr = []
                 if not isinstance(arr, list):
                     arr = []
                 c_name_lower = concept["name"].lower().strip()
@@ -420,7 +437,9 @@ def generate_diagnostic_quiz(
                         step_by_step_solution=step_sol,
                     )
                     questions.append(q)
-                    REGISTRY[qid] = q.model_dump()
+                    reg_entry = q.model_dump()
+                    reg_entry["user_id"] = user_id
+                    REGISTRY[qid] = reg_entry
                     if len(questions) >= count:
                         break
         except Exception:
@@ -443,138 +462,364 @@ def generate_diagnostic_quiz(
                 if len(questions) >= count:
                     break
             
-            chunk_sentences = sentences(chunk.text)
-            matched_sentences = [s for s in chunk_sentences if pat.search(s) and 8 <= len(s.split()) <= 40]
-            if not matched_sentences:
-                matched_sentences = [chunk_sentences[0]] if chunk_sentences else [chunk.text[:120]]
+                chunk_sentences = sentences(chunk.text)
+                matched_sentences = [s for s in chunk_sentences if pat.search(s) and 8 <= len(s.split()) <= 40]
+                if not matched_sentences:
+                    matched_sentences = [chunk_sentences[0]] if chunk_sentences else [chunk.text[:120]]
 
-            # Filter out sentences already used for this concept
-            fresh_sentences = [s for s in matched_sentences if s not in prior_sentences]
-            if not fresh_sentences:
-                # If all available sentences have been used, cycle afresh
-                prior_sentences.clear()
-                fresh_sentences = matched_sentences
+                # Filter out sentences already used for this concept
+                fresh_sentences = [s for s in matched_sentences if s not in prior_sentences]
+                if not fresh_sentences:
+                    # If all available sentences have been used, cycle afresh
+                    prior_sentences.clear()
+                    fresh_sentences = matched_sentences
 
-            # Rotate starting sentence
-            sent_start = calc_offset % max(len(fresh_sentences), 1)
-            ordered_sentences = fresh_sentences[sent_start:] + fresh_sentences[:sent_start]
+                # Rotate starting sentence
+                sent_start = calc_offset % max(len(fresh_sentences), 1)
+                ordered_sentences = fresh_sentences[sent_start:] + fresh_sentences[:sent_start]
 
-            for sent in ordered_sentences:
-                if len(questions) >= count:
-                    break
+                for sent in ordered_sentences:
+                    if len(questions) >= count:
+                        break
 
-                desired_type = target_types[len(questions) % len(target_types)]
-                qid = f"diag_{uuid.uuid4().hex[:8]}"
+                    desired_type = target_types[len(questions) % len(target_types)]
+                    qid = f"diag_{uuid.uuid4().hex[:8]}"
 
-                loc = getattr(chunk, "locator_label", None) or f"Page {chunk.page_number}"
-                if desired_type == "fill_in_the_blanks":
-                    c_name_lower = concept["name"].lower()
-                    words_in_sent = [
-                        w for w in re.findall(r"[A-Za-z0-9\-]+", sent)
-                        if len(w) >= 4 and w.lower() not in STOP and w.lower() not in GENERIC_NON_CONCEPTS
-                        and c_name_lower not in w.lower() and w.lower() not in c_name_lower
-                    ]
-                    if words_in_sent:
-                        target_blank = max(words_in_sent, key=len)
-                        b_pat = re.compile(r"\b" + re.escape(target_blank) + r"\b", re.I)
-                        masked_text = b_pat.sub("_____", sent, count=1)
-                    else:
-                        target_blank = concept["name"]
-                        masked_text = pat.sub("_____", sent) if pat.search(sent) else f"{sent.rsplit(' ', 2)[0]} _____."
+                    loc = getattr(chunk, "locator_label", None) or f"Page {chunk.page_number}"
+                    if desired_type == "fill_in_the_blanks":
+                        c_name_lower = concept["name"].lower()
+                        words_in_sent = [
+                            w for w in re.findall(r"[A-Za-z0-9\-]+", sent)
+                            if len(w) >= 4 and w.lower() not in STOP and w.lower() not in GENERIC_NON_CONCEPTS
+                            and c_name_lower not in w.lower() and w.lower() not in c_name_lower
+                        ]
+                        if words_in_sent:
+                            target_blank = max(words_in_sent, key=len)
+                            b_pat = re.compile(r"\b" + re.escape(target_blank) + r"\b", re.I)
+                            masked_text = b_pat.sub("_____", sent, count=1)
+                        else:
+                            target_blank = concept["name"]
+                            masked_text = pat.sub("_____", sent) if pat.search(sent) else f"{sent.rsplit(' ', 2)[0]} _____."
 
-                    q = QuizQuestion(
-                        question_id=qid,
-                        concept_id=concept_id,
-                        question_type="fill_in_the_blanks",
-                        question_text=f"Complete the core mechanism of {concept['name']}: \"{masked_text}\"",
-                        options=[],
-                        correct_option_idx=0,
-                        target_blank_answer=target_blank,
-                        rubric=f"Accepts '{target_blank}' or close technical equivalents.",
-                        key_terms=[target_blank.lower()],
-                        explanation=f"Missing term is '{target_blank}'. Grounding sentence: {sent} (p. {chunk.page_number}) [{loc}]",
-                        source_page=chunk.page_number,
-                    )
-                elif desired_type == "typed_qa":
-                    q = QuizQuestion(
-                        question_id=qid,
-                        concept_id=concept_id,
-                        question_type="typed_qa",
-                        question_text=f"In your own words, explain the core mechanism of {concept['name']} and how it behaves according to your study material.",
-                        options=[],
-                        correct_option_idx=0,
-                        target_blank_answer="",
-                        rubric=f"Must explain the functional role, definition, and behavior of {concept['name']}.",
-                        key_terms=[concept["name"].lower()] + [t.lower() for t in tokens(concept.get("definition", "")) if len(t) > 4][:4],
-                        explanation=f"Textbook definition: {chunk.text[:220]}... (p. {chunk.page_number}) [{loc}]",
-                        source_page=chunk.page_number,
-                    )
-                elif desired_type == "numerical":
-                    q = generate_numerical_question(
-                        concept_id=concept_id,
-                        concept_name=concept.get("name", ""),
-                        user_id=user_id,
-                        source_page=chunk.page_number,
-                    )
-                else:  # MCQ
-                    # Never have concept["name"] as the correct option or distractors.
-                    # Formulate an operational mechanism question where options are substantive statements.
-                    mcq_stems = [
-                        f"Regarding {concept['name']}, which statement accurately describes its operational mechanism according to the study material?",
-                        f"In the context of {concept['name']}, which of the following best characterizes its computational principle or governing rule?",
-                        f"Which of the following statements correctly identifies how {concept['name']} functions within this curriculum?",
-                        f"When analyzing {concept['name']}, which operational property is verified by the study material?",
-                    ]
-                    question_text = mcq_stems[(calc_offset + len(questions)) % len(mcq_stems)]
-                    correct_opt = sent.strip()
-                    if not correct_opt.endswith((".", ";", "!")):
-                        correct_opt += "."
+                        q = QuizQuestion(
+                            question_id=qid,
+                            concept_id=concept_id,
+                            question_type="fill_in_the_blanks",
+                            question_text=f"Complete the core mechanism of {concept['name']}: \"{masked_text}\"",
+                            options=[],
+                            correct_option_idx=0,
+                            target_blank_answer=target_blank,
+                            rubric=f"Accepts '{target_blank}' or close technical equivalents.",
+                            key_terms=[target_blank.lower()],
+                            explanation=f"Missing term is '{target_blank}'. Grounding sentence: {sent} (p. {chunk.page_number}) [{loc}]",
+                            source_page=chunk.page_number,
+                        )
+                    elif desired_type == "typed_qa":
+                        q = QuizQuestion(
+                            question_id=qid,
+                            concept_id=concept_id,
+                            question_type="typed_qa",
+                            question_text=f"In your own words, explain the core mechanism of {concept['name']} and how it behaves according to your study material.",
+                            options=[],
+                            correct_option_idx=0,
+                            target_blank_answer="",
+                            rubric=f"Must explain the functional role, definition, and behavior of {concept['name']}.",
+                            key_terms=[concept["name"].lower()] + [t.lower() for t in tokens(concept.get("definition", "")) if len(t) > 4][:4],
+                            explanation=f"Textbook definition: {chunk.text[:220]}... (p. {chunk.page_number}) [{loc}]",
+                            source_page=chunk.page_number,
+                        )
+                    elif desired_type == "numerical":
+                        q = generate_numerical_question(
+                            concept_id=concept_id,
+                            concept_name=concept.get("name", ""),
+                            user_id=user_id,
+                            source_page=chunk.page_number,
+                        )
+                    else:  # MCQ
+                        # Never have concept["name"] as the correct option or distractors.
+                        # Formulate an operational mechanism question where options are substantive statements.
+                        mcq_stems = [
+                            f"Regarding {concept['name']}, which statement accurately describes its operational mechanism according to the study material?",
+                            f"In the context of {concept['name']}, which of the following best characterizes its computational principle or governing rule?",
+                            f"Which of the following statements correctly identifies how {concept['name']} functions within this curriculum?",
+                            f"When analyzing {concept['name']}, which operational property is verified by the study material?",
+                        ]
+                        question_text = mcq_stems[(calc_offset + len(questions)) % len(mcq_stems)]
+                        correct_opt = sent.strip()
+                        if not correct_opt.endswith((".", ";", "!")):
+                            correct_opt += "."
 
-                    d1 = f"Operates via non-contiguous pointer linking, requiring linear traversal for state retrieval."
-                    d2 = f"Executes unconstrained state transformations without preserving boundary invariance guarantees."
-                    d3 = f"Requires global re-indexing and quadratic space reallocation on each intermediate evaluation."
+                        d1 = f"Operates via non-contiguous pointer linking, requiring linear traversal for state retrieval."
+                        d2 = f"Executes unconstrained state transformations without preserving boundary invariance guarantees."
+                        d3 = f"Requires global re-indexing and quadratic space reallocation on each intermediate evaluation."
 
-                    alt_statements = []
-                    for oc in chunks:
-                        if oc != chunk:
-                            for osent in sentences(oc.text):
-                                if 10 <= len(osent.split()) <= 30 and osent != sent and not pat.search(osent):
-                                    alt_statements.append(osent.strip())
-                                    if len(alt_statements) >= 2:
-                                        break
-                    if len(alt_statements) >= 2:
-                        d1 = alt_statements[0]
-                        d2 = alt_statements[1]
-                    elif len(alt_statements) == 1:
-                        d1 = alt_statements[0]
+                        alt_statements = []
+                        for oc in chunks:
+                            if oc != chunk:
+                                for osent in sentences(oc.text):
+                                    if 10 <= len(osent.split()) <= 30 and osent != sent and not pat.search(osent):
+                                        alt_statements.append(osent.strip())
+                                        if len(alt_statements) >= 2:
+                                            break
+                        if len(alt_statements) >= 2:
+                            d1 = alt_statements[0]
+                            d2 = alt_statements[1]
+                        elif len(alt_statements) == 1:
+                            d1 = alt_statements[0]
 
-                    distractors = [d1, d2, d3]
-                    options = [correct_opt] + distractors
-                    random.shuffle(options)
-                    correct_idx = options.index(correct_opt)
+                        distractors = [d1, d2, d3]
+                        options = [correct_opt] + distractors
+                        random.shuffle(options)
+                        correct_idx = options.index(correct_opt)
 
-                    q = QuizQuestion(
-                        question_id=qid,
-                        concept_id=concept_id,
-                        question_type="mcq",
-                        question_text=question_text,
-                        options=options,
-                        correct_option_idx=correct_idx,
-                        target_blank_answer="",
-                        rubric="",
-                        key_terms=[],
-                        explanation=f"Grounded statement: {sent} (p. {chunk.page_number}) [{loc}]",
-                        source_page=chunk.page_number,
-                    )
+                        q = QuizQuestion(
+                            question_id=qid,
+                            concept_id=concept_id,
+                            question_type="mcq",
+                            question_text=question_text,
+                            options=options,
+                            correct_option_idx=correct_idx,
+                            target_blank_answer="",
+                            rubric="",
+                            key_terms=[],
+                            explanation=f"Grounded statement: {sent} (p. {chunk.page_number}) [{loc}]",
+                            source_page=chunk.page_number,
+                        )
 
-                questions.append(q)
-                reg_entry = q.model_dump()
-                reg_entry["user_id"] = user_id
-                REGISTRY[qid] = reg_entry
-                prior_served.append(q.question_text)
-                prior_sentences.add(sent)
+                    questions.append(q)
+                    reg_entry = q.model_dump()
+                    reg_entry["user_id"] = user_id
+                    REGISTRY[qid] = reg_entry
+                    prior_served.append(q.question_text)
+                    prior_sentences.add(sent)
 
     return questions
+
+
+def generate_full_diagnostic_suite(
+    target_cids: list[str],
+    user_id: str = "default",
+    count: int = 6,
+    kb: dict | None = None,
+) -> list[dict]:
+    """Generate a balanced, non-duplicate 6-question baseline diagnostic suite.
+    
+    Batches question generation with a strict fast timeout and falls back seamlessly
+    to deterministic generation in < 10ms if remote LLMs are unavailable, rate-limited,
+    or slow, guaranteeing the frontend assessment modal never hangs.
+    """
+    if kb is None:
+        kb = store.require(user_id=user_id) if hasattr(store, "require") else store.get_kb(user_id=user_id)
+    
+    concepts_list = kb.get("concepts", []) if (kb and kb.get("ready")) else []
+    if not concepts_list:
+        return []
+
+    store.ensure_retrieval_index_if_needed(user_id=user_id)
+    by_id = {c["id"]: c for c in concepts_list}
+
+    # Ensure target_cids has exactly count items by cycling if necessary
+    resolved_cids = [cid for cid in target_cids if cid in by_id]
+    if not resolved_cids:
+        resolved_cids = [c["id"] for c in concepts_list]
+    
+    final_cids: list[str] = []
+    idx = 0
+    while len(final_cids) < count and resolved_cids:
+        final_cids.append(resolved_cids[idx % len(resolved_cids)])
+        idx += 1
+
+    # Balanced rotation of question types
+    cycle_types = ["mcq", "fill_in_the_blanks", "typed_qa", "mcq", "fill_in_the_blanks", "mcq"]
+    target_types = [cycle_types[i % len(cycle_types)] for i in range(count)]
+
+    # Gather chunks for each concept
+    concept_chunks_map: dict[str, list] = {}
+    for cid in set(final_cids):
+        c_chunks = GLOBAL_INDEX.retrieve_chunks(cid, max_chunks=2, user_id=user_id)
+        if not c_chunks:
+            all_chunks = GLOBAL_INDEX.get_all_chunks(user_id=user_id)
+            c_chunks = all_chunks[:2] if all_chunks else []
+        if not c_chunks:
+            c_meta = by_id.get(cid, {})
+            def_text = c_meta.get("definition") or f"{c_meta.get('name', cid)} is an essential concept in this curriculum."
+            c_chunks = [type("ChunkMeta", (), {
+                "chunk_id": f"fb_{cid}",
+                "page_number": 1,
+                "section_title": c_meta.get("name", cid),
+                "text": def_text,
+                "locator_label": "Overview"
+            })()]
+        concept_chunks_map[cid] = c_chunks
+
+    questions_dict: list[dict] = []
+    seen_qids: set[str] = set()
+
+    # Step 1: Batched single LLM call if enabled (with strict 3.5s timeout)
+    if llm.enabled():
+        items_prompt = []
+        for i, cid in enumerate(final_cids):
+            c_meta = by_id.get(cid, {})
+            q_type = target_types[i]
+            c_chunks = concept_chunks_map.get(cid, [])
+            ctx_summary = " ".join(getattr(c, "text", "")[:300] for c in c_chunks)
+            items_prompt.append(
+                f"Item {i+1}:\n"
+                f"  - Concept Name: {c_meta.get('name', cid)}\n"
+                f"  - Concept ID: {cid}\n"
+                f"  - Question Type: {q_type}\n"
+                f"  - Context: {ctx_summary}"
+            )
+        
+        system_prompt = (
+            "You are a rigorous psychometric assessment designer for technical education. "
+            "Generate a JSON array of high-signal diagnostic assessment items strictly grounded in the context.\n"
+            "CRITICAL RULES:\n"
+            "1. For 'mcq', the correct option and distractors MUST BE DETAILED OPERATIONAL MECHANISMS, NOT CONCEPT NAMES.\n"
+            "2. THE CORRECT OPTION FOR MCQ MUST NEVER BE THE CONCEPT NAME ITSELF.\n"
+            "3. For 'fill_in_the_blanks', blank out an essential operational keyword (use '_____').\n"
+            "4. For 'typed_qa', ask for an explanatory operational mechanism with rubric and key_terms.\n"
+            "Respond ONLY with a valid JSON array of objects."
+        )
+
+        user_prompt = (
+            f"Generate exactly {count} diagnostic items matching each specification:\n\n"
+            + "\n\n".join(items_prompt)
+            + "\n\nJSON Schema:\n"
+            "[\n"
+            "  {\n"
+            '    "concept_id": "<concept_id>",\n'
+            '    "question_type": "mcq" | "fill_in_the_blanks" | "typed_qa",\n'
+            '    "question_text": "<text>",\n'
+            '    "options": ["<opt0>", "<opt1>", "<opt2>", "<opt3>"] (only for mcq),\n'
+            '    "correct_option_idx": 0,\n'
+            '    "target_blank_answer": "<word>" (only for fill_in_the_blanks),\n'
+            '    "rubric": "<rubric>" (only for typed_qa),\n'
+            '    "key_terms": ["term1"] (only for typed_qa),\n'
+            '    "explanation": "<grounded explanation>",\n'
+            '    "source_page": 1\n'
+            "  }\n"
+            "]"
+        )
+
+        try:
+            raw = llm.complete(system_prompt, user_prompt, max_tokens=1800, timeout=2.0)
+            if raw:
+                arr = llm.safe_json_loads(raw)
+                if not isinstance(arr, list):
+                    try:
+                        clean_json = llm.extract_json_payload(raw)
+                        arr = json.loads(clean_json, strict=False) if clean_json else []
+                    except Exception:
+                        arr = []
+                if isinstance(arr, list):
+                    for idx, item in enumerate(arr):
+                        if idx >= len(final_cids):
+                            break
+                        cid = item.get("concept_id") or final_cids[idx]
+                        if cid not in by_id:
+                            cid = final_cids[idx]
+                        c_meta = by_id.get(cid, {})
+                        c_name = c_meta.get("name", cid)
+                        q_type = str(item.get("question_type", target_types[idx])).lower()
+                        if q_type not in ("mcq", "fill_in_the_blanks", "typed_qa", "numerical"):
+                            q_type = target_types[idx]
+
+                        opts = [str(o).strip() for o in item.get("options", [])]
+                        c_idx = int(item.get("correct_option_idx", 0))
+
+                        # Anti-bias check: skip if MCQ answer is just the concept name
+                        if q_type == "mcq" and opts and 0 <= c_idx < len(opts):
+                            if opts[c_idx].lower().strip() == c_name.lower().strip():
+                                continue
+
+                        qid = f"diag_{uuid.uuid4().hex[:8]}"
+                        q_model = QuizQuestion(
+                            question_id=qid,
+                            concept_id=cid,
+                            question_type=q_type,
+                            question_text=str(item.get("question_text", f"Assess mechanism of {c_name}")).strip(),
+                            options=opts,
+                            correct_option_idx=c_idx,
+                            target_blank_answer=str(item.get("target_blank_answer", "")).strip(),
+                            rubric=str(item.get("rubric", "")).strip(),
+                            key_terms=[str(t).strip() for t in item.get("key_terms", [])],
+                            explanation=str(item.get("explanation", f"Grounded in curriculum context.")),
+                            source_page=int(item.get("source_page", 1)),
+                        )
+                        qd = q_model.model_dump()
+                        qd["id"] = qid
+                        qd["user_id"] = user_id
+                        qd["conceptName"] = c_name
+                        qd["conceptId"] = cid
+                        qd["questionType"] = q_type
+                        REGISTRY[qid] = qd
+                        questions_dict.append(qd)
+                        seen_qids.add(qid)
+        except Exception as e:
+            logger.info(f"Batched diagnostic LLM generation failed or timed out: {e}")
+
+    # Step 2: Instant deterministic fallback for any unfilled slots (< 5ms)
+    while len(questions_dict) < count:
+        slot_idx = len(questions_dict)
+        cid = final_cids[slot_idx % len(final_cids)]
+        c_meta = by_id.get(cid, {})
+        c_chunks = concept_chunks_map.get(cid, [])
+        des_type = target_types[slot_idx % len(target_types)]
+        
+        try:
+            # Call deterministic question generation for this single slot (NO LLM, instant <1ms)
+            fallback_qs = generate_diagnostic_quiz(
+                concept_id=cid,
+                count=1,
+                question_types=[des_type],
+                user_id=user_id,
+                chunks=c_chunks,
+                kb=kb,
+                offset=slot_idx,
+                use_llm=False,
+            )
+            for q in fallback_qs:
+                if q.question_id not in seen_qids:
+                    seen_qids.add(q.question_id)
+                    qd = q.model_dump()
+                    qd["id"] = q.question_id
+                    qd["user_id"] = user_id
+                    qd["conceptName"] = c_meta.get("name", cid)
+                    qd["conceptId"] = cid
+                    qd["questionType"] = qd.get("question_type", "mcq")
+                    REGISTRY[q.question_id] = qd
+                    questions_dict.append(qd)
+                    if len(questions_dict) >= count:
+                        break
+        except Exception as e:
+            logger.warning(f"Deterministic slot generation for {cid} fallback: {e}")
+            # Synthetic safe item
+            qid = f"diag_{uuid.uuid4().hex[:8]}"
+            c_name = c_meta.get("name", cid)
+            q_safe = {
+                "question_id": qid,
+                "id": qid,
+                "concept_id": cid,
+                "conceptId": cid,
+                "conceptName": c_name,
+                "question_type": "typed_qa",
+                "questionType": "typed_qa",
+                "question_text": f"In your own words, explain the core operational mechanism of {c_name}.",
+                "options": [],
+                "correct_option_idx": 0,
+                "target_blank_answer": "",
+                "rubric": f"Accurately explains the definition and operational behavior of {c_name}.",
+                "key_terms": [c_name.lower()],
+                "explanation": f"Grounded in curriculum materials for {c_name}.",
+                "source_page": 1,
+                "user_id": user_id,
+            }
+            REGISTRY[qid] = q_safe
+            questions_dict.append(q_safe)
+            seen_qids.add(qid)
+
+    return questions_dict[:count]
 
 
 def evaluate_submission(sub: QuizSubmission) -> QuizResult:

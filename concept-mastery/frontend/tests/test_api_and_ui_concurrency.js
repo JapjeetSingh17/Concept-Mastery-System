@@ -110,6 +110,8 @@ function makeMockElement(id = "", tagName = "DIV") {
     play() {
       return Promise.resolve();
     },
+    load() {},
+    pause() {},
     get innerHTML() {
       return el._innerHTML;
     },
@@ -140,8 +142,18 @@ function makeMockElement(id = "", tagName = "DIV") {
 
 function createApiSandbox(fetchImpl) {
   const storage = new Map();
+  const sessionStorageMap = new Map();
+  const sessionStorageObj = {
+    getItem: k => (sessionStorageMap.has(k) ? sessionStorageMap.get(k) : null),
+    setItem: (k, v) => sessionStorageMap.set(k, String(v)),
+    removeItem: k => sessionStorageMap.delete(k),
+    clear: () => sessionStorageMap.clear(),
+    get length() { return sessionStorageMap.size; },
+    key: i => Array.from(sessionStorageMap.keys())[i] || null
+  };
   const windowObj = {
     location: { protocol: "http:", hostname: "localhost", port: "8000", hash: "#dashboard" },
+    sessionStorage: sessionStorageObj,
     dispatchEvent() {},
     addEventListener() {},
     removeEventListener() {}
@@ -161,6 +173,7 @@ function createApiSandbox(fetchImpl) {
       setItem: (k, v) => storage.set(k, String(v)),
       removeItem: k => storage.delete(k)
     },
+    sessionStorage: sessionStorageObj,
     window: windowObj,
     fetch: fetchImpl,
     setTimeout,
@@ -175,7 +188,8 @@ function createApiSandbox(fetchImpl) {
       entries() {
         return this._entries[Symbol.iterator]();
       }
-    }
+    },
+    Blob
   };
   context.globalThis = context;
   vm.createContext(context);
@@ -210,7 +224,7 @@ async function testApiServiceExportsAndDedupe() {
     "getMasteryDashboard", "getLoopNextAction", "evaluateAnswer", "getNextQuestion",
     "submitAnswer", "getLoopStatus", "startDiagnostic", "submitDiagnostic",
     "getRemedialQuiz", "startActiveRecall", "evaluateActiveRecall", "getActiveRecallHistory",
-    "getMastery", "resetMastery", "getRecommendations", "listMaterials",
+    "getMastery", "resetMastery", "getRecommendations", "getDashboardSummary", "listMaterials",
     "ingestMaterialFile", "ingestMaterialUrl", "getMaterialPreview", "deleteMaterial",
     "generateNote", "getNotes", "deleteNote", "generateNoteAudio", "exportNoteArtifact",
     "generateDeepAudio", "generateToolArtifact", "getArtifactUrl",
@@ -290,14 +304,46 @@ async function createAppHarness(routeHandlers) {
     ["cm_user", JSON.stringify({ user_id: "user-1", full_name: "Test User" })]
   ]);
 
+  const sessionStorageMap = new Map();
+  const sessionStorageObj = {
+    getItem: k => (sessionStorageMap.has(k) ? sessionStorageMap.get(k) : null),
+    setItem: (k, v) => sessionStorageMap.set(k, String(v)),
+    removeItem: k => sessionStorageMap.delete(k),
+    clear: () => sessionStorageMap.clear(),
+    get length() { return sessionStorageMap.size; },
+    key: i => Array.from(sessionStorageMap.keys())[i] || null
+  };
+
   const byId = new Map();
   const classElements = new Map();
   const docListeners = new Map();
   const winListeners = new Map();
 
+  function registerIdsFromHtml(html) {
+    if (!html) return;
+    const matches = [...String(html).matchAll(/id="([^"]+)"/g)];
+    for (const m of matches) {
+      const eid = m[1];
+      if (!byId.has(eid)) {
+        makeStubContainer(eid);
+      }
+    }
+  }
+
   function makeStubContainer(id, tag = "DIV") {
     const el = makeMockElement(id, tag);
     byId.set(id, el);
+    let elemHtml = "";
+    Object.defineProperty(el, "innerHTML", {
+      get() {
+        return elemHtml || el._innerHTML;
+      },
+      set(val) {
+        elemHtml = String(val);
+        el._innerHTML = elemHtml;
+        registerIdsFromHtml(elemHtml);
+      }
+    });
     return el;
   }
 
@@ -311,9 +357,11 @@ async function createAppHarness(routeHandlers) {
     "btn-quiz-submit", "btn-quiz-skip", "quiz-feedback-container",
     "btn-start-recall-timer", "btn-ready-test-now", "btn-submit-active-recall",
     "active-recall-text", "verification-answer-input", "recall-stats-display",
-    "btn-generate-smart-notes", "btn-note-audio", "note-audio-player-box",
-    "note-audio-element", "task-selector-error", "task-selector-grid",
-    "smart-notes-concept-select", "custom-instructions-input", "active-note-view"
+    "btn-generate-smart-notes", "btn-note-audio", "btn-note-pdf", "btn-note-pptx", "btn-note-diagram",
+    "btn-save-note-mp3",
+    "note-audio-player-box", "note-audio-element", "task-selector-error", "task-selector-grid",
+    "smart-notes-concept-select", "custom-instructions-input", "active-note-view",
+    "note-diagram-box", "note-diagram-inner"
   ]) {
     if (!byId.has(id)) makeStubContainer(id);
   }
@@ -354,6 +402,7 @@ async function createAppHarness(routeHandlers) {
     },
     set(val) {
       viewRawHtml = String(val);
+      registerIdsFromHtml(viewRawHtml);
       if (viewRawHtml.includes('id="quiz-card-box"')) {
         byId.set("quiz-card-box", quizBox);
       }
@@ -362,10 +411,33 @@ async function createAppHarness(routeHandlers) {
         "btn-ready-test-now",
         "btn-submit-active-recall",
         "btn-generate-smart-notes",
-        "btn-note-audio"
+        "btn-note-audio",
+        "btn-note-pdf",
+        "btn-note-pptx",
+        "btn-note-diagram",
+        "btn-save-note-mp3"
       ]) {
         if (viewRawHtml.includes(`id="${btnId}"`)) {
           makeStubContainer(btnId, "BUTTON");
+        }
+      }
+      if (viewRawHtml.includes('id="note-diagram-box"')) {
+        const diagramBox = makeStubContainer("note-diagram-box", "DIV");
+        const match = viewRawHtml.match(/id="note-diagram-box"[^>]*style="([^"]*)"/) ||
+                      viewRawHtml.match(/style="([^"]*)"[^>]*id="note-diagram-box"/);
+        if (match) {
+          diagramBox.setAttribute("style", match[1]);
+          if (match[1].includes("display:none")) {
+            diagramBox.style.display = "none";
+          }
+        }
+      }
+      if (viewRawHtml.includes('id="note-diagram-inner"')) {
+        const diagramInner = makeStubContainer("note-diagram-inner", "DIV");
+        const match = viewRawHtml.match(/id="note-diagram-inner"[^>]*style="([^"]*)"/) ||
+                      viewRawHtml.match(/style="([^"]*)"[^>]*id="note-diagram-inner"/);
+        if (match) {
+          diagramInner.setAttribute("style", match[1]);
         }
       }
       if (viewRawHtml.includes('class="task-card')) {
@@ -392,6 +464,9 @@ async function createAppHarness(routeHandlers) {
       if (sel.startsWith("#")) return byId.get(sel.slice(1)) || null;
       return null;
     },
+    getElementById(id) {
+      return byId.get(id) || null;
+    },
     querySelectorAll(sel) {
       return classElements.get(sel) || [];
     },
@@ -409,6 +484,7 @@ async function createAppHarness(routeHandlers) {
 
   const windowObj = {
     location: { protocol: "http:", hostname: "localhost", port: "8000", hash: "#settings" },
+    sessionStorage: sessionStorageObj,
     addEventListener(type, fn) {
       if (!winListeners.has(type)) winListeners.set(type, new Set());
       winListeners.get(type).add(fn);
@@ -420,10 +496,15 @@ async function createAppHarness(routeHandlers) {
     __winListeners: winListeners
   };
 
-  const fetchImpl = (url, opts = {}) => {
+  const fetchImpl = async (url, opts = {}) => {
     const method = (opts.method || "GET").toUpperCase();
     const pathname = url.replace(/^https?:\/\/[^/]+/, "").split("?")[0];
-    return routeHandlers({ method, url, pathname, opts });
+    const handled = await routeHandlers({ method, url, pathname, opts });
+    if (handled) return handled;
+    if (pathname.startsWith("/api/artifacts/") && pathname.endsWith(".mp3")) {
+      return audioBlobResponse(5000, 200);
+    }
+    return jsonResponse({});
   };
 
   const context = {
@@ -441,6 +522,7 @@ async function createAppHarness(routeHandlers) {
       setItem: (k, v) => storage.set(k, String(v)),
       removeItem: k => storage.delete(k)
     },
+    sessionStorage: sessionStorageObj,
     window: windowObj,
     document: documentObj,
     location: windowObj.location,
@@ -450,7 +532,9 @@ async function createAppHarness(routeHandlers) {
     setInterval: () => 1,
     clearInterval: () => {},
     confirm: () => true,
-    renderMathInElement: null
+    renderMathInElement: null,
+    Blob,
+    URL
   };
   context.globalThis = context;
   vm.createContext(context);
@@ -461,11 +545,34 @@ async function createAppHarness(routeHandlers) {
 }
 
 function jsonResponse(obj, status = 200) {
+  const str = JSON.stringify(obj);
   return {
     ok: status >= 200 && status < 300,
     status,
-    headers: { get: () => "application/json" },
-    json: async () => obj
+    headers: { get: (k) => (k && k.toLowerCase() === "content-type" ? "application/json" : null) },
+    json: async () => obj,
+    text: async () => str,
+    blob: async () => new Blob([str], { type: "application/json" })
+  };
+}
+
+function audioBlobResponse(size = 5000, status = 200) {
+  const buffer = new Uint8Array(size);
+  const blob = new Blob([buffer], { type: "audio/mpeg" });
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: {
+      get: (k) => {
+        if (!k) return null;
+        const lk = k.toLowerCase();
+        if (lk === "content-type") return "audio/mpeg";
+        if (lk === "content-length") return String(size);
+        return null;
+      }
+    },
+    blob: async () => blob,
+    arrayBuffer: async () => buffer.buffer
   };
 }
 
@@ -641,6 +748,9 @@ async function testActiveRecallNotesAudioLocksAndTabAbort() {
       const d = createDeferred();
       audioDeferreds.push(d);
       return await d.promise;
+    }
+    if (pathname.startsWith("/api/artifacts/") && pathname.endsWith(".mp3")) {
+      return audioBlobResponse(5000, 200);
     }
     return jsonResponse({});
   });
@@ -828,6 +938,636 @@ async function testMockGatingAndErrorBanner() {
   assert.ok(harness.viewEl.innerHTML.includes("Backend Unavailable"), "Dashboard must show Backend Unavailable instead of silent empty state");
 }
 
+async function testBrowserDownloadHelperBlobAndRevokeDelay() {
+  const timeouts = [];
+  const revokedUrls = [];
+  const createdUrls = [];
+  const clickedAnchors = [];
+
+  const fakeBlob = new Blob([new Uint8Array([37, 80, 68, 70])], { type: "application/pdf" });
+
+  const customURL = {
+    createObjectURL(blob) {
+      const url = `blob:test-${Math.random()}`;
+      createdUrls.push({ url, blob });
+      return url;
+    },
+    revokeObjectURL(url) {
+      revokedUrls.push(url);
+    }
+  };
+
+  const harness = await createAppHarness(async ({ url }) => {
+    if (url.includes("/api/artifacts/")) {
+      return {
+        ok: true,
+        status: 200,
+        headers: {
+          get: (h) => (h.toLowerCase() === "content-type" ? "application/pdf" : null)
+        },
+        blob: async () => fakeBlob
+      };
+    }
+    return jsonResponse({});
+  });
+
+  // Inject tracking spys into harness context
+  harness.context.URL = customURL;
+  harness.context.window.URL = customURL;
+  const originalSetTimeout = harness.context.setTimeout;
+  harness.context.setTimeout = (fn, delay) => {
+    timeouts.push({ fn, delay });
+    return originalSetTimeout(fn, 10); // Run faster in test while recording real delay
+  };
+
+  const origCreateElement = harness.documentObj.createElement;
+  harness.documentObj.createElement = (tag) => {
+    const el = origCreateElement(tag);
+    if (tag.toLowerCase() === "a") {
+      el.click = () => {
+        clickedAnchors.push(el);
+      };
+    }
+    return el;
+  };
+
+  // Test ApiService.downloadArtifact directly
+  const apiSvc = harness.windowObj.ApiService || harness.context.window.ApiService;
+  await apiSvc.downloadArtifact("/api/artifacts/test.pdf", "CustomNote.pdf");
+
+  assert.equal(createdUrls.length, 1, "Must create ObjectURL from Blob");
+  assert.equal(createdUrls[0].blob.type, "application/pdf", "Blob must preserve application/pdf content type");
+  assert.equal(clickedAnchors.length, 1, "Anchor click must be triggered");
+  assert.equal(clickedAnchors[0].download, "CustomNote.pdf", "Anchor download attribute must match filename");
+  assert.equal(clickedAnchors[0].href, createdUrls[0].url, "Anchor href must point to created Blob URL");
+
+  const timeoutEntry = timeouts.find(t => t.delay === 60000);
+  assert.ok(timeoutEntry, "URL.revokeObjectURL and anchor cleanup must be scheduled with a 60-second delay (60000ms)");
+  assert.equal(revokedUrls.length, 0, "ObjectURL must NOT be revoked immediately after click");
+
+  // Fire timeout callback to verify revocation
+  timeoutEntry.fn();
+  assert.equal(revokedUrls.length, 1, "ObjectURL must be revoked after timeout callback fires");
+  assert.equal(revokedUrls[0], createdUrls[0].url, "Revoked URL must match created Blob URL");
+}
+
+async function testConceptFlowDiagramSvgInjectionAndSpinner() {
+  let resolveDiagram = null;
+  let noteDeferred = null;
+
+  const mockSvg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 420"><text fill="#e2e8f0">Flow Node</text></svg>';
+
+  const harness = await createAppHarness(async ({ pathname, opts }) => {
+    if (pathname === "/api/tools/generate") {
+      return new Promise((resolve) => {
+        resolveDiagram = () => resolve(jsonResponse({
+          artifact_type: "visual",
+          svg: mockSvg,
+          download_url: "/api/artifacts/diagram_123.svg"
+        }));
+      });
+    }
+    if (pathname === "/api/notes/generate") {
+      return new Promise((resolve) => {
+        noteDeferred = () => resolve(jsonResponse({
+          note_id: "note-diag-1",
+          concept_id: "gradient_descent",
+          task_type: "exam",
+          title: "Gradient Descent Notes",
+          markdown_content: "# Gradient Descent\nOptimization mechanics."
+        }));
+      });
+    }
+    if (pathname === "/api/notes") {
+      return jsonResponse([]);
+    }
+    if (pathname === "/api/mastery") {
+      return jsonResponse({
+        overall_score: 85,
+        concepts: [{ concept_id: "gradient_descent", name: "Gradient Descent", mastery_score: 85 }]
+      });
+    }
+    return jsonResponse({});
+  });
+
+  // Switch to smart-notes view
+  const hashListeners = [...(harness.windowObj.__winListeners.get("hashchange") || [])];
+  harness.windowObj.location.hash = "#smart-notes";
+  hashListeners[0]();
+  await new Promise(r => setTimeout(r, 30));
+
+  // Select task card and generate note
+  const taskCards = harness.classElements.get(".task-card") || [];
+  assert.ok(taskCards.length > 0, "Expected .task-card elements in Smart Notes view");
+  taskCards[0].click();
+
+  const genBtn = harness.byId.get("btn-generate-smart-notes");
+  assert.ok(genBtn, "Expected #btn-generate-smart-notes");
+  const genPromise = genBtn.click();
+  await new Promise(r => setTimeout(r, 10));
+  assert.ok(noteDeferred, "Expected note generation request in flight");
+  noteDeferred();
+  await genPromise;
+  await new Promise(r => setTimeout(r, 30));
+
+  const diagramBtn = harness.byId.get("btn-note-diagram");
+  const diagramBox = harness.byId.get("note-diagram-box");
+  const diagramInner = harness.byId.get("note-diagram-inner");
+
+  assert.ok(diagramBtn, "#btn-note-diagram must exist after note is generated");
+  assert.ok(diagramBox, "#note-diagram-box must exist");
+  assert.ok(diagramInner, "#note-diagram-inner must exist");
+
+  // Initial style check on diagram inner container
+  const innerStyle = diagramInner.getAttribute("style") || "";
+  assert.ok(
+    innerStyle.includes("min-height: 280px") || innerStyle.includes("min-height:280px"),
+    "Diagram inner container must specify min-height: 280px"
+  );
+  assert.ok(
+    innerStyle.includes("overflow-x: auto") || innerStyle.includes("overflow-x:auto"),
+    "Diagram inner container must specify overflow-x: auto"
+  );
+
+  // Trigger diagram generation click
+  const clickPromise = diagramBtn.click();
+  await new Promise(r => setTimeout(r, 10));
+
+  // Box must be visible and inner container must show loading spinner
+  assert.equal(diagramBox.style.display, "block", "Diagram box must be displayed while generating");
+  assert.ok(
+    diagramInner.innerHTML.includes("Rendering Concept Flow Diagram") ||
+    diagramInner.innerHTML.includes("spinner") ||
+    diagramInner.innerHTML.includes("Synthesizing"),
+    "Inner container must show loading spinner while generating"
+  );
+  assert.equal(diagramBtn.disabled, true, "Generate Diagram button must be locked while generating");
+
+  // Resolve API promise
+  assert.ok(resolveDiagram, "Diagram API call must be in-flight");
+  resolveDiagram();
+  await clickPromise;
+  await new Promise(r => setTimeout(r, 10));
+
+  // After completion: SVG must be injected
+  assert.ok(diagramInner.innerHTML.includes('<svg xmlns="http://www.w3.org/2000/svg"'), "Inner container must contain the injected SVG element");
+  assert.ok(diagramInner.innerHTML.includes("Flow Node"), "Inner container must contain the SVG text node");
+  assert.equal(diagramBtn.disabled, false, "Generate Diagram button must be unlocked after resolution");
+}
+
+async function testAudioPlayerBlobSizeAndDelayedRevoke() {
+  // 1. ApiService.fetchAudioBlob unit validation
+  let fetchStatus = 200;
+  let fetchBlobSize = 5000;
+  const { ApiService } = createApiSandbox(async () => {
+    return {
+      ok: fetchStatus >= 200 && fetchStatus < 300,
+      status: fetchStatus,
+      blob: async () => new Blob([new Uint8Array(fetchBlobSize)], { type: "audio/mpeg" })
+    };
+  });
+
+  // Rejects on HTTP error (e.g. 503)
+  fetchStatus = 503;
+  await assert.rejects(
+    () => ApiService.fetchAudioBlob("/api/artifacts/audio_test.mp3"),
+    err => err.message.includes("503")
+  );
+
+  // Rejects on empty or truncated blob (size <= 100)
+  fetchStatus = 200;
+  fetchBlobSize = 40;
+  await assert.rejects(
+    () => ApiService.fetchAudioBlob("/api/artifacts/audio_test.mp3"),
+    err => err.message.includes("100") || err.message.includes("empty") || err.message.includes("invalid")
+  );
+
+  // Succeeds on valid blob size > 100 and returns Blob with type audio/mpeg
+  fetchStatus = 200;
+  fetchBlobSize = 5000;
+  const validBlob = await ApiService.fetchAudioBlob("/api/artifacts/audio_test.mp3");
+  assert.ok(validBlob, "Expected valid blob");
+  assert.equal(validBlob.type, "audio/mpeg");
+  assert.equal(validBlob.size, 5000);
+
+  // 2. Integration test with UI harness
+  let audioGenDeferred = null;
+  const createdBlobUrls = [];
+  const revokedBlobUrls = [];
+  const timeoutCallbacks = [];
+
+  const harness = await createAppHarness(async ({ pathname }) => {
+    if (pathname === "/api/notes/generate") {
+      return jsonResponse({
+        note_id: "note-audio-test",
+        concept_id: "neural_nets",
+        task_type: "exam",
+        title: "Neural Nets Note",
+        markdown_content: "# Neural Nets\nBackprop and SGD mechanics."
+      });
+    }
+    if (pathname === "/api/notes/note-audio-test/audio") {
+      return new Promise(resolve => {
+        audioGenDeferred = () => resolve(jsonResponse({
+          audio_url: "/api/artifacts/audio_nn.mp3"
+        }));
+      });
+    }
+    if (pathname === "/api/artifacts/audio_nn.mp3") {
+      return audioBlobResponse(6311, 200);
+    }
+    if (pathname === "/api/notes") return jsonResponse([]);
+    if (pathname === "/api/mastery") {
+      return jsonResponse({
+        overall_score: 90,
+        concepts: [{ concept_id: "neural_nets", name: "Neural Networks", mastery_score: 90 }]
+      });
+    }
+    return jsonResponse({});
+  });
+
+  harness.context.URL.createObjectURL = (blob) => {
+    const url = `blob:http://localhost:8000/${Math.random().toString(36).slice(2)}`;
+    createdBlobUrls.push({ url, blob });
+    return url;
+  };
+  harness.context.URL.revokeObjectURL = (url) => {
+    revokedBlobUrls.push(url);
+  };
+  harness.context.setTimeout = (fn, ms) => {
+    timeoutCallbacks.push({ fn, ms });
+    return 1;
+  };
+
+  // Switch to smart-notes view
+  const hashListeners = [...(harness.windowObj.__winListeners.get("hashchange") || [])];
+  harness.windowObj.location.hash = "#smart-notes";
+  hashListeners[0]();
+  await new Promise(r => setTimeout(r, 30));
+
+  // Select task card and generate note
+  const taskCards = harness.classElements.get(".task-card") || [];
+  assert.ok(taskCards.length > 0, "Expected .task-card elements");
+  taskCards[0].click();
+
+  const genBtn = harness.byId.get("btn-generate-smart-notes");
+  assert.ok(genBtn);
+  await genBtn.click();
+  await new Promise(r => setTimeout(r, 30));
+
+  const audioBtn = harness.byId.get("btn-note-audio");
+  const audioElement = harness.byId.get("note-audio-element");
+  const playerBox = harness.byId.get("note-audio-player-box");
+  const saveMp3Btn = harness.byId.get("btn-save-note-mp3");
+
+  assert.ok(audioBtn, "Audio button must exist");
+  assert.ok(audioElement, "Audio element must exist");
+  assert.ok(playerBox, "Player box must exist");
+  assert.ok(saveMp3Btn, "Save MP3 button must exist");
+
+  // Track load() calls on audio element
+  let loadCalled = false;
+  audioElement.load = () => { loadCalled = true; };
+
+  // Click audio button
+  const audClickPromise = audioBtn.click();
+  await new Promise(r => setTimeout(r, 10));
+  assert.equal(audioBtn.disabled, true, "Audio button must lock while synthesizing");
+
+  assert.ok(audioGenDeferred, "Audio generation must be in flight");
+  audioGenDeferred();
+  await audClickPromise;
+  await new Promise(r => setTimeout(r, 20));
+
+  assert.equal(audioBtn.disabled, false, "Audio button must unlock after completion");
+  assert.ok(audioBtn.innerHTML.includes("Audio Ready"), "Audio button must show Audio Ready");
+  assert.ok(audioElement.src.startsWith("blob:"), "Audio element src must be a Blob URL");
+  assert.equal(loadCalled, true, "audioElement.load() must have been called");
+  assert.ok(playerBox.classList.contains("visible"), "Audio player box must be visible");
+
+  // Click Save MP3 button
+  await saveMp3Btn.click();
+  const revokeEntry = timeoutCallbacks.find(e => e.ms === 60000);
+  assert.ok(revokeEntry, "Delayed revokeObjectURL timeout of 60000ms (60s) must be registered");
+}
+
+async function testDashboardSwrCacheParallelSettledAndSkeletonDecoupling() {
+  // --- Part 1: SWR Cache Unit Tests on ApiService ---
+  const { ApiService, context } = createApiSandbox(async () => jsonResponse({}));
+
+  assert.equal(typeof ApiService.getSwr, "function", "ApiService.getSwr must be defined");
+  assert.equal(typeof ApiService.setSwr, "function", "ApiService.setSwr must be defined");
+  assert.equal(typeof ApiService.clearSwr, "function", "ApiService.clearSwr must be defined");
+  assert.equal(typeof ApiService.fetchWithSwr, "function", "ApiService.fetchWithSwr must be defined");
+  assert.equal(typeof ApiService.listNotes, "function", "ApiService.listNotes alias must be defined");
+
+  // In-memory + sessionStorage caching
+  ApiService.setSwr("mastery", { concepts: [{ id: "c1", name: "Backpropagation" }] }, { userId: "user-1" });
+  const cachedVal = ApiService.getSwr("mastery", { userId: "user-1" });
+  assert.deepEqual(cachedVal, { concepts: [{ id: "c1", name: "Backpropagation" }] });
+  assert.ok(context.sessionStorage.getItem("cm_swr:user-1:all:mastery"), "SWR cache should persist to sessionStorage");
+
+  // SWR clearing
+  ApiService.clearSwr("mastery");
+  assert.equal(ApiService.getSwr("mastery", { userId: "user-1" }), null);
+
+  // fetchWithSwr with revalidation
+  let networkCalls = 0;
+  const swrFetchImpl = async () => {
+    networkCalls++;
+    return jsonResponse({ concepts: [{ id: "c2", name: "Convolutional Networks" }] });
+  };
+  const { ApiService: swrApi } = createApiSandbox(swrFetchImpl);
+  swrApi.setSwr("mastery", { concepts: [{ id: "c1", name: "Cached ML" }] });
+
+  let revalidatedData = null;
+  const instantRes = await swrApi.fetchWithSwr("mastery", null, {}, (fresh) => {
+    revalidatedData = fresh;
+  });
+  assert.deepEqual(instantRes, { concepts: [{ id: "c1", name: "Cached ML" }] });
+  await new Promise(r => setTimeout(r, 20));
+  assert.deepEqual(revalidatedData, { concepts: [{ id: "c2", name: "Convolutional Networks" }] });
+  assert.equal(networkCalls, 1);
+
+  // --- Part 2: Integration Test with App Harness ---
+  const recDeferred = createDeferred();
+  let fetchCounts = {
+    materials: 0,
+    mastery: 0,
+    loopStatus: 0,
+    notes: 0,
+    recommend: 0
+  };
+
+  const harness = await createAppHarness(async ({ pathname }) => {
+    if (pathname === "/api/materials") {
+      fetchCounts.materials++;
+      return jsonResponse({
+        materials: [{ material_id: "mat_dl", title: "Deep Learning Foundations", ready: true, source_type: "pdf" }]
+      });
+    }
+    if (pathname === "/api/mastery") {
+      fetchCounts.mastery++;
+      return jsonResponse({
+        concepts: [
+          { id: "c1", name: "Gradient Descent", score: 0.9, attempts: 4 },
+          { id: "c2", name: "Backpropagation", score: 0.45, attempts: 2 }
+        ]
+      });
+    }
+    if (pathname === "/api/loop/status") {
+      fetchCounts.loopStatus++;
+      return jsonResponse({
+        loop_state: "ACTIVE_LOOP",
+        material_ready: true,
+        baseline_completed: true
+      });
+    }
+    if (pathname === "/api/notes") {
+      fetchCounts.notes++;
+      return jsonResponse({ notes: [] });
+    }
+    if (pathname === "/api/recommend") {
+      fetchCounts.recommend++;
+      return recDeferred.promise;
+    }
+    return jsonResponse({});
+  });
+
+  // Start with clean SWR cache
+  harness.context.window.ApiService.clearSwr();
+
+  // Navigate to Dashboard
+  const hashListeners = [...(harness.windowObj.__winListeners.get("hashchange") || [])];
+  assert.ok(hashListeners.length > 0, "hashchange listener must be registered");
+  harness.windowObj.location.hash = "#dashboard";
+  hashListeners[0]();
+
+  // Allow fast local stats (Promise.allSettled) to resolve
+  await new Promise(r => setTimeout(r, 35));
+
+  // 1. Fast SQLite metrics and concept lists render immediately
+  assert.ok(harness.viewEl.innerHTML.includes("Gradient Descent"), "Dashboard must render concept list from fast metrics");
+  assert.ok(harness.viewEl.innerHTML.includes("Backpropagation"), "Dashboard must render concept list from fast metrics");
+  assert.ok(harness.viewEl.innerHTML.includes("Your Learning Progress"), "Dashboard must render learning progress ring");
+
+  // 2. Slow AI recommendations decouple into asynchronous skeleton shimmer
+  const recContainer = harness.byId.get("dashboard-rec-container");
+  assert.ok(recContainer, "#dashboard-rec-container must exist");
+  assert.ok(harness.viewEl.innerHTML.includes("skeleton-shimmer"), "Recommendation card must display skeleton-shimmer while pending");
+  assert.ok(harness.viewEl.innerHTML.includes("recommendation-card-skeleton"), "Skeleton container class must be present");
+
+  // 3. Resolve decoupled AI recommendation
+  recDeferred.resolve(jsonResponse({
+    actions: [
+      {
+        type: "Remedial Review",
+        name: "Backpropagation",
+        conceptId: "c2",
+        reason: "Target gradient vanishing and chain rule calculations"
+      }
+    ]
+  }));
+  await new Promise(r => setTimeout(r, 35));
+
+  // 4. Recommendation sub-container updates cleanly without tearing down the dashboard
+  assert.ok(!recContainer.innerHTML.includes("skeleton-shimmer"), "Skeleton shimmer must be replaced once recommendation resolves");
+  assert.ok(recContainer.innerHTML.includes("Backpropagation"), "Recommendation card must display recommended concept name");
+  assert.ok(recContainer.innerHTML.includes("Target gradient vanishing"), "Recommendation card must display recommendation reason");
+
+  // 5. Verify SWR caching on tab switch: 0ms perceived latency, no "Loading dashboard..." spinner
+  harness.windowObj.location.hash = "#upload";
+  hashListeners[0]();
+  await new Promise(r => setTimeout(r, 20));
+
+  // Track if "Loading dashboard..." was ever set in viewEl
+  let sawBlockingSpinner = false;
+  const originalDesc = Object.getOwnPropertyDescriptor(harness.viewEl, "innerHTML");
+  Object.defineProperty(harness.viewEl, "innerHTML", {
+    get() {
+      return originalDesc ? originalDesc.get.call(harness.viewEl) : harness.viewEl._innerHTML;
+    },
+    set(val) {
+      if (String(val).includes("Loading dashboard...")) {
+        sawBlockingSpinner = true;
+      }
+      if (originalDesc && originalDesc.set) {
+        originalDesc.set.call(harness.viewEl, val);
+      } else {
+        harness.viewEl._innerHTML = String(val);
+      }
+    }
+  });
+
+  // Switch back to #dashboard with populated SWR cache
+  harness.windowObj.location.hash = "#dashboard";
+  hashListeners[0]();
+
+  // Instant render check: blocking spinner was skipped entirely
+  assert.equal(sawBlockingSpinner, false, "Dashboard tab switch must not show blocking 'Loading dashboard...' spinner when cache is warm");
+
+  // Allow microtask to mount cached view
+  await new Promise(r => setTimeout(r, 20));
+  assert.ok(harness.viewEl.innerHTML.includes("Gradient Descent"), "Cached dashboard must be rendered immediately");
+  assert.ok(harness.viewEl.innerHTML.includes("Backpropagation"), "Cached recommendation must be preserved");
+}
+
+async function testDashboardSummaryBatchedEndpointFastPath() {
+  const requestLog = [];
+
+  const harness = await createAppHarness(async ({ pathname, url }) => {
+    requestLog.push({ pathname, url });
+    if (pathname === "/api/dashboard-summary") {
+      return jsonResponse({
+        ok: true,
+        user_id: "user-1",
+        materials: [
+          { material_id: "mat_batched", title: "Transformer Architecture", chunk_count: 8, concept_count: 3 }
+        ],
+        concepts: [
+          { id: "c_attn", name: "Self-Attention Mechanism", score: 0.92, attempts: 4, status: "strong", state: "STRONG" }
+        ],
+        edges: [],
+        notes: [
+          { note_id: "note_attn", title: "Self-Attention Summary", task_type: "study_guide" }
+        ],
+        loop_status: {
+          loop_state: "ACTIVE_LOOP",
+          material_ready: true,
+          baseline_completed: true,
+          concepts_count: 1
+        },
+        recommendations: [
+          {
+            type: "Reinforce",
+            name: "Self-Attention Mechanism",
+            conceptId: "c_attn",
+            reason: "High retention score; quick practice to lock in conceptual mastery."
+          }
+        ],
+        top_recommendation: {
+          type: "Reinforce",
+          name: "Self-Attention Mechanism",
+          conceptId: "c_attn",
+          reason: "High retention score; quick practice to lock in conceptual mastery."
+        }
+      });
+    }
+    return jsonResponse({});
+  });
+
+  // Clear boot requests and SWR cache before test
+  harness.context.window.ApiService.clearSwr();
+  requestLog.length = 0;
+
+  // Navigate to Dashboard
+  const hashListeners = [...(harness.windowObj.__winListeners.get("hashchange") || [])];
+  harness.windowObj.location.hash = "#dashboard";
+  hashListeners[0]();
+
+  await new Promise(r => setTimeout(r, 35));
+
+  // 1. One single round-trip was executed to load the dashboard
+  const summaryCalls = requestLog.filter(r => r.pathname === "/api/dashboard-summary");
+  assert.equal(summaryCalls.length, 1, "Expected exactly 1 request to /api/dashboard-summary");
+  assert.equal(requestLog.length, 1, "Batched fast path should only issue 1 network request for cold load");
+
+  // 2. Verified rendered view contains batched data
+  assert.ok(harness.viewEl.innerHTML.includes("Self-Attention Mechanism"), "Batched concept name should render in view");
+  assert.ok(harness.viewEl.innerHTML.includes("Your Learning Progress"), "Progress donut should render");
+
+  // 3. Recommendation container rendered immediately from batched payload
+  const recContainer = harness.byId.get("dashboard-rec-container");
+  assert.ok(recContainer, "#dashboard-rec-container must exist");
+  assert.ok(!harness.viewEl.innerHTML.includes("skeleton-shimmer"), "Skeleton shimmer should be cleared immediately with batched recommendation");
+  assert.ok(harness.viewEl.innerHTML.includes("Self-Attention Mechanism"), "Top recommendation must be rendered");
+
+  // 4. Individual SWR caches are automatically populated for downstream views
+  const ApiService = harness.context.window.ApiService;
+  assert.ok(ApiService.getSwr("dashboardSummary", { userId: "user-1" }), "dashboardSummary must be cached in SWR");
+  assert.ok(ApiService.getSwr("materialsList", { userId: "user-1" }), "materialsList must be seeded into SWR");
+  assert.ok(ApiService.getSwr("mastery", { userId: "user-1" }), "mastery must be seeded into SWR");
+  assert.ok(ApiService.getSwr("loopStatus", { userId: "user-1" }), "loopStatus must be seeded into SWR");
+  assert.ok(ApiService.getSwr("notesList", { userId: "user-1" }), "notesList must be seeded into SWR");
+  assert.ok(ApiService.getSwr("recommend", { userId: "user-1" }), "recommend must be seeded into SWR");
+}
+
+function testInputHighContrastAndThemeTokensAcrossProject() {
+  const cssPath = path.resolve(__dirname, "../css/styles.css");
+  const cssContent = fs.readFileSync(cssPath, "utf-8");
+  const appJsContent = fs.readFileSync(APP_JS_PATH, "utf-8");
+
+  // 1. Verify CSS variables exist in :root and [data-theme="dark"]
+  assert.ok(cssContent.includes("--surface-input:"), "styles.css must define --surface-input");
+  assert.ok(cssContent.includes("--surface-input-focus:"), "styles.css must define --surface-input-focus");
+  assert.ok(cssContent.includes("--ink-input:"), "styles.css must define --ink-input");
+  assert.ok(cssContent.includes("--border-input:"), "styles.css must define --border-input");
+
+  // 2. Dark theme must have color-scheme: dark and dark-adapted surface inputs
+  const darkThemeMatch = cssContent.match(/\[data-theme=["']dark["']\]\s*\{([\s\S]*?)\}/);
+  assert.ok(darkThemeMatch, "styles.css must have [data-theme='dark'] block");
+  const darkCss = darkThemeMatch[1];
+  assert.ok(darkCss.includes("color-scheme: dark"), "[data-theme='dark'] must declare color-scheme: dark;");
+  assert.ok(darkCss.includes("--surface-input: #131f37"), "Dark theme --surface-input must be deep navy (#131f37)");
+  assert.ok(darkCss.includes("--ink-input: #f8fafc"), "Dark theme --ink-input must be high-contrast white (#f8fafc)");
+
+  // 3. Global inputs, textareas, and selects must have baseline styling
+  assert.ok(cssContent.includes("input, textarea, select {"), "Global input, textarea, select styling rule must exist");
+  assert.ok(cssContent.includes("input::placeholder, textarea::placeholder {"), "Placeholder styling must exist");
+  assert.ok(cssContent.includes(".form-control,"), ".form-control, .form-input, .form-select classes must exist");
+
+  // 4. Baseline diagnostic classes must use CSS tokens and NOT hardcode #fff
+  const fitbBlockMatch = cssContent.match(/\.fitb-blank-input\s*\{([\s\S]*?)\}/);
+  assert.ok(fitbBlockMatch, ".fitb-blank-input must be defined");
+  assert.ok(fitbBlockMatch[1].includes("var(--surface-input)"), ".fitb-blank-input must use var(--surface-input)");
+  assert.ok(fitbBlockMatch[1].includes("var(--ink-input)"), ".fitb-blank-input must use var(--ink-input)");
+
+  const fitbFocusMatch = cssContent.match(/\.fitb-blank-input:focus\s*\{([\s\S]*?)\}/);
+  assert.ok(fitbFocusMatch, ".fitb-blank-input:focus must be defined");
+  assert.ok(!fitbFocusMatch[1].includes("#fff"), ".fitb-blank-input:focus must NOT hardcode #fff");
+  assert.ok(fitbFocusMatch[1].includes("var(--surface-input-focus)"), ".fitb-blank-input:focus must use var(--surface-input-focus)");
+
+  const quizTextareaMatch = cssContent.match(/\.quiz-textarea\s*\{([\s\S]*?)\}/);
+  assert.ok(quizTextareaMatch, ".quiz-textarea must be defined");
+  assert.ok(quizTextareaMatch[1].includes("var(--surface-input)"), ".quiz-textarea must use var(--surface-input)");
+  assert.ok(quizTextareaMatch[1].includes("var(--ink-input)"), ".quiz-textarea must use var(--ink-input)");
+
+  const quizTextareaFocusMatch = cssContent.match(/\.quiz-textarea:focus\s*\{([\s\S]*?)\}/);
+  assert.ok(quizTextareaFocusMatch, ".quiz-textarea:focus must be defined");
+  assert.ok(!quizTextareaFocusMatch[1].includes("#fff"), ".quiz-textarea:focus must NOT hardcode #fff");
+  assert.ok(quizTextareaFocusMatch[1].includes("var(--surface-input-focus)"), ".quiz-textarea:focus must use var(--surface-input-focus)");
+
+  // 5. Numerical, Active Recall, and Verification inputs
+  assert.ok(cssContent.includes(".numerical-input:focus"), ".numerical-input:focus must be styled");
+  assert.ok(cssContent.includes(".recall-textarea:focus"), ".recall-textarea:focus must be styled");
+  assert.ok(cssContent.includes(".verification-input:focus"), ".verification-input:focus must be styled");
+
+  // 6. Ensure no lingering undefined var(--surface) in app.js
+  assert.ok(!appJsContent.includes("background:var(--surface);"), "app.js must not contain raw background:var(--surface)");
+
+  // 7. Calculate WCAG 2.1 relative luminance and contrast ratio for dark mode input
+  // sRGB to linear luminance helper
+  function getLuminance(r, g, b) {
+    const a = [r, g, b].map(v => {
+      v /= 255;
+      return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+    });
+    return a[0] * 0.2126 + a[1] * 0.7152 + a[2] * 0.0722;
+  }
+  // #f8fafc: rgb(248, 250, 252)
+  const lTextDark = getLuminance(248, 250, 252);
+  // #131f37: rgb(19, 31, 55)
+  const lBgDark = getLuminance(19, 31, 55);
+  const darkContrast = (lTextDark + 0.05) / (lBgDark + 0.05);
+  assert.ok(darkContrast >= 7.0, `Dark theme input contrast must exceed 7:1 (WCAG AAA); actual is ${darkContrast.toFixed(2)}:1`);
+
+  // Light theme: #0f172a (15, 23, 42) on #ffffff (255, 255, 255)
+  const lTextLight = getLuminance(15, 23, 42);
+  const lBgLight = getLuminance(255, 255, 255);
+  const lightContrast = (lBgLight + 0.05) / (lTextLight + 0.05);
+  assert.ok(lightContrast >= 7.0, `Light theme input contrast must exceed 7:1 (WCAG AAA); actual is ${lightContrast.toFixed(2)}:1`);
+}
+
 (async function run() {
   await testApiServiceExportsAndDedupe();
   console.log("PASS: testApiServiceExportsAndDedupe");
@@ -837,4 +1577,16 @@ async function testMockGatingAndErrorBanner() {
   console.log("PASS: testActiveRecallNotesAudioLocksAndTabAbort");
   await testMockGatingAndErrorBanner();
   console.log("PASS: testMockGatingAndErrorBanner");
+  await testBrowserDownloadHelperBlobAndRevokeDelay();
+  console.log("PASS: testBrowserDownloadHelperBlobAndRevokeDelay");
+  await testConceptFlowDiagramSvgInjectionAndSpinner();
+  console.log("PASS: testConceptFlowDiagramSvgInjectionAndSpinner");
+  await testAudioPlayerBlobSizeAndDelayedRevoke();
+  console.log("PASS: testAudioPlayerBlobSizeAndDelayedRevoke");
+  await testDashboardSwrCacheParallelSettledAndSkeletonDecoupling();
+  console.log("PASS: testDashboardSwrCacheParallelSettledAndSkeletonDecoupling");
+  await testDashboardSummaryBatchedEndpointFastPath();
+  console.log("PASS: testDashboardSummaryBatchedEndpointFastPath");
+  testInputHighContrastAndThemeTokensAcrossProject();
+  console.log("PASS: testInputHighContrastAndThemeTokensAcrossProject");
 })();

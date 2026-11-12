@@ -14,9 +14,8 @@ import logging
 import time
 from pathlib import Path
 from typing import Optional, Literal
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Request, Depends, Query, Body
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Request, Depends, Query, Body, Response
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse
 
 from . import config
 from .core import store, tts
@@ -897,15 +896,75 @@ def post_loop_next_action(
 
 
 @router.post("/recommend")
+@router.post("/recommend/")
+@router.get("/recommend")
+@router.get("/recommend/")
 def post_recommend(
     request: Request,
     user_id: str = "default",
+    refresh_ai: bool = Query(False),
     current_user: User = Depends(get_current_user),
 ):
     uid = _resolve_tenant_user_id(current_user, request, user_id)
     if not _get_tenant_kb(uid, request).get("ready"):
         return {"actions": [], "ready": False}
-    return recommend.recommend(user_id=uid)
+    return recommend.recommend(user_id=uid, refresh_ai=refresh_ai)
+
+
+@router.get("/dashboard-summary")
+@router.get("/dashboard-summary/", include_in_schema=False)
+@router.get("/api/dashboard-summary", include_in_schema=False)
+@router.get("/api/dashboard-summary/", include_in_schema=False)
+def get_dashboard_summary(
+    request: Request,
+    user_id: str = "default",
+    material_id: Optional[str] = None,
+    refresh_ai: bool = Query(False),
+    current_user: User = Depends(get_current_user),
+):
+    """Fast-path one-round-trip Dashboard loading: fetches active material metadata, concepts with
+    current mastery scores, prerequisite edges, quiz/recall attempt counts, saved notes metadata,
+    and fast deterministic next-step recommendations (<10ms) without synchronous LLM calls.
+    """
+    uid = _resolve_tenant_user_id(current_user, request, user_id)
+    summary = store.get_dashboard_summary(user_id=uid, material_id=material_id)
+
+    # Fast deterministic graph + mastery recommendations (<10ms, no OpenRouter LLM call unless refresh_ai=True)
+    rec_res = recommend.recommend(user_id=uid, refresh_ai=refresh_ai)
+    actions = rec_res.get("actions", [])
+    summary["recommendations"] = actions
+    summary["top_recommendation"] = actions[0] if actions else None
+
+    # Loop lifecycle state
+    kb = _get_tenant_kb(uid, request)
+    concepts_list = summary.get("concepts", [])
+    if not concepts_list and not (kb and kb.get("ready")):
+        summary["loop_status"] = {
+            "ok": True,
+            "loop_state": "UNINITIALIZED",
+            "state": "AWAITING_UPLOAD",
+            "message": "Upload your study material to begin.",
+            "material_ready": False,
+            "concepts_count": 0,
+            "baseline_completed": False,
+            "total_attempts": 0,
+        }
+    else:
+        total_attempts = sum(c.get("attempts", 0) for c in concepts_list)
+        lifecycle = loop.get_lifecycle_state(uid)
+        baseline_done = (lifecycle == "ACTIVE_LEARNING" or total_attempts >= 3)
+        summary["loop_status"] = {
+            "ok": True,
+            "loop_state": "ACTIVE_LOOP" if baseline_done else "BASELINE_DIAGNOSTIC",
+            "state": "ACTIVE_LEARNING" if baseline_done else lifecycle,
+            "message": "Active learning session in progress." if baseline_done else "Baseline diagnostic required.",
+            "material_ready": True,
+            "concepts_count": len(concepts_list),
+            "baseline_completed": baseline_done,
+            "total_attempts": total_attempts,
+        }
+
+    return summary
 
 
 # ── Closed-Loop Status, Diagnostic & Active Recall ─────────────────────────
@@ -974,48 +1033,12 @@ def post_diagnostic_start(
     while len(target_cids) < 6 and concepts_list:
         target_cids.append(concepts_list[len(target_cids) % len(concepts_list)]["id"])
 
-    questions = []
-    seen_qids = set()
-    for cid in target_cids:
-        try:
-            qs = quiz.generate_diagnostic_quiz(cid, count=1, user_id=uid, kb=kb)
-            for q in qs:
-                if q.question_id not in seen_qids:
-                    seen_qids.add(q.question_id)
-                    qd = q.model_dump()
-                    c_meta = next((c for c in concepts_list if c["id"] == cid), {})
-                    qd["conceptName"] = c_meta.get("name", cid)
-                    qd["conceptId"] = cid
-                    questions.append(qd)
-                    if len(questions) >= 6:
-                        break
-        except Exception as e:
-            logger.warning(f"Failed generating diagnostic question for {cid}: {e}")
-        if len(questions) >= 6:
-            break
-
-    # If still fewer than 6 questions, cycle through available concepts to complete the set
-    if len(questions) < 6 and concepts_list:
-        idx = 0
-        attempts = 0
-        while len(questions) < 6 and attempts < 15:
-            c = concepts_list[idx % len(concepts_list)]
-            cid = c.get("id")
-            idx += 1
-            attempts += 1
-            try:
-                qs = quiz.generate_diagnostic_quiz(cid, count=1, user_id=uid, kb=kb, offset=len(questions))
-                for q in qs:
-                    if q.question_id not in seen_qids:
-                        seen_qids.add(q.question_id)
-                        qd = q.model_dump()
-                        qd["conceptName"] = c.get("name", cid)
-                        qd["conceptId"] = cid
-                        questions.append(qd)
-                        if len(questions) >= 6:
-                            break
-            except Exception as e:
-                logger.warning(f"Fallback diagnostic question for {cid} failed: {e}")
+    questions = quiz.generate_full_diagnostic_suite(
+        target_cids=target_cids,
+        user_id=uid,
+        count=6,
+        kb=kb
+    )
 
     if not questions:
         raise HTTPException(
@@ -1254,17 +1277,34 @@ def get_generated_artifact(filename: str, download: Optional[bool] = None):
         ".pdf": "application/pdf",
         ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         ".mp3": "audio/mpeg",
+        ".wav": "audio/wav",
     }
     media_type = media_types.get(suffix, "application/octet-stream")
     is_attachment = download is True or suffix in [".pdf", ".pptx"]
-    if is_attachment:
-        return FileResponse(
-            path=str(file_path),
-            media_type=media_type,
-            filename=safe_name,
-            content_disposition_type="attachment",
-        )
-    return FileResponse(path=str(file_path), media_type=media_type)
+    raw_bytes = file_path.read_bytes()
+
+    if len(raw_bytes) == 0:
+        raise HTTPException(status_code=503, detail="Artifact file is empty")
+    if suffix == ".mp3" and len(raw_bytes) <= 100:
+        raise HTTPException(status_code=503, detail="Audio artifact contains invalid or truncated stream")
+    if suffix == ".wav" and len(raw_bytes) <= 44:
+        raise HTTPException(status_code=503, detail="Audio artifact contains invalid or truncated stream")
+
+    headers = {
+        "Content-Type": media_type,
+        "Content-Length": str(len(raw_bytes)),
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": (
+            f'attachment; filename="{safe_name}"'
+            if is_attachment
+            else f'inline; filename="{safe_name}"'
+        ),
+    }
+    return Response(
+        content=raw_bytes,
+        media_type=media_type,
+        headers=headers,
+    )
 
 
 @router.post("/materials/{material_id}/deep-audio")
@@ -1294,13 +1334,21 @@ async def post_material_deep_audio(
                 user_id=uid,
                 section_or_slide_index=section_index,
             )
+        if res and isinstance(res, dict) and res.get("audio_url"):
+            filename = Path(res["audio_url"]).name
+            audio_file = config.GENERATED_ARTIFACTS_DIR / filename
+            if audio_file.exists() and audio_file.stat().st_size == 0:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Deep audio synthesis produced empty audio stream"
+                )
         return res
     except store.UserError as ue:
         raise HTTPException(status_code=400, detail=str(ue))
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to generate deep audio: {e}")
+        raise HTTPException(status_code=503, detail=f"Failed to generate deep audio: {e}")
 
 
 @router.post("/notes/generate", response_model=SmartNoteResponse)
@@ -1339,6 +1387,14 @@ async def post_note_audio(
     await run_in_threadpool(_require_owned_note, note_id, uid)
     try:
         res = await run_in_threadpool(notes.generate_note_audio, note_id=note_id, user_id=uid)
+        if res and isinstance(res, dict) and res.get("audio_url"):
+            filename = Path(res["audio_url"]).name
+            audio_file = config.GENERATED_ARTIFACTS_DIR / filename
+            if audio_file.exists() and audio_file.stat().st_size == 0:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Audio synthesis service unavailable: generated audio stream is empty"
+                )
         return res
     except store.UserError as ue:
         err_msg = str(ue)
@@ -1347,16 +1403,19 @@ async def post_note_audio(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to generate note audio: {e}")
+        raise HTTPException(status_code=503, detail=f"Failed to generate note audio: {e}")
 
 
 @router.post("/notes/{note_id}/export")
 @router.post("/notes/{note_id}/export/")
+@router.get("/notes/{note_id}/export")
+@router.get("/notes/{note_id}/export/")
 def post_note_export(
     note_id: str,
     request: Request,
     export_format: Optional[str] = Query(None),
     payload: Optional[dict] = Body(None),
+    download: Optional[bool] = Query(None),
     user_id: Optional[str] = Query(None),
     current_user: User = Depends(get_current_user),
 ):
@@ -1366,7 +1425,46 @@ def post_note_export(
     uid = _resolve_tenant_user_id(current_user, request, body_uid, user_id)
     _require_owned_note(note_id, uid)
     try:
+        # If client passed full markdown content in payload, update and ensure expansion
+        stored_note = store.get_smart_note(note_id, user_id=uid)
+        if isinstance(payload, dict) and payload.get("markdown_content"):
+            incoming_md = str(payload["markdown_content"]).strip()
+            if incoming_md and stored_note:
+                stored_note["markdown_content"] = incoming_md
+                if payload.get("title"):
+                    stored_note["title"] = str(payload["title"]).strip()
+                if len(incoming_md.split()) < 300:
+                    stored_note["markdown_content"] = notes.expand_note_content(stored_note, user_id=uid)
+                store.save_smart_note(stored_note)
+        elif stored_note:
+            raw_md = stored_note.get("markdown_content") or ""
+            if len(raw_md.split()) < 300:
+                stored_note["markdown_content"] = notes.expand_note_content(stored_note, user_id=uid)
+                store.save_smart_note(stored_note)
+
         res = notes.export_note_artifact(note_id=note_id, user_id=uid, export_format=fmt)
+        wants_download = download is True or (isinstance(payload, dict) and payload.get("download") is True)
+        accept_header = (request.headers.get("accept") or "").lower()
+        if wants_download or (fmt == "pdf" and "application/pdf" in accept_header) or (fmt == "pptx" and "presentationml" in accept_header):
+            target_url = res.get("download_url") or res.get("url") or res.get(f"{fmt}_url") or ""
+            safe_filename = Path(target_url).name
+            file_path = (config.GENERATED_ARTIFACTS_DIR / safe_filename).resolve()
+            base_dir = config.GENERATED_ARTIFACTS_DIR.resolve()
+            if safe_filename and file_path.is_file() and str(file_path).startswith(str(base_dir)):
+                raw_bytes = file_path.read_bytes()
+                media_type = (
+                    "application/pdf"
+                    if fmt == "pdf"
+                    else "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                )
+                return Response(
+                    content=raw_bytes,
+                    media_type=media_type,
+                    headers={
+                        "Content-Disposition": f'attachment; filename="{safe_filename}"',
+                        "Content-Length": str(len(raw_bytes)),
+                    },
+                )
         return res
     except store.UserError as ue:
         err_msg = str(ue)
@@ -1427,7 +1525,7 @@ def post_tools_generate(
             return tools.generate_pptx_deck_tool(
                 concept_id=req.concept_id,
                 user_id=uid,
-                slide_count=req.slide_count or 5
+                slide_count=req.slide_count or 8
             )
         elif tool_type == "pdf":
             return tools.generate_pdf_handout_tool(

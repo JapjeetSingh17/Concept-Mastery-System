@@ -661,12 +661,15 @@ def extract_json_payload(text: str) -> str:
     return sanitize_llm_response(text).strip()
 
 
-def _call_openrouter(system: str, user: str, max_tokens: int = 700) -> Optional[str]:
+def _call_openrouter(system: str, user: str, max_tokens: int = 700, timeout: Optional[float] = None) -> Optional[str]:
     """Call OpenRouter Gateway with automated per-model client-side failover."""
     if not config.OPENROUTER_API_KEY or _STATE["openrouter_exhausted"]:
         return None
 
     import httpx
+
+    start_t = time.time()
+    per_model_timeout = min(timeout, 8.0) if timeout is not None else 8.0
 
     headers = {
         "Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
@@ -688,6 +691,10 @@ def _call_openrouter(system: str, user: str, max_tokens: int = 700) -> Optional[
     candidate_models = get_verified_candidate_models(models_pool)
 
     for idx, model in enumerate(candidate_models, 1):
+        if timeout is not None and (timeout - (time.time() - start_t)) < 1.0:
+            logger.info(f"[OpenRouter] Insufficient time remaining (<1s); aborting model candidates.")
+            break
+
         payload = {
             "model": model,
             "messages": messages,
@@ -698,13 +705,17 @@ def _call_openrouter(system: str, user: str, max_tokens: int = 700) -> Optional[
             payload["response_format"] = {"type": "json_object"}
 
         for attempt in (1, 2):
+            if timeout is not None and (timeout - (time.time() - start_t)) < 1.0:
+                break
             try:
-                # Per-model timeout: 8s so a hanging model doesn't stall the system
+                cur_rem = timeout - (time.time() - start_t) if timeout is not None else per_model_timeout
+                cur_timeout = min(per_model_timeout, cur_rem) if timeout is not None else per_model_timeout
+
                 r = httpx.post(
                     f"{config.OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
                     headers=headers,
                     json=payload,
-                    timeout=8.0,
+                    timeout=cur_timeout,
                 )
 
                 if r.status_code == 200:
@@ -759,9 +770,9 @@ def _call_openrouter(system: str, user: str, max_tokens: int = 700) -> Optional[
                 break
 
             except httpx.TimeoutException:
-                mark_model_token_exhausted(model, reason="Timeout after 8.0s", cooldown_seconds=300)
+                mark_model_token_exhausted(model, reason="Timeout", cooldown_seconds=300)
                 logger.warning(
-                    f"[OpenRouter Failover] Model '{model}' timed out after 8.0s. "
+                    f"[OpenRouter Failover] Model '{model}' timed out. "
                     f"Automatically switching starting model to next in priority chain..."
                 )
                 break
@@ -776,19 +787,23 @@ def _call_openrouter(system: str, user: str, max_tokens: int = 700) -> Optional[
     return None
 
 
-def _call_gemini(system: str, user: str, max_tokens: int = 700) -> Optional[str]:
+def _call_gemini(system: str, user: str, max_tokens: int = 700, timeout: Optional[float] = None) -> Optional[str]:
     """Call Google Gemini REST API."""
     if not config.GEMINI_API_KEY or _STATE["gemini_exhausted"]:
         return None
 
     import httpx
 
+    start_t = time.time()
     # Models to try: primary first, followed by stable 3.5-flash
     models = [config.GEMINI_MODEL]
     if config.GEMINI_MODEL != "gemini-3.5-flash":
         models.append("gemini-3.5-flash")
 
     for model in models:
+        if timeout is not None and (timeout - (time.time() - start_t)) < 1.0:
+            break
+
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={config.GEMINI_API_KEY}"
         body = {
             "systemInstruction": {"parts": [{"text": system}]},
@@ -797,8 +812,10 @@ def _call_gemini(system: str, user: str, max_tokens: int = 700) -> Optional[str]
         }
 
         try:
-            timeout = 8.0 if model == config.GEMINI_MODEL and model != "gemini-3.5-flash" else 15.0
-            r = httpx.post(url, json=body, timeout=timeout)
+            base_timeout = 8.0 if model == config.GEMINI_MODEL and model != "gemini-3.5-flash" else 15.0
+            cur_rem = timeout - (time.time() - start_t) if timeout is not None else base_timeout
+            call_timeout = min(base_timeout, cur_rem) if timeout is not None else base_timeout
+            r = httpx.post(url, json=body, timeout=call_timeout)
 
             if r.status_code in (429, 403) or "RESOURCE_EXHAUSTED" in r.text:
                 logger.warning(f"Gemini quota/limit reached ({r.status_code}). Marking Gemini as exhausted.")
@@ -820,13 +837,14 @@ def _call_gemini(system: str, user: str, max_tokens: int = 700) -> Optional[str]
     return None
 
 
-def _call_groq(system: str, user: str, max_tokens: int = 700) -> Optional[str]:
+def _call_groq(system: str, user: str, max_tokens: int = 700, timeout: Optional[float] = None) -> Optional[str]:
     """Call Groq Cloud with requested model and automatic fallback to available models."""
     if not config.GROQ_API_KEY or _STATE["groq_exhausted"]:
         return None
 
     import httpx
 
+    start_t = time.time()
     models = [config.GROQ_MODEL]
     if config.GROQ_MODEL != "openai/gpt-oss-120b":
         models.append("openai/gpt-oss-120b")
@@ -834,7 +852,12 @@ def _call_groq(system: str, user: str, max_tokens: int = 700) -> Optional[str]:
         models.append("qwen/qwen3.8-27b")
 
     for model in models:
+        if timeout is not None and (timeout - (time.time() - start_t)) < 1.0:
+            break
+
         try:
+            cur_rem = timeout - (time.time() - start_t) if timeout is not None else 20.0
+            call_timeout = min(20.0, cur_rem) if timeout is not None else 20.0
             r = httpx.post(
                 f"{config.GROQ_BASE_URL.rstrip('/')}/chat/completions",
                 headers={"Authorization": f"Bearer {config.GROQ_API_KEY}"},
@@ -847,7 +870,7 @@ def _call_groq(system: str, user: str, max_tokens: int = 700) -> Optional[str]:
                     "max_tokens": max_tokens,
                     "temperature": 0.4,
                 },
-                timeout=20.0,
+                timeout=call_timeout,
             )
 
             if r.status_code in (429, 403) or "rate_limit_exceeded" in r.text:
@@ -870,18 +893,24 @@ def _call_groq(system: str, user: str, max_tokens: int = 700) -> Optional[str]:
     return None
 
 
-def _call_generic(system: str, user: str, max_tokens: int = 700) -> Optional[str]:
+def _call_generic(system: str, user: str, max_tokens: int = 700, timeout: Optional[float] = None) -> Optional[str]:
     """Generic fallback for any custom OpenAI/Anthropic endpoint."""
     if not (config.LLM_API_KEY and config.LLM_MODEL):
         return None
 
     import httpx
 
+    start_t = time.time()
+    cur_rem = timeout - (time.time() - start_t) if timeout is not None else 30.0
+    if timeout is not None and cur_rem < 1.0:
+        return None
+    call_timeout = min(30.0, cur_rem) if timeout is not None else 30.0
+
     try:
         if config.LLM_PROVIDER == "anthropic":
             r = httpx.post(
                 "https://api.anthropic.com/v1/messages",
-                timeout=30,
+                timeout=call_timeout,
                 headers={"x-api-key": config.LLM_API_KEY, "anthropic-version": "2023-06-01"},
                 json={
                     "model": config.LLM_MODEL,
@@ -895,7 +924,7 @@ def _call_generic(system: str, user: str, max_tokens: int = 700) -> Optional[str
 
         r = httpx.post(
             config.LLM_BASE_URL.rstrip("/") + "/chat/completions",
-            timeout=30,
+            timeout=call_timeout,
             headers={"Authorization": f"Bearer {config.LLM_API_KEY}"},
             json={
                 "model": config.LLM_MODEL,
@@ -913,7 +942,7 @@ def _call_generic(system: str, user: str, max_tokens: int = 700) -> Optional[str
         return None
 
 
-def complete(system: str, user: str, max_tokens: int = 700) -> Optional[str]:
+def complete(system: str, user: str, max_tokens: int = 700, timeout: Optional[float] = None) -> Optional[str]:
     """Generate completion using tiered provider failover.
 
     Execution Order:
@@ -926,30 +955,46 @@ def complete(system: str, user: str, max_tokens: int = 700) -> Optional[str]:
     if not enabled():
         return None
 
+    start_t = time.time()
+    deadline = start_t + timeout if timeout is not None else None
+
     # Tier 1: Try OpenRouter
     if config.OPENROUTER_API_KEY and not _STATE["openrouter_exhausted"]:
-        res = _call_openrouter(system, user, max_tokens)
+        rem = deadline - time.time() if deadline is not None else None
+        res = _call_openrouter(system, user, max_tokens, timeout=rem)
         if res:
             return sanitize_llm_response(res)
         logger.info("[LLM Failover] OpenRouter call did not return content. Switching to Gemini direct...")
 
+    if deadline is not None and (deadline - time.time()) < 1.0:
+        return None
+
     # Tier 2: Try Gemini direct
     if config.GEMINI_API_KEY and not _STATE["gemini_exhausted"]:
-        res = _call_gemini(system, user, max_tokens)
+        rem = deadline - time.time() if deadline is not None else None
+        res = _call_gemini(system, user, max_tokens, timeout=rem)
         if res:
             return sanitize_llm_response(res)
         logger.info("[LLM Failover] Gemini call did not return content. Switching to Groq Cloud...")
 
+    if deadline is not None and (deadline - time.time()) < 1.0:
+        return None
+
     # Tier 3: Try Groq Cloud
     if config.GROQ_API_KEY and not _STATE["groq_exhausted"]:
-        res = _call_groq(system, user, max_tokens)
+        rem = deadline - time.time() if deadline is not None else None
+        res = _call_groq(system, user, max_tokens, timeout=rem)
         if res:
             return sanitize_llm_response(res)
         logger.info("[LLM Failover] Groq Cloud call did not return content.")
 
+    if deadline is not None and (deadline - time.time()) < 1.0:
+        return None
+
     # Tier 4: Try Generic Provider
     if config.LLM_API_KEY and config.LLM_MODEL:
-        res = _call_generic(system, user, max_tokens)
+        rem = deadline - time.time() if deadline is not None else None
+        res = _call_generic(system, user, max_tokens, timeout=rem)
         if res:
             return sanitize_llm_response(res)
 

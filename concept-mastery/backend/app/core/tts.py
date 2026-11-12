@@ -7,16 +7,19 @@ for PDF and PPTX study materials.
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import io
 import json
 import logging
 import os
 import re
 import sqlite3
+import wave
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, Tuple
 
 from fastapi.concurrency import run_in_threadpool
 import httpx
@@ -24,10 +27,11 @@ import httpx
 from .. import config
 from . import store
 from . import llm
+from .fallback_sound import FALLBACK_MP3_BYTES as _VALID_FALLBACK_MP3_BYTES
 
 logger = logging.getLogger("concept_mastery.tts")
 _TTS_TIMEOUT = httpx.Timeout(30.0, connect=5.0)
-_MOCK_MP3_BYTES = b"\xff\xfb\x90\x00" + (b"\x00" * 128)
+_MOCK_MP3_BYTES = _VALID_FALLBACK_MP3_BYTES
 
 _AUDIO_CACHE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS audio_cache (
@@ -98,13 +102,19 @@ def _record_audio_cache(
 def sanitize_latex_for_speech(text: str) -> str:
     """Convert math notation into natural spoken English before TTS.
 
-    Transforms mathematical symbols, strips markdown formatting symbols,
+    Transforms mathematical symbols, strips markdown formatting symbols (#, *, `, $$, $),
     and caps output length to 1,800 characters to protect TTS credits.
     """
     if not text:
         return ""
 
     s = text
+
+    # Strip fenced code blocks
+    s = re.sub(r"```[\w]*\n?[\s\S]*?```", " ", s)
+
+    # Convert inline code blocks: `code` -> code
+    s = re.sub(r"`([^`]+)`", r"\1", s)
 
     # Handle common LaTeX fractions and roots
     s = re.sub(r"\\frac\{([^}]+)\}\{([^}]+)\}", r"\1 divided by \2", s)
@@ -158,9 +168,15 @@ def sanitize_latex_for_speech(text: str) -> str:
     s = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", s)
     s = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", s)
 
-    # Strip raw markdown formatting symbols (#, *, `, $$, $, etc.)
+    # Strip LaTeX delimiters ($$...$$ and $...$)
+    s = re.sub(r"\$\$([^\$]+)\$\$", r"\1", s)
     s = s.replace("$$", " ")
+    s = re.sub(r"\$([^\$]+)\$", r"\1", s)
     s = s.replace("$", " ")
+
+    # Strip raw markdown formatting symbols: headers (#), bullets (*, -, +), bold/italics (*, _, ~), blockquotes (>), backticks (`), pipes (|)
+    s = re.sub(r"(?m)^\s*#{1,6}\s+", " ", s)
+    s = re.sub(r"(?m)^\s*[-*+]\s+", " ", s)
     s = re.sub(r"[#*`~_>\^|\\{}]", " ", s)
 
     # Normalize whitespace
@@ -180,6 +196,437 @@ def sanitize_latex_for_speech(text: str) -> str:
     return s
 
 
+def pcm_to_wav(
+    pcm_bytes: bytes,
+    sample_rate: int = 24000,
+    channels: int = 1,
+    sample_width: int = 2
+) -> bytes:
+    """Wrap raw 16-bit PCM bytes into standard WAV format with a 44-byte header."""
+    if pcm_bytes.startswith(b"RIFF"):
+        return pcm_bytes
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(sample_width)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+    return buf.getvalue()
+
+
+def split_text_for_groq_tts(text: str, max_chars: int = 190) -> list[str]:
+    """Split text into sentence/phrase chunks of <= max_chars characters for Groq Orpheus."""
+    if not text:
+        return []
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    chunks = []
+    current = ""
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        if len(sentence) <= max_chars:
+            if current and (len(current) + len(sentence) + 1 > max_chars):
+                chunks.append(current.strip())
+                current = sentence
+            else:
+                current = f"{current} {sentence}".strip() if current else sentence
+        else:
+            if current:
+                chunks.append(current.strip())
+                current = ""
+            words = sentence.split(" ")
+            word_chunk = ""
+            for w in words:
+                if not w:
+                    continue
+                if len(word_chunk) + len(w) + 1 <= max_chars:
+                    word_chunk = f"{word_chunk} {w}".strip() if word_chunk else w
+                else:
+                    if word_chunk:
+                        chunks.append(word_chunk.strip())
+                    word_chunk = w[:max_chars]
+            if word_chunk:
+                current = word_chunk
+    if current:
+        chunks.append(current.strip())
+    return [c for c in chunks if c.strip()]
+
+
+def concatenate_wav_streams(wav_bytes_list: list[bytes]) -> bytes:
+    """Concatenate multiple WAV streams into a single valid WAV file using Python wave module."""
+    if not wav_bytes_list:
+        return b""
+    if len(wav_bytes_list) == 1:
+        return wav_bytes_list[0]
+
+    params = None
+    frames_data = []
+
+    for wb in wav_bytes_list:
+        if not wb or len(wb) < 44 or not wb.startswith(b"RIFF"):
+            continue
+        try:
+            with wave.open(io.BytesIO(wb), "rb") as wf:
+                p = wf.getparams()
+                if params is None:
+                    params = p
+                frames = wf.readframes(wf.getnframes())
+                frames_data.append(frames)
+        except Exception as e:
+            logger.warning("Error reading WAV chunk: %s", e)
+
+    if not frames_data or params is None:
+        return wav_bytes_list[0] if wav_bytes_list else b""
+
+    out_buf = io.BytesIO()
+    with wave.open(out_buf, "wb") as out_wf:
+        out_wf.setparams(params)
+        for f in frames_data:
+            out_wf.writeframes(f)
+    return out_buf.getvalue()
+
+
+def transcribe_audio_groq(audio_bytes: bytes, filename: str = "audio.webm") -> str:
+    """Transcribe speech audio bytes to text using Groq's whisper-large-v3-turbo."""
+    if not (config.GROQ_API_KEY or "").strip():
+        logger.warning("GROQ_API_KEY is unset; audio transcription skipped.")
+        return ""
+    try:
+        url = f"{config.GROQ_BASE_URL.rstrip('/')}/audio/transcriptions"
+        headers = {"Authorization": f"Bearer {config.GROQ_API_KEY}"}
+        model = config.GROQ_STT_MODEL or "whisper-large-v3-turbo"
+        mime = "audio/wav" if filename.endswith(".wav") else "audio/mpeg" if filename.endswith(".mp3") else "audio/webm"
+        files = {"file": (filename, audio_bytes, mime)}
+        data = {"model": model}
+        resp = httpx.post(url, headers=headers, data=data, files=files, timeout=_TTS_TIMEOUT)
+        if resp.status_code == 200:
+            return resp.json().get("text", "").strip()
+        logger.warning("Groq Whisper STT returned HTTP %s: %s", resp.status_code, resp.text[:200])
+    except Exception as e:
+        logger.warning("Groq Whisper STT error: %s", e)
+    return ""
+
+
+def _extract_gemini_audio(data: dict) -> Optional[bytes]:
+    """Extract audio bytes from Gemini generateContent response and wrap PCM in WAV header."""
+    try:
+        candidates = data.get("candidates") or []
+        if not candidates:
+            return None
+        parts = candidates[0].get("content", {}).get("parts", [])
+        for part in parts:
+            inline_data = part.get("inlineData")
+            if inline_data and "data" in inline_data:
+                raw_audio = base64.b64decode(inline_data["data"])
+                mime_type = inline_data.get("mimeType", "").lower()
+                if raw_audio.startswith(b"RIFF"):
+                    return raw_audio
+                rate_match = re.search(r"rate=(\d+)", mime_type)
+                rate = int(rate_match.group(1)) if rate_match else 24000
+                return pcm_to_wav(raw_audio, sample_rate=rate)
+    except Exception as e:
+        logger.warning("Error parsing Gemini TTS response: %s", e)
+    return None
+
+
+def _synthesize_elevenlabs(cleaned_text: str, model_id: str) -> Optional[bytes]:
+    """Tier 1: ElevenLabs Flash v2.5 TTS."""
+    if not (config.ELEVENLABS_API_KEY or "").strip():
+        return None
+    try:
+        url, headers, body = _build_elevenlabs_request(cleaned_text, model_id)
+        resp = httpx.post(url, headers=headers, json=body, timeout=_TTS_TIMEOUT)
+        if resp.status_code == 200 and resp.content and len(resp.content) > 32:
+            return resp.content
+        logger.warning(
+            "Tier 1 (ElevenLabs) failed with HTTP %s: %s; falling over to Tier 2 (Gemini)...",
+            resp.status_code,
+            resp.text[:200],
+        )
+    except Exception as e:
+        logger.warning("Tier 1 (ElevenLabs) request error: %s; falling over to Tier 2 (Gemini)...", e)
+    return None
+
+
+async def _synthesize_elevenlabs_async(cleaned_text: str, model_id: str) -> Optional[bytes]:
+    """Tier 1 Async: ElevenLabs Flash v2.5 TTS."""
+    if not (config.ELEVENLABS_API_KEY or "").strip():
+        return None
+    try:
+        url, headers, body = _build_elevenlabs_request(cleaned_text, model_id)
+        async with httpx.AsyncClient(timeout=_TTS_TIMEOUT) as client:
+            resp = await client.post(url, headers=headers, json=body)
+        if resp.status_code == 200 and resp.content and len(resp.content) > 32:
+            return resp.content
+        logger.warning(
+            "Tier 1 (ElevenLabs) async failed with HTTP %s: %s; falling over to Tier 2 (Gemini)...",
+            resp.status_code,
+            resp.text[:200],
+        )
+    except Exception as e:
+        logger.warning("Tier 1 (ElevenLabs) async error: %s; falling over to Tier 2 (Gemini)...", e)
+    return None
+
+
+def _synthesize_gemini_tts(cleaned_text: str) -> Optional[bytes]:
+    """Tier 2: Gemini 2.5 Flash TTS."""
+    if not (config.GEMINI_API_KEY or "").strip():
+        return None
+    try:
+        model = config.GEMINI_TTS_MODEL or "gemini-2.5-flash-preview-tts"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={config.GEMINI_API_KEY}"
+        payload = {
+            "contents": [{"parts": [{"text": cleaned_text}]}],
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {
+                    "voiceConfig": {
+                        "prebuiltVoiceConfig": {
+                            "voiceName": config.GEMINI_TTS_VOICE or "Kore"
+                        }
+                    }
+                }
+            }
+        }
+        resp = httpx.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=_TTS_TIMEOUT)
+        if resp.status_code == 200:
+            audio_bytes = _extract_gemini_audio(resp.json())
+            if audio_bytes and len(audio_bytes) > 44:
+                return audio_bytes
+        logger.warning(
+            "Tier 2 (Gemini TTS) failed with HTTP %s: %s; falling over to Tier 3 (Groq)...",
+            resp.status_code,
+            resp.text[:200],
+        )
+    except Exception as e:
+        logger.warning("Tier 2 (Gemini TTS) error: %s; falling over to Tier 3 (Groq)...", e)
+    return None
+
+
+async def _synthesize_gemini_tts_async(cleaned_text: str) -> Optional[bytes]:
+    """Tier 2 Async: Gemini 2.5 Flash TTS."""
+    if not (config.GEMINI_API_KEY or "").strip():
+        return None
+    try:
+        model = config.GEMINI_TTS_MODEL or "gemini-2.5-flash-preview-tts"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={config.GEMINI_API_KEY}"
+        payload = {
+            "contents": [{"parts": [{"text": cleaned_text}]}],
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {
+                    "voiceConfig": {
+                        "prebuiltVoiceConfig": {
+                            "voiceName": config.GEMINI_TTS_VOICE or "Kore"
+                        }
+                    }
+                }
+            }
+        }
+        async with httpx.AsyncClient(timeout=_TTS_TIMEOUT) as client:
+            resp = await client.post(url, headers={"Content-Type": "application/json"}, json=payload)
+        if resp.status_code == 200:
+            audio_bytes = _extract_gemini_audio(resp.json())
+            if audio_bytes and len(audio_bytes) > 44:
+                return audio_bytes
+        logger.warning(
+            "Tier 2 (Gemini TTS) async failed with HTTP %s: %s; falling over to Tier 3 (Groq)...",
+            resp.status_code,
+            resp.text[:200],
+        )
+    except Exception as e:
+        logger.warning("Tier 2 (Gemini TTS) async error: %s; falling over to Tier 3 (Groq)...", e)
+    return None
+
+
+def _synthesize_groq_tts(cleaned_text: str) -> Optional[bytes]:
+    """Tier 3: Groq Orpheus TTS with chunking <= 190 characters."""
+    if not (config.GROQ_API_KEY or "").strip():
+        return None
+    try:
+        chunks = split_text_for_groq_tts(cleaned_text, max_chars=190)
+        if not chunks:
+            return None
+        headers = {
+            "Authorization": f"Bearer {config.GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        url = f"{config.GROQ_BASE_URL.rstrip('/')}/audio/speech"
+        model = config.GROQ_TTS_MODEL or "canopylabs/orpheus-v1-english"
+        voice = config.GROQ_TTS_VOICE or "troy"
+        wav_list = []
+        for ch in chunks:
+            body = {
+                "model": model,
+                "voice": voice,
+                "response_format": "wav",
+                "input": ch
+            }
+            resp = httpx.post(url, headers=headers, json=body, timeout=_TTS_TIMEOUT)
+            if resp.status_code == 200 and resp.content and len(resp.content) >= 44:
+                wav_list.append(resp.content)
+            else:
+                logger.warning("Groq TTS chunk failed with HTTP %s: %s", resp.status_code, resp.text[:200])
+        if wav_list:
+            return concatenate_wav_streams(wav_list)
+    except Exception as e:
+        logger.warning("Tier 3 (Groq TTS) error: %s; falling back to local fallback...", e)
+    return None
+
+
+async def _synthesize_groq_tts_async(cleaned_text: str) -> Optional[bytes]:
+    """Tier 3 Async: Groq Orpheus TTS with chunking <= 190 characters."""
+    if not (config.GROQ_API_KEY or "").strip():
+        return None
+    try:
+        chunks = split_text_for_groq_tts(cleaned_text, max_chars=190)
+        if not chunks:
+            return None
+        headers = {
+            "Authorization": f"Bearer {config.GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        url = f"{config.GROQ_BASE_URL.rstrip('/')}/audio/speech"
+        model = config.GROQ_TTS_MODEL or "canopylabs/orpheus-v1-english"
+        voice = config.GROQ_TTS_VOICE or "troy"
+        wav_list = []
+        async with httpx.AsyncClient(timeout=_TTS_TIMEOUT) as client:
+            for ch in chunks:
+                body = {
+                    "model": model,
+                    "voice": voice,
+                    "response_format": "wav",
+                    "input": ch
+                }
+                resp = await client.post(url, headers=headers, json=body)
+                if resp.status_code == 200 and resp.content and len(resp.content) >= 44:
+                    wav_list.append(resp.content)
+                else:
+                    logger.warning("Groq TTS async chunk failed with HTTP %s: %s", resp.status_code, resp.text[:200])
+        if wav_list:
+            return concatenate_wav_streams(wav_list)
+    except Exception as e:
+        logger.warning("Tier 3 (Groq TTS) async error: %s; falling back to local fallback...", e)
+    return None
+
+
+def synthesize_speech_multiprovider(cleaned_text: str) -> tuple[bytes, str, str, str]:
+    """Execute 3-tier TTS failover:
+    Tier 1: ElevenLabs -> audio/mpeg
+    Tier 2: Gemini 2.5 Flash TTS -> audio/wav
+    Tier 3: Groq Orpheus TTS -> audio/wav
+    Fallback: Local valid MP3 frames -> audio/mpeg
+
+    Returns (audio_bytes, media_type, provider_used, model_id).
+    """
+    # Tier 1: ElevenLabs
+    el_model = config.ELEVENLABS_MODEL_ID or "eleven_flash_v2_5"
+    audio_bytes = _synthesize_elevenlabs(cleaned_text, el_model)
+    if audio_bytes and len(audio_bytes) > 32:
+        return audio_bytes, "audio/mpeg", "elevenlabs", el_model
+
+    # Tier 2: Gemini 2.5 Flash TTS
+    gem_model = config.GEMINI_TTS_MODEL or "gemini-2.5-flash-preview-tts"
+    audio_bytes = _synthesize_gemini_tts(cleaned_text)
+    if audio_bytes and len(audio_bytes) > 44:
+        return audio_bytes, "audio/wav", "gemini", gem_model
+
+    # Tier 3: Groq Orpheus TTS
+    groq_model = config.GROQ_TTS_MODEL or "canopylabs/orpheus-v1-english"
+    audio_bytes = _synthesize_groq_tts(cleaned_text)
+    if audio_bytes and len(audio_bytes) > 44:
+        return audio_bytes, "audio/wav", "groq", groq_model
+
+    # Local fallback
+    return _VALID_FALLBACK_MP3_BYTES, "audio/mpeg", "local_fallback", "mock_tts"
+
+
+async def synthesize_speech_multiprovider_async(cleaned_text: str) -> tuple[bytes, str, str, str]:
+    """Execute async 3-tier TTS failover:
+    Returns (audio_bytes, media_type, provider_used, model_id).
+    """
+    # Tier 1: ElevenLabs
+    el_model = config.ELEVENLABS_MODEL_ID or "eleven_flash_v2_5"
+    audio_bytes = await _synthesize_elevenlabs_async(cleaned_text, el_model)
+    if audio_bytes and len(audio_bytes) > 32:
+        return audio_bytes, "audio/mpeg", "elevenlabs", el_model
+
+    # Tier 2: Gemini 2.5 Flash TTS
+    gem_model = config.GEMINI_TTS_MODEL or "gemini-2.5-flash-preview-tts"
+    audio_bytes = await _synthesize_gemini_tts_async(cleaned_text)
+    if audio_bytes and len(audio_bytes) > 44:
+        return audio_bytes, "audio/wav", "gemini", gem_model
+
+    # Tier 3: Groq Orpheus TTS
+    groq_model = config.GROQ_TTS_MODEL or "canopylabs/orpheus-v1-english"
+    audio_bytes = await _synthesize_groq_tts_async(cleaned_text)
+    if audio_bytes and len(audio_bytes) > 44:
+        return audio_bytes, "audio/wav", "groq", groq_model
+
+    # Local fallback
+    return _VALID_FALLBACK_MP3_BYTES, "audio/mpeg", "local_fallback", "mock_tts"
+
+
+def synthesize_speech(
+    text: str,
+    user_id: str = "default",
+    cache_key: Optional[str] = None
+) -> tuple[bytes, str, str]:
+    """Public helper returning (audio_bytes, media_type, provider_used)."""
+    cleaned_text = sanitize_latex_for_speech(text)
+    audio_bytes, media_type, provider_used, _ = synthesize_speech_multiprovider(cleaned_text)
+    return audio_bytes, media_type, provider_used
+
+
+def _get_cached_audio(cache_key: str, default_path: Optional[Path] = None) -> Optional[dict]:
+    """Check SQLite audio_cache and disk for existing synthesized audio with valid bytes."""
+    init_audio_cache_db()
+    try:
+        with get_audio_cache_db() as conn:
+            row = conn.execute(
+                "SELECT * FROM audio_cache WHERE cache_key = ?", (cache_key,)
+            ).fetchone()
+            if row:
+                f_path = Path(row["file_path"])
+                if f_path.exists() and f_path.stat().st_size > 100:
+                    media_type = "audio/wav" if f_path.suffix.lower() == ".wav" else "audio/mpeg"
+                    data_bytes = f_path.read_bytes()
+                    data_uri = f"data:{media_type};base64,{base64.b64encode(data_bytes).decode('ascii')}"
+                    return {
+                        "audio_url": f"/api/artifacts/{f_path.name}",
+                        "cached": True,
+                        "file_path": str(f_path),
+                        "model_id": row["model_id"],
+                        "transcript": row["transcript"],
+                        "media_type": media_type,
+                        "provider_used": "cache",
+                        "data_uri": data_uri,
+                    }
+    except Exception as e:
+        logger.warning("Error checking audio_cache: %s", e)
+    if default_path and default_path.exists() and default_path.stat().st_size > 100:
+        media_type = "audio/wav" if default_path.suffix.lower() == ".wav" else "audio/mpeg"
+        data_bytes = default_path.read_bytes()
+        data_uri = f"data:{media_type};base64,{base64.b64encode(data_bytes).decode('ascii')}"
+        return {
+            "audio_url": f"/api/artifacts/{default_path.name}",
+            "cached": True,
+            "file_path": str(default_path),
+            "model_id": "cached",
+            "transcript": "",
+            "media_type": media_type,
+            "provider_used": "cache",
+            "data_uri": data_uri,
+        }
+    return None
+
+
+def _is_audio_cached(cache_key: str, mp3_file: Optional[Path] = None) -> bool:
+    """Boolean check for whether audio is cached on disk."""
+    return bool(_get_cached_audio(cache_key, mp3_file))
+
+
 def _prepare_synthesis_context(text: str, cache_key: Optional[str]) -> tuple[str, str, Path, str, str]:
     """Sanitize input text and resolve cache paths and model identifier."""
     cleaned_text = sanitize_latex_for_speech(text)
@@ -189,20 +636,6 @@ def _prepare_synthesis_context(text: str, cache_key: Optional[str]) -> tuple[str
     audio_url = f"/api/artifacts/{key}.mp3"
     model_id = config.ELEVENLABS_MODEL_ID or "eleven_flash_v2_5"
     return cleaned_text, key, mp3_file, audio_url, model_id
-
-
-def _is_audio_cached(cache_key: str, mp3_file: Path) -> bool:
-    """Check SQLite audio_cache and disk presence for existing synthesized audio."""
-    init_audio_cache_db()
-    try:
-        with get_audio_cache_db() as conn:
-            row = conn.execute(
-                "SELECT * FROM audio_cache WHERE cache_key = ?", (cache_key,)
-            ).fetchone()
-            return bool(row and mp3_file.exists())
-    except Exception as e:
-        logger.warning("Error checking audio_cache: %s", e)
-        return mp3_file.exists()
 
 
 def _build_elevenlabs_request(cleaned_text: str, model_id: str) -> tuple[str, dict[str, str], dict]:
@@ -227,19 +660,25 @@ def _build_elevenlabs_request(cleaned_text: str, model_id: str) -> tuple[str, di
 def _persist_tts_result(
     cache_key: str,
     user_id: str,
-    mp3_file: Path,
+    target_file: Path,
     audio_url: str,
     cleaned_text: str,
     model_id: str,
     audio_bytes: bytes,
+    media_type: str = "audio/mpeg",
+    provider_used: str = "elevenlabs",
     fallback_mode: Optional[str] = None,
 ) -> dict:
-    """Write MP3 bytes to disk, record cache metadata, and build response dict."""
-    mp3_file.parent.mkdir(parents=True, exist_ok=True)
-    mp3_file.write_bytes(audio_bytes)
-    _record_audio_cache(cache_key, user_id, str(mp3_file), cleaned_text, model_id)
+    """Write audio bytes to disk, record cache metadata, and build response dict."""
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    target_file.write_bytes(audio_bytes)
+    _record_audio_cache(cache_key, user_id, str(target_file), cleaned_text, model_id)
+    data_uri = f"data:{media_type};base64,{base64.b64encode(audio_bytes).decode('ascii')}"
     res = {
         "audio_url": audio_url,
+        "media_type": media_type,
+        "provider_used": provider_used,
+        "data_uri": data_uri,
         "cached": False,
         "model_id": model_id,
         "transcript": cleaned_text,
@@ -254,48 +693,32 @@ def synthesize_elevenlabs_audio(
     user_id: str = "default",
     cache_key: Optional[str] = None,
 ) -> dict:
-    """Synthesize speech audio using ElevenLabs or local cache / mock fallback.
+    """Synthesize speech audio using 3-tier failover (ElevenLabs -> Gemini 2.5 Flash -> Groq Orpheus -> Local)."""
+    cleaned_text = sanitize_latex_for_speech(text)
+    key = cache_key or hashlib.md5(cleaned_text.encode("utf-8")).hexdigest()
+    config.GENERATED_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    - Cleans input using sanitize_latex_for_speech.
-    - If cache_key is None, computes MD5 hash of cleaned text.
-    - Checks SQLite audio_cache table and disk for existing MP3 file.
-    - If cached: returns cached URL immediately (0 API credits spent).
-    - If live API key is present: calls ElevenLabs Flash v2.5 endpoint.
-    - If key is empty or network fails / offline in pytest: writes valid mock MP3.
-    """
-    cleaned_text, cache_key, mp3_file, audio_url, model_id = _prepare_synthesis_context(text, cache_key)
+    cached = _get_cached_audio(key, config.GENERATED_ARTIFACTS_DIR / f"{key}.mp3")
+    if not cached:
+        cached = _get_cached_audio(key, config.GENERATED_ARTIFACTS_DIR / f"{key}.wav")
+    if cached:
+        return cached
 
-    if _is_audio_cached(cache_key, mp3_file):
-        return {
-            "audio_url": audio_url,
-            "cached": True,
-            "model_id": model_id,
-            "transcript": cleaned_text,
-        }
-
-    if config.ELEVENLABS_API_KEY:
-        try:
-            url, headers, body = _build_elevenlabs_request(cleaned_text, model_id)
-            resp = httpx.post(url, headers=headers, json=body, timeout=_TTS_TIMEOUT)
-            if resp.status_code == 200 and resp.content:
-                return _persist_tts_result(
-                    cache_key, user_id, mp3_file, audio_url, cleaned_text, model_id, resp.content
-                )
-            logger.warning(
-                "ElevenLabs API returned %s: %s", resp.status_code, resp.text[:200]
-            )
-        except Exception as e:
-            logger.warning("ElevenLabs TTS request failed: %s", e)
+    audio_bytes, media_type, provider_used, model_id = synthesize_speech_multiprovider(cleaned_text)
+    ext = "wav" if media_type == "audio/wav" else "mp3"
+    target_file = config.GENERATED_ARTIFACTS_DIR / f"{key}.{ext}"
+    audio_url = f"/api/artifacts/{key}.{ext}"
 
     return _persist_tts_result(
-        cache_key,
-        user_id,
-        mp3_file,
-        audio_url,
-        cleaned_text,
-        "mock_tts",
-        _MOCK_MP3_BYTES,
-        fallback_mode="browser_speech_synthesis",
+        cache_key=key,
+        user_id=user_id,
+        target_file=target_file,
+        audio_url=audio_url,
+        cleaned_text=cleaned_text,
+        model_id=model_id,
+        audio_bytes=audio_bytes,
+        media_type=media_type,
+        provider_used=provider_used,
     )
 
 
@@ -305,50 +728,32 @@ async def synthesize_elevenlabs_audio_async(
     cache_key: Optional[str] = None,
 ) -> dict:
     """Non-blocking async variant using httpx.AsyncClient and threadpool disk/SQLite I/O."""
-    cleaned_text, cache_key, mp3_file, audio_url, model_id = await run_in_threadpool(
-        _prepare_synthesis_context, text, cache_key
-    )
+    cleaned_text = sanitize_latex_for_speech(text)
+    key = cache_key or hashlib.md5(cleaned_text.encode("utf-8")).hexdigest()
+    config.GENERATED_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    if await run_in_threadpool(_is_audio_cached, cache_key, mp3_file):
-        return {
-            "audio_url": audio_url,
-            "cached": True,
-            "model_id": model_id,
-            "transcript": cleaned_text,
-        }
+    cached = await run_in_threadpool(_get_cached_audio, key, config.GENERATED_ARTIFACTS_DIR / f"{key}.mp3")
+    if not cached:
+        cached = await run_in_threadpool(_get_cached_audio, key, config.GENERATED_ARTIFACTS_DIR / f"{key}.wav")
+    if cached:
+        return cached
 
-    if config.ELEVENLABS_API_KEY:
-        try:
-            url, headers, body = _build_elevenlabs_request(cleaned_text, model_id)
-            async with httpx.AsyncClient(timeout=_TTS_TIMEOUT) as client:
-                resp = await client.post(url, headers=headers, json=body)
-            if resp.status_code == 200 and resp.content:
-                return await run_in_threadpool(
-                    _persist_tts_result,
-                    cache_key,
-                    user_id,
-                    mp3_file,
-                    audio_url,
-                    cleaned_text,
-                    model_id,
-                    resp.content,
-                )
-            logger.warning(
-                "ElevenLabs API returned %s: %s", resp.status_code, resp.text[:200]
-            )
-        except Exception as e:
-            logger.warning("ElevenLabs async TTS request failed: %s", e)
+    audio_bytes, media_type, provider_used, model_id = await synthesize_speech_multiprovider_async(cleaned_text)
+    ext = "wav" if media_type == "audio/wav" else "mp3"
+    target_file = config.GENERATED_ARTIFACTS_DIR / f"{key}.{ext}"
+    audio_url = f"/api/artifacts/{key}.{ext}"
 
     return await run_in_threadpool(
         _persist_tts_result,
-        cache_key,
+        key,
         user_id,
-        mp3_file,
+        target_file,
         audio_url,
         cleaned_text,
-        "mock_tts",
-        _MOCK_MP3_BYTES,
-        "browser_speech_synthesis",
+        model_id,
+        audio_bytes,
+        media_type,
+        provider_used,
     )
 
 

@@ -291,3 +291,74 @@ def test_non_default_user_diagnostic_start_generates_six_questions(tmp_path):
     store.clear_all_study_materials(student_id)
     store.clear_kb(student_id)
 
+
+def test_diagnostic_start_fast_under_3_5s_and_submits_cleanly(tmp_path):
+    """Guarantees POST /api/diagnostic/start executes in < 3.5s without modal freeze and grades answers."""
+    import time
+    student_id = "test_fast_diag_student"
+    headers = {"X-Dev-User-Id": student_id}
+
+    store.clear_all_study_materials(student_id)
+    store.clear_kb(student_id)
+
+    study_file = tmp_path / "deep_learning_transformers.md"
+    study_file.write_text(
+        "# Deep Learning and Transformers\n\n"
+        "## Attention Mechanism\n"
+        "The attention mechanism maps a query and a set of key-value pairs to an output. "
+        "It computes compatibility scores between query and key vectors.\n\n"
+        "## Transformer Architecture\n"
+        "The Transformer architecture replaces recurrence entirely with multi-head self-attention mechanisms. "
+        "It enables parallelized computation across sequence lengths.\n\n"
+        "## Gradient Descent\n"
+        "Gradient descent iteratively updates model parameters in the direction of steepest loss decrease. "
+        "The learning rate determines the step size at each optimization iteration.\n\n"
+        "## Backpropagation\n"
+        "Backpropagation computes partial derivatives of the loss function with respect to weights using the chain rule.\n\n"
+        "## Feedforward Network\n"
+        "Each Transformer layer contains a fully connected feed-forward network applied to each position separately and identically.\n\n"
+        "## Layer Normalization\n"
+        "Layer normalization standardizes activations across the channel dimension within a single training sample.\n"
+    )
+
+    UniversalMaterialIngestor.ingest_file(study_file, user_id=student_id, title="Deep Learning and Transformers")
+
+    t0 = time.time()
+    res = client.post("/api/diagnostic/start", headers=headers, json={"user_id": student_id})
+    elapsed = time.time() - t0
+
+    assert res.status_code == 200, f"Expected 200, got {res.status_code}: {res.text}"
+    assert elapsed < 3.5, f"Diagnostic generation took too long: {elapsed:.2f}s (must be < 3.5s)"
+
+    data = res.json()
+    assert data["ok"] is True
+    questions = data["questions"]
+    assert len(questions) == 6, f"Expected 6 questions, got {len(questions)}"
+
+    # Prepare answers to submit
+    answers = []
+    for q in questions:
+        qid = q.get("question_id") or q.get("id")
+        cid = q.get("concept_id") or q.get("conceptId")
+        qtype = (q.get("question_type") or q.get("questionType") or "mcq").lower()
+        ans = {"question_id": qid, "concept_id": cid}
+        if qtype == "mcq":
+            ans["selected_option_idx"] = q.get("correct_option_idx", 0)
+        elif qtype == "fill_in_the_blanks":
+            ans["typed_answer"] = q.get("target_blank_answer", "attention")
+        else:
+            ans["typed_answer"] = "Core mechanism operates by computing dot-product representations."
+        answers.append(ans)
+
+    sub_res = client.post("/api/diagnostic/submit", headers=headers, json={"user_id": student_id, "answers": answers})
+    assert sub_res.status_code == 200, f"Submission failed: {sub_res.text}"
+    sub_data = sub_res.json()
+    assert sub_data["ok"] is True
+    assert sub_data["total"] == 6
+    assert sub_data["baseline_completed"] is True
+
+    # Cleanup
+    store.clear_all_study_materials(student_id)
+    store.clear_kb(student_id)
+
+

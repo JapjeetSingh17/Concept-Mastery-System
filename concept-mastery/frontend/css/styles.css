@@ -11,10 +11,17 @@
   --bg-sidebar-active: rgba(255, 255, 255, 0.12);
   --bg-sidebar-hover: rgba(255, 255, 255, 0.06);
 
+  --surface: #ffffff;
   --surface-card: #ffffff;
   --surface-card-hover: #fcfdfe;
   --surface-muted: #f1f5f9;
   --surface-subtle: #f8fafc;
+  --surface-input: #ffffff;
+  --surface-input-focus: #ffffff;
+  --border-input: #cbd5e1;
+  --border-input-focus: #2563eb;
+  --ink-input: #0f172a;
+  --ink-placeholder: #94a3b8;
 
   /* Typography / Inks */
   --ink-primary: #0f172a;
@@ -97,10 +104,17 @@
   --bg-sidebar-active: rgba(255, 255, 255, 0.14);
   --bg-sidebar-hover: rgba(255, 255, 255, 0.08);
 
+  --surface: #0f172a;
   --surface-card: #0f172a;
   --surface-card-hover: #141e36;
   --surface-muted: #1e293b;
   --surface-subtle: #0b1222;
+  --surface-input: #131f37;
+  --surface-input-focus: #0b1222;
+  --border-input: #334155;
+  --border-input-focus: #3b82f6;
+  --ink-input: #f8fafc;
+  --ink-placeholder: #64748b;
 
   --ink-primary: #f8fafc;
   --ink-secondary: #cbd5e1;
@@ -206,13 +220,77 @@ a:hover { color: var(--primary-hover); }
 
 button, input, select, textarea {
   font: inherit;
-  color: inherit;
 }
 
 button {
   cursor: pointer;
   border: none;
   background: transparent;
+  color: inherit;
+}
+
+/* Global Form Control Baseline: High Contrast & Theme Agnostic */
+input, textarea, select {
+  font-family: inherit;
+  font-size: 0.95rem;
+  color: var(--ink-input);
+  background-color: var(--surface-input);
+  border: 1px solid var(--border-input);
+  border-radius: var(--radius-sm);
+  color-scheme: inherit;
+  box-sizing: border-box;
+  transition: border-color 0.15s ease, background-color 0.15s ease, box-shadow 0.15s ease, color 0.15s ease;
+}
+
+input::placeholder, textarea::placeholder {
+  color: var(--ink-placeholder);
+  opacity: 1;
+}
+
+input:focus, textarea:focus, select:focus {
+  outline: none;
+  border-color: var(--border-input-focus);
+  background-color: var(--surface-input-focus);
+  color: var(--ink-input);
+  box-shadow: 0 0 0 3px var(--primary-glow);
+}
+
+select option {
+  background-color: var(--surface-card);
+  color: var(--ink-primary);
+}
+
+input[type="checkbox"], input[type="radio"] {
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+
+/* Standard Reusable Form Classes */
+.form-control,
+.form-input,
+.form-select {
+  display: block;
+  width: 100%;
+  color: var(--ink-input);
+  background-color: var(--surface-input);
+  border: 1px solid var(--border-input);
+  border-radius: var(--radius-sm);
+  padding: 0.65rem 0.85rem;
+  font-family: inherit;
+  font-size: 0.92rem;
+  line-height: 1.5;
+  box-sizing: border-box;
+  transition: border-color 0.15s ease, background-color 0.15s ease, box-shadow 0.15s ease, color 0.15s ease;
+}
+
+.form-control:focus,
+.form-input:focus,
+.form-select:focus {
+  outline: none;
+  border-color: var(--border-input-focus);
+  background-color: var(--surface-input-focus);
+  color: var(--ink-input);
+  box-shadow: 0 0 0 3px var(--primary-glow);
 }
 
 :focus-visible {
@@ -1203,6 +1281,11 @@ button {
   100% { transform: scale(1); opacity: 1; }
 }
 
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
 /* Sample PDF Quick Ingest Callout */
 .sample-callout-card {
   background: linear-gradient(135deg, rgba(37, 99, 235, 0.06), rgba(99, 102, 241, 0.08));
@@ -1395,17 +1478,19 @@ button {
 .tutor-input-form input {
   flex: 1;
   padding: 0.75rem 1rem;
-  border: 1px solid var(--border-subtle);
+  border: 1px solid var(--border-input);
   border-radius: var(--radius-md);
-  background: var(--surface-subtle);
-  color: var(--ink-primary);
+  background-color: var(--surface-input);
+  color: var(--ink-input);
   font-size: 0.94rem;
-  transition: border-color 0.15s ease, background 0.15s ease;
+  transition: border-color 0.15s ease, background-color 0.15s ease, box-shadow 0.15s ease;
 }
 
 .tutor-input-form input:focus {
-  background: var(--surface-card);
+  background-color: var(--surface-input-focus);
+  color: var(--ink-input);
   border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-glow);
 }
 
 @keyframes message-appear {
@@ -1609,16 +1694,17 @@ button {
   display: inline-block;
   min-width: 180px;
   max-width: 280px;
-  padding: 0.35rem 0.75rem;
+  padding: 0.4rem 0.85rem;
   margin: 0 0.35rem;
   border: 2px dashed var(--primary);
   border-radius: var(--radius-sm);
-  background: var(--surface);
-  color: var(--ink-primary);
+  background-color: var(--surface-input);
+  color: var(--ink-input);
   font-family: inherit;
   font-size: 1rem;
   font-weight: 600;
   text-align: center;
+  box-sizing: border-box;
   transition: all 0.2s ease;
 }
 
@@ -1626,8 +1712,9 @@ button {
   outline: none;
   border-style: solid;
   border-color: var(--primary);
-  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);
-  background: #fff;
+  box-shadow: 0 0 0 3px var(--primary-glow);
+  background-color: var(--surface-input-focus);
+  color: var(--ink-input);
 }
 
 .typed-qa-container {
@@ -1640,23 +1727,25 @@ button {
 .quiz-textarea {
   width: 100%;
   padding: 1rem 1.25rem;
-  border: 1.5px solid var(--border-subtle);
+  border: 1.5px solid var(--border-input);
   border-radius: var(--radius-md);
-  background: var(--surface);
-  color: var(--ink-primary);
+  background-color: var(--surface-input);
+  color: var(--ink-input);
   font-family: inherit;
   font-size: 0.95rem;
   line-height: 1.6;
   resize: vertical;
   min-height: 110px;
+  box-sizing: border-box;
   transition: all 0.2s ease;
 }
 
 .quiz-textarea:focus {
   outline: none;
   border-color: var(--primary);
-  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);
-  background: #fff;
+  box-shadow: 0 0 0 3px var(--primary-glow);
+  background-color: var(--surface-input-focus);
+  color: var(--ink-input);
 }
 
 .qa-helper-bar {
@@ -2493,16 +2582,19 @@ dialog::backdrop {
   font-weight: 700;
   padding: 0.65rem 1rem;
   border-radius: var(--radius-md);
-  border: 2px solid var(--border-subtle);
-  background: var(--surface-card);
-  color: var(--ink-primary);
+  border: 2px solid var(--border-input);
+  background-color: var(--surface-input);
+  color: var(--ink-input);
   width: 220px;
   max-width: 100%;
+  box-sizing: border-box;
   transition: all 0.15s ease;
 }
 
 .numerical-input:focus {
   border-color: var(--primary);
+  background-color: var(--surface-input-focus);
+  color: var(--ink-input);
   outline: none;
   box-shadow: 0 0 0 3px var(--primary-glow);
 }
@@ -2538,11 +2630,20 @@ dialog::backdrop {
   font-size: 0.85rem;
   line-height: 1.5;
   padding: 0.65rem 0.85rem;
-  border: 1px solid var(--border-subtle);
+  border: 1px solid var(--border-input);
   border-radius: var(--radius-md);
-  background: var(--surface-subtle);
-  color: var(--ink-secondary);
+  background-color: var(--surface-input);
+  color: var(--ink-input);
+  box-sizing: border-box;
   resize: vertical;
+}
+
+.scratchpad-textarea:focus {
+  outline: none;
+  border-color: var(--primary);
+  background-color: var(--surface-input-focus);
+  color: var(--ink-input);
+  box-shadow: 0 0 0 3px var(--primary-glow);
 }
 
 .step-by-step-box {
@@ -2855,10 +2956,11 @@ dialog::backdrop {
   font-size: 1rem;
   line-height: 1.6;
   padding: 1rem 1.25rem;
-  border: 2px solid var(--border-subtle);
+  border: 2px solid var(--border-input);
   border-radius: var(--radius-md);
-  background: var(--surface-subtle);
-  color: var(--ink-primary);
+  background-color: var(--surface-input);
+  color: var(--ink-input);
+  box-sizing: border-box;
   resize: vertical;
   min-height: 170px;
   transition: all 0.15s ease;
@@ -2866,7 +2968,8 @@ dialog::backdrop {
 
 .recall-textarea:focus {
   border-color: var(--primary);
-  background: var(--surface-card);
+  background-color: var(--surface-input-focus);
+  color: var(--ink-input);
   outline: none;
   box-shadow: 0 0 0 3px var(--primary-glow);
 }
@@ -2896,15 +2999,20 @@ dialog::backdrop {
   width: 100%;
   padding: 0.65rem 0.9rem;
   font-size: 0.92rem;
-  border: 1px solid var(--border-subtle);
+  border: 1px solid var(--border-input);
   border-radius: var(--radius-md);
-  background: var(--surface-card);
-  color: var(--ink-primary);
+  background-color: var(--surface-input);
+  color: var(--ink-input);
+  box-sizing: border-box;
+  transition: border-color 0.15s ease, background-color 0.15s ease, box-shadow 0.15s ease;
 }
 
 .verification-input:focus {
   border-color: var(--primary);
+  background-color: var(--surface-input-focus);
+  color: var(--ink-input);
   outline: none;
+  box-shadow: 0 0 0 3px var(--primary-glow);
 }
 
 /* Stage 4: Gap Audit & Epistemic Comparison */
@@ -3605,6 +3713,48 @@ dialog::backdrop {
 .toast.danger {
   background: var(--color-danger);
   color: #ffffff;
+}
+
+/* Subtle Skeleton Shimmer for Asynchronous Recommendation Cards */
+.skeleton-shimmer {
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.04) 25%,
+    rgba(255, 255, 255, 0.12) 37%,
+    rgba(255, 255, 255, 0.04) 63%
+  );
+  background-size: 400% 100%;
+  animation: skeleton-shimmer-wave 1.6s ease-in-out infinite;
+  border-radius: var(--radius-sm, 6px);
+}
+
+@keyframes skeleton-shimmer-wave {
+  0% { background-position: 100% 50%; }
+  100% { background-position: 0 50%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton-shimmer {
+    animation: none;
+    background: rgba(255, 255, 255, 0.06);
+  }
+}
+
+[data-theme="light"] .skeleton-shimmer {
+  background: linear-gradient(
+    90deg,
+    rgba(0, 0, 0, 0.04) 25%,
+    rgba(0, 0, 0, 0.10) 37%,
+    rgba(0, 0, 0, 0.04) 63%
+  );
+  background-size: 400% 100%;
+}
+
+.recommendation-card-skeleton {
+  min-height: 200px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
 }
 
 

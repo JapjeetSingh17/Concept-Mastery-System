@@ -180,6 +180,7 @@ def chat(
     # 1. Vectorless Retrieval from Local SQLite / KB (unless explicitly asked to search the web)
     retrieved_chunks = list(chunks) if chunks else []
     if not wants_web_search and not retrieved_chunks:
+        store.ensure_retrieval_index_if_needed(user_id=user_id)
         if concept_id:
             retrieved_chunks = GLOBAL_INDEX.retrieve_chunks(concept_id, max_chunks=3, user_id=user_id)
         if not retrieved_chunks:

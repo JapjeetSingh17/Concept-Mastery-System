@@ -410,6 +410,7 @@ def generate_micro_lesson(
     concept_def = concept.get("definition", "") if concept else ""
 
     # 1. Retrieve vectorless ground truth chunks and verify relevance
+    store.ensure_retrieval_index_if_needed(user_id=user_id)
     chunks = GLOBAL_INDEX.retrieve_chunks(concept_id, max_chunks=3, user_id=user_id)
     if not chunks:
         bm25_hits = GLOBAL_INDEX.search_bm25(raw_name, max_chunks=3, user_id=user_id)

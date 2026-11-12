@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS study_materials (
     created_at                  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_materials_user ON study_materials(user_id);
+CREATE INDEX IF NOT EXISTS idx_materials_user_material ON study_materials(user_id, material_id);
 
 -- Registered Users (Google OAuth & Local Dev)
 CREATE TABLE IF NOT EXISTS users (
@@ -101,6 +102,7 @@ CREATE TABLE IF NOT EXISTS active_recall_sessions (
     created_at                  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_active_recall_user ON active_recall_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_active_recall_user_concept ON active_recall_sessions(user_id, concept_id);
 
 -- Smart Notes
 CREATE TABLE IF NOT EXISTS smart_notes (
@@ -120,6 +122,7 @@ CREATE TABLE IF NOT EXISTS smart_notes (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_smart_notes_user_concept ON smart_notes(user_id, concept_id);
+CREATE INDEX IF NOT EXISTS idx_smart_notes_user_material ON smart_notes(user_id, material_id);
 
 -- Learning Evidence Store
 CREATE TABLE IF NOT EXISTS learning_evidence_store (
@@ -176,6 +179,28 @@ CREATE TABLE IF NOT EXISTS explainable_mastery_decisions (
     updated_at                      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_mastery_decisions_user_concept ON explainable_mastery_decisions(user_id, concept_id);
+
+-- Unified Concept Mastery Mirror (ensures table & index exist for single-connection queries)
+CREATE TABLE IF NOT EXISTS user_concept_mastery (
+    user_id             TEXT NOT NULL DEFAULT 'default',
+    concept_id          TEXT NOT NULL,
+    mastery_score       REAL NOT NULL DEFAULT 0.0,
+    state               TEXT NOT NULL DEFAULT 'UNKNOWN',
+    attempt_count       INTEGER NOT NULL DEFAULT 0,
+    quiz_correct        INTEGER NOT NULL DEFAULT 0,
+    quiz_total          INTEGER NOT NULL DEFAULT 0,
+    dialogue_score      REAL NOT NULL DEFAULT 0.5,
+    prereq_health       REAL NOT NULL DEFAULT 1.0,
+    a                   REAL NOT NULL DEFAULT 1.0,
+    b                   REAL NOT NULL DEFAULT 1.0,
+    last_attempted_at   TEXT DEFAULT NULL,
+    evidence_notes      TEXT NOT NULL DEFAULT '[]',
+    reasoning_depth     TEXT NOT NULL DEFAULT 'DEVELOPING',
+    misconceptions      TEXT NOT NULL DEFAULT '[]',
+    audit_trail         TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (user_id, concept_id)
+);
+CREATE INDEX IF NOT EXISTS idx_user_concept_mastery_uid_cid ON user_concept_mastery(user_id, concept_id);
 """
 
 _INIT_LOCK = threading.Lock()
@@ -430,7 +455,8 @@ def list_study_materials(user_id: str = "default") -> list[dict]:
         ).fetchall()
         materials = []
         for r in rows:
-            concepts = _parse_json_value(r["extracted_concepts_json"], [])
+            raw_c = _parse_json_value(r["extracted_concepts_json"], [])
+            str_concepts = [c.get("name", str(c)) if isinstance(c, dict) else str(c) for c in raw_c]
             materials.append({
                 "material_id": r["material_id"],
                 "user_id": r["user_id"],
@@ -438,8 +464,8 @@ def list_study_materials(user_id: str = "default") -> list[dict]:
                 "source_type": r["source_type"],
                 "original_filename_or_url": r["original_filename_or_url"],
                 "chunk_count": r["chunk_count"],
-                "concepts": concepts,
-                "concept_count": len(concepts),
+                "concepts": str_concepts,
+                "concept_count": len(str_concepts),
                 "created_at": r["created_at"],
             })
         return materials
@@ -487,6 +513,322 @@ def clear_all_study_materials(user_id: str | None = None):
             conn.execute("DELETE FROM study_materials WHERE user_id = ?", (user_id,))
         else:
             conn.execute("DELETE FROM study_materials")
+
+
+def _attach_mastery_db(conn: sqlite3.Connection) -> str:
+    """Ensure mastery.db is attached if stored in a separate SQLite database file."""
+    try:
+        mastery_path = Path(config.SQLITE_MASTERY_DB_PATH).resolve()
+        materials_path = Path(MATERIALS_DB_PATH).resolve()
+        if mastery_path == materials_path:
+            return ""
+        attached = [r[1] for r in conn.execute("PRAGMA database_list").fetchall()]
+        if "mastery_db" not in attached:
+            mastery_path.parent.mkdir(parents=True, exist_ok=True)
+            mconn = sqlite3.connect(str(mastery_path), timeout=5.0)
+            mconn.executescript("""
+                CREATE TABLE IF NOT EXISTS user_concept_mastery (
+                    user_id TEXT NOT NULL DEFAULT 'default',
+                    concept_id TEXT NOT NULL,
+                    mastery_score REAL NOT NULL DEFAULT 0.0,
+                    state TEXT NOT NULL DEFAULT 'UNKNOWN',
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    quiz_correct INTEGER NOT NULL DEFAULT 0,
+                    quiz_total INTEGER NOT NULL DEFAULT 0,
+                    dialogue_score REAL NOT NULL DEFAULT 0.5,
+                    prereq_health REAL NOT NULL DEFAULT 1.0,
+                    a REAL NOT NULL DEFAULT 1.0,
+                    b REAL NOT NULL DEFAULT 1.0,
+                    last_attempted_at TEXT DEFAULT NULL,
+                    evidence_notes TEXT NOT NULL DEFAULT '[]',
+                    reasoning_depth TEXT NOT NULL DEFAULT 'DEVELOPING',
+                    misconceptions TEXT NOT NULL DEFAULT '[]',
+                    audit_trail TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (user_id, concept_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_ucm_uid_cid ON user_concept_mastery(user_id, concept_id);
+            """)
+            mconn.close()
+            conn.execute(f"ATTACH DATABASE '{mastery_path}' AS mastery_db")
+        return "mastery_db."
+    except Exception:
+        return ""
+
+
+def get_dashboard_summary(user_id: str = "default", material_id: str | None = None) -> dict:
+    """Fetch active material metadata, all concepts with their current mastery scores,
+    prerequisite edges, quiz/recall attempt counts, and saved notes metadata using indexed
+    SQLite JOIN queries on a single connection instead of N+1 per-concept queries.
+    """
+    user_id = user_id or "default"
+    with _materials_transaction(immediate=False) as conn:
+        mastery_prefix = _attach_mastery_db(conn)
+
+        # 1. Active material & materials list query (indexed on user_id, material_id)
+        active_mat_row = None
+        if material_id:
+            active_mat_row = conn.execute(
+                """
+                SELECT material_id, user_id, title, source_type, original_filename_or_url,
+                       chunk_count, extracted_concepts_json, created_at
+                FROM study_materials
+                WHERE user_id = ? AND material_id = ?
+                LIMIT 1
+                """,
+                (user_id, material_id)
+            ).fetchone()
+
+        if not active_mat_row:
+            active_mat_row = conn.execute(
+                """
+                SELECT material_id, user_id, title, source_type, original_filename_or_url,
+                       chunk_count, extracted_concepts_json, created_at
+                FROM study_materials
+                WHERE user_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (user_id,)
+            ).fetchone()
+
+        all_mat_rows = conn.execute(
+            """
+            SELECT material_id, user_id, title, source_type, original_filename_or_url,
+                   chunk_count, extracted_concepts_json, created_at
+            FROM study_materials
+            WHERE user_id = ?
+            ORDER BY created_at DESC
+            """,
+            (user_id,)
+        ).fetchall()
+
+        materials_list = []
+        for mr in all_mat_rows:
+            parsed_c = _parse_json_value(mr["extracted_concepts_json"], [])
+            materials_list.append({
+                "material_id": mr["material_id"],
+                "user_id": mr["user_id"],
+                "title": mr["title"],
+                "source_type": mr["source_type"],
+                "original_filename_or_url": mr["original_filename_or_url"],
+                "chunk_count": mr["chunk_count"],
+                "concepts": parsed_c,
+                "concept_count": len(parsed_c),
+                "created_at": mr["created_at"],
+            })
+
+        active_material = None
+        if active_mat_row:
+            parsed_ac = _parse_json_value(active_mat_row["extracted_concepts_json"], [])
+            active_material = {
+                "material_id": active_mat_row["material_id"],
+                "user_id": active_mat_row["user_id"],
+                "title": active_mat_row["title"],
+                "source_type": active_mat_row["source_type"],
+                "original_filename_or_url": active_mat_row["original_filename_or_url"],
+                "chunk_count": active_mat_row["chunk_count"],
+                "concepts": parsed_ac,
+                "concept_count": len(parsed_ac),
+                "created_at": active_mat_row["created_at"],
+            }
+
+        # 2. Concepts and DAG edges from KB
+        kb = get_kb(user_id)
+        raw_concepts = list(kb.get("concepts", [])) if (kb and kb.get("ready")) else []
+        edges = list(kb.get("edges", [])) if (kb and kb.get("ready")) else []
+
+        if not raw_concepts and active_material and active_material["concepts"]:
+            for idx, c_item in enumerate(active_material["concepts"]):
+                c_name = c_item.get("name") if isinstance(c_item, dict) else str(c_item)
+                c_id = c_item.get("id") if isinstance(c_item, dict) else f"concept_{idx+1}"
+                raw_concepts.append({
+                    "id": c_id,
+                    "concept_id": c_id,
+                    "name": c_name,
+                    "summary": c_item.get("summary", "") if isinstance(c_item, dict) else ""
+                })
+
+        # 3. Fetch quiz and recall aggregated metrics per concept
+        quiz_rows = conn.execute(
+            """
+            SELECT concept_id,
+                   COUNT(*) AS quiz_evidence_count,
+                   SUM(CASE WHEN solution_revealed_first = 0 AND hints_used = 0 THEN 1 ELSE 0 END) AS unassisted_count,
+                   MAX(created_at) AS last_quiz_at
+            FROM learning_evidence_store
+            WHERE user_id = ?
+            GROUP BY concept_id
+            """,
+            (user_id,)
+        ).fetchall()
+        quiz_by_cid = {r["concept_id"]: dict(r) for r in quiz_rows}
+
+        recall_rows = conn.execute(
+            """
+            SELECT concept_id,
+                   COUNT(*) AS recall_count,
+                   MAX(retrieval_score) AS best_recall_score,
+                   MAX(created_at) AS last_recall_at
+            FROM active_recall_sessions
+            WHERE user_id = ?
+            GROUP BY concept_id
+            """,
+            (user_id,)
+        ).fetchall()
+        recall_by_cid = {r["concept_id"]: dict(r) for r in recall_rows}
+
+        # Mastery table joined with latest explainable decision
+        query = f"""
+        WITH RankedDecisions AS (
+            SELECT concept_id, outcome, legacy_status, recommended_next_action, updated_at,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY concept_id
+                       ORDER BY updated_at DESC, evidence_version DESC
+                   ) as rn
+            FROM explainable_mastery_decisions
+            WHERE user_id = ?
+        )
+        SELECT
+            ucm.concept_id,
+            ucm.mastery_score,
+            ucm.state,
+            ucm.attempt_count,
+            ucm.quiz_correct,
+            ucm.quiz_total,
+            ucm.last_attempted_at,
+            rd.outcome AS latest_decision_outcome,
+            rd.recommended_next_action AS recommended_next_action,
+            rd.updated_at AS decision_updated_at
+        FROM {mastery_prefix}user_concept_mastery ucm
+        LEFT JOIN RankedDecisions rd ON rd.concept_id = ucm.concept_id AND rd.rn = 1
+        WHERE ucm.user_id = ?
+        """
+
+        mastery_rows = conn.execute(query, (user_id, user_id)).fetchall()
+        mastery_by_cid = {r["concept_id"]: dict(r) for r in mastery_rows}
+
+        # Merge any explainable mastery decisions that might not have a ucm row
+        orphan_decisions = conn.execute(
+            """
+            SELECT concept_id, outcome, legacy_status, recommended_next_action, updated_at
+            FROM explainable_mastery_decisions
+            WHERE user_id = ?
+            ORDER BY updated_at DESC
+            """,
+            (user_id,)
+        ).fetchall()
+        for od in orphan_decisions:
+            cid = od["concept_id"]
+            if cid not in mastery_by_cid:
+                mastery_by_cid[cid] = {
+                    "concept_id": cid,
+                    "mastery_score": 1.0 if od["outcome"] == "MASTERED" else (0.3 if od["outcome"] == "NOT_YET_MASTERED" else 0.0),
+                    "state": od["legacy_status"] or ("STRONG" if od["outcome"] == "MASTERED" else "UNKNOWN"),
+                    "attempt_count": 1,
+                    "quiz_correct": 1 if od["outcome"] == "MASTERED" else 0,
+                    "quiz_total": 1,
+                    "last_attempted_at": od["updated_at"],
+                    "latest_decision_outcome": od["outcome"],
+                    "recommended_next_action": od["recommended_next_action"]
+                }
+
+        # 4. Saved notes metadata query (indexed on user_id, concept_id)
+        notes_query = """
+            SELECT note_id, user_id, concept_id, material_id, task_type, title, audio_url, pdf_url, pptx_url, created_at
+            FROM smart_notes
+            WHERE user_id = ?
+            ORDER BY created_at DESC
+        """
+        notes_rows = conn.execute(notes_query, (user_id,)).fetchall()
+        notes_list = [dict(nr) for nr in notes_rows]
+
+        # 5. Hydrate concepts list with combined stats and mapped status
+        hydrated_concepts = []
+        for c in raw_concepts:
+            cid = c.get("id") if isinstance(c, dict) else (c.id if hasattr(c, "id") else str(c))
+            cname = c.get("name") if isinstance(c, dict) else (c.name if hasattr(c, "name") else str(c))
+            csummary = c.get("summary") if isinstance(c, dict) else (getattr(c, "summary", "") or "")
+
+            m = mastery_by_cid.get(cid, {})
+            q_data = quiz_by_cid.get(cid, {})
+            r_data = recall_by_cid.get(cid, {})
+
+            quiz_attempts = int(q_data.get("quiz_evidence_count") or m.get("quiz_attempt_count") or 0)
+            recall_attempts = int(r_data.get("recall_count") or m.get("recall_attempt_count") or 0)
+            best_recall_score = float(r_data.get("best_recall_score") or m.get("best_recall_score") or 0.0)
+            last_attempted = m.get("last_attempted_at") or q_data.get("last_quiz_at") or r_data.get("last_recall_at")
+
+            score = float(m.get("mastery_score", 0.0))
+            raw_state = str(m.get("state", "UNKNOWN")).upper()
+            outcome = m.get("latest_decision_outcome")
+            attempts = max(int(m.get("attempt_count", 0)), quiz_attempts + recall_attempts, quiz_attempts)
+
+            if outcome == "MASTERED" or raw_state == "STRONG":
+                status = "strong"
+                state = "STRONG"
+                score = max(score, 0.75) if attempts > 0 else 1.0
+            elif outcome == "NOT_YET_MASTERED" or raw_state == "WEAK":
+                status = "weak"
+                state = "WEAK"
+                score = min(score, 0.45) if attempts > 0 else 0.30
+            else:
+                if attempts > 0:
+                    status = "strong" if score >= 0.70 else ("weak" if score < 0.50 else "unknown")
+                    state = status.upper()
+                else:
+                    status = "unknown"
+                    state = "UNKNOWN"
+                    score = 0.0
+
+            why = m.get("recommended_next_action") or (
+                f"{m.get('quiz_correct', 0)} of {m.get('quiz_total', 0)} quiz questions correct."
+                if attempts > 0
+                else "No answers yet. That isn't enough evidence to call it strong or weak."
+            )
+
+            hydrated_concepts.append({
+                "id": cid,
+                "concept_id": cid,
+                "name": cname,
+                "concept_name": cname,
+                "summary": csummary,
+                "score": round(score, 2),
+                "mastery_score": round(score, 2),
+                "status": status,
+                "state": state,
+                "attempts": attempts,
+                "quiz_attempts": quiz_attempts,
+                "recall_attempts": recall_attempts,
+                "best_recall_score": round(best_recall_score, 2),
+                "last_attempted_at": last_attempted,
+                "why": why,
+                "recommended_next_action": m.get("recommended_next_action", ""),
+            })
+
+        total_concepts = len(hydrated_concepts)
+        strong_count = sum(1 for c in hydrated_concepts if c["status"] == "strong")
+        weak_count = sum(1 for c in hydrated_concepts if c["status"] == "weak")
+        unknown_count = sum(1 for c in hydrated_concepts if c["status"] == "unknown")
+        avg_score = round(sum(c["score"] for c in hydrated_concepts) / total_concepts, 2) if total_concepts else 0.0
+
+        return {
+            "ok": True,
+            "user_id": user_id,
+            "material": active_material,
+            "materials": materials_list,
+            "concepts": hydrated_concepts,
+            "edges": edges,
+            "notes": notes_list,
+            "stats": {
+                "total_concepts": total_concepts,
+                "strong_count": strong_count,
+                "weak_count": weak_count,
+                "unknown_count": unknown_count,
+                "average_score": avg_score,
+                "total_materials": len(materials_list),
+                "total_notes": len(notes_list),
+            }
+        }
 
 
 # ── Active Recall Session Persistence ───────────────────────────────────────
@@ -1163,6 +1505,131 @@ def save_kb(file, pages, index, concepts, edges, user_id: str = "default"):
     if user_id == "default":
         KB.update(kb_data)
 
+def _build_lightweight_kb_from_materials(mats: list[dict], user_id: str = "default") -> dict:
+    """Construct lightweight KB from stored study materials without triggering eager BM25/Vector rebuilds."""
+    aggregated_concepts = []
+    seen_cids = set()
+    total_pages = 0
+    file_titles = []
+
+    for m in mats:
+        file_titles.append(m.get("title", "Material"))
+        total_pages += int(m.get("chunk_count") or 1)
+        for c in (m.get("concepts") or []):
+            cid = c.get("id") if isinstance(c, dict) else (c.get("concept_id") if isinstance(c, dict) else str(c))
+            if cid and cid not in seen_cids:
+                seen_cids.add(cid)
+                aggregated_concepts.append(c if isinstance(c, dict) else {"id": cid, "name": cid, "summary": ""})
+
+    edges = []
+    if len(aggregated_concepts) > 1:
+        for i in range(len(aggregated_concepts) - 1):
+            c_prev = aggregated_concepts[i].get("id") or aggregated_concepts[i].get("name")
+            c_next = aggregated_concepts[i+1].get("id") or aggregated_concepts[i+1].get("name")
+            if c_prev and c_next:
+                edges.append([c_prev, c_next])
+
+    combined_title = ", ".join(file_titles[:3]) + (f" (+{len(file_titles)-3} more)" if len(file_titles) > 3 else "")
+    lazy_idx = VectorIndex(chunks=[], idf=None, vecs=None)
+
+    kb_data = {
+        "ready": True,
+        "file": combined_title or "Unified Study Materials",
+        "pages": max(total_pages, 1),
+        "index": lazy_idx,
+        "concepts": aggregated_concepts,
+        "edges": edges,
+        "user_id": user_id,
+    }
+    USER_KBS[user_id] = kb_data
+    if user_id == "default":
+        KB.update(kb_data)
+    return kb_data
+
+
+def ensure_retrieval_index_if_needed(user_id: str = "default") -> None:
+    """Ensure inverted SQLite BM25 index is populated if retrieval is needed and index is empty.
+    
+    Populates chunks directly from stored study materials without triggering heavy LLM concept
+    extraction or resetting existing mastery states.
+    """
+    from .concept_index import GLOBAL_INDEX
+    if GLOBAL_INDEX.count(user_id) > 0:
+        return
+    mats = list_study_materials(user_id)
+    if not mats:
+        return
+
+    from ..models.schemas import ChunkMetadata
+    from ..pipelines.ingest import chunk_extracted_items
+
+    all_combined_chunks = []
+    known_concepts = set()
+
+    for mat in mats:
+        full_mat = get_study_material(mat["material_id"], user_id=user_id)
+        if not full_mat:
+            continue
+        for c in full_mat.get("concepts", []):
+            if c:
+                known_concepts.add(str(c).strip())
+
+        preview_items = full_mat.get("structured_preview", [])
+        items = []
+        for p in preview_items:
+            items.append({
+                "page": p.get("index", 1),
+                "locator_label": p.get("label", f"Page {p.get('index', 1)}"),
+                "section": p.get("heading") or p.get("title") or (f"Video [{p.get('label')}]" if p.get("timestamp") else "Introduction"),
+                "text": p.get("text", "")
+            })
+
+        if not items and full_mat.get("raw_extracted_text"):
+            items.append({
+                "page": 1,
+                "locator_label": "Overview",
+                "section": "Overview",
+                "text": full_mat["raw_extracted_text"]
+            })
+
+        mat_chunks = chunk_extracted_items(
+            items=items,
+            source_id=mat["material_id"],
+            source_type=mat.get("source_type", "document"),
+            source_title=mat.get("title", ""),
+            origin_name=mat.get("original_filename_or_url", ""),
+        )
+        all_combined_chunks.extend(mat_chunks)
+
+    if all_combined_chunks:
+        chunk_models = []
+        for i, c in enumerate(all_combined_chunks):
+            c_concepts = list(c.get("canonical_concepts", []))
+            if not c_concepts and known_concepts:
+                chunk_text_lower = (c.get("text", "") + " " + c.get("section", "")).lower()
+                for kc in known_concepts:
+                    if kc.lower() in chunk_text_lower:
+                        c_concepts.append(kc)
+
+            chunk_models.append(
+                ChunkMetadata(
+                    chunk_id=str(c.get("chunk_id", f"c_{i}")),
+                    page_number=int(c.get("page", 1)),
+                    section_title=str(c.get("section", "Section")),
+                    text=str(c.get("text", "")),
+                    canonical_concepts=c_concepts,
+                    source_filename=str(c.get("source_filename", "")),
+                    locator_label=str(c.get("locator_label", f"Page {c.get('page', 1)}")),
+                    source_id=str(c.get("source_id", "")),
+                    source_type=str(c.get("source_type", "pdf")),
+                    source_title=str(c.get("source_title", "")),
+                    origin_url_or_filename=str(c.get("origin_url_or_filename", "")),
+                    user_id=user_id,
+                )
+            )
+        GLOBAL_INDEX.index_chunks(chunk_models, user_id=user_id)
+
+
 def get_kb(user_id: str = "default") -> dict:
     """Retrieve user-specific knowledge base, or empty structure if no materials."""
     if user_id == "default":
@@ -1174,9 +1641,7 @@ def get_kb(user_id: str = "default") -> dict:
             return cached_default
         mats = list_study_materials("default")
         if mats:
-            from ..pipelines.ingest import UniversalMaterialIngestor
-            UniversalMaterialIngestor.rebuild_unified_knowledge_base(user_id="default")
-            return USER_KBS.get("default", KB)
+            return _build_lightweight_kb_from_materials(mats, user_id="default")
         return KB
 
     # For specific non-default user:
@@ -1187,10 +1652,7 @@ def get_kb(user_id: str = "default") -> dict:
     # Check if materials exist in database for this user
     mats = list_study_materials(user_id)
     if mats:
-        # Rebuild user's knowledge base dynamically from their materials
-        from ..pipelines.ingest import UniversalMaterialIngestor
-        UniversalMaterialIngestor.rebuild_unified_knowledge_base(user_id=user_id)
-        return USER_KBS.get(user_id, {"ready": False, "file": None, "pages": 0, "index": None, "concepts": [], "edges": [], "user_id": user_id})
+        return _build_lightweight_kb_from_materials(mats, user_id=user_id)
 
     # If the user has explicitly empty or reset KB (e.g. via clear_kb), respect it
     if cached_user is not None and not cached_user.get("ready"):

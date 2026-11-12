@@ -510,20 +510,36 @@
     if (!url) return;
     const safeFilename = filename || url.split("/").pop().split("?")[0] || "download";
     try {
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const blob = await res.blob();
-      const blobUrl = URL.createObjectURL(blob);
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      let contentType = (response.headers && typeof response.headers.get === "function")
+        ? (response.headers.get("content-type") || "")
+        : "";
+      if (!contentType) {
+        if (safeFilename.endsWith(".pdf")) contentType = "application/pdf";
+        else if (safeFilename.endsWith(".pptx")) contentType = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+        else if (safeFilename.endsWith(".mp3")) contentType = "audio/mpeg";
+        else if (safeFilename.endsWith(".svg")) contentType = "image/svg+xml";
+        else contentType = "application/octet-stream";
+      }
+      const rawBlob = await response.blob();
+      const blob = new Blob([rawBlob], { type: contentType });
+      const objectUrl = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.style.display = "none";
-      a.href = blobUrl;
+      a.href = objectUrl;
       a.download = safeFilename;
       document.body.appendChild(a);
       a.click();
       setTimeout(() => {
-        if (a.parentNode) document.body.removeChild(a);
-        URL.revokeObjectURL(blobUrl);
-      }, 1000);
+        try {
+          if (a.remove) a.remove();
+          else if (a.parentNode) a.parentNode.removeChild(a);
+        } catch {}
+        try {
+          URL.revokeObjectURL(objectUrl);
+        } catch {}
+      }, 60000);
     } catch (err) {
       console.warn("Direct blob download failed, falling back to anchor:", err);
       const a = document.createElement("a");
@@ -533,8 +549,11 @@
       document.body.appendChild(a);
       a.click();
       setTimeout(() => {
-        if (a.parentNode) document.body.removeChild(a);
-      }, 500);
+        try {
+          if (a.remove) a.remove();
+          else if (a.parentNode) a.parentNode.removeChild(a);
+        } catch {}
+      }, 60000);
     }
   }
 
@@ -1151,28 +1170,41 @@
     }
   }
 
+  function syncMaterialStateFromList(mats, uid) {
+    AppState.materials = mats || [];
+    if (mats && mats.length > 0) {
+      const top = mats[0];
+      const status = {
+        ready: true,
+        file: top.title || top.original_filename_or_url || "Active Study Material",
+        pages: top.chunk_count || 1,
+        concepts: top.concept_count || (top.concepts ? top.concepts.length : 0),
+        user_id: uid
+      };
+      AppState.activeDoc = status;
+      updateSidebarWidget(status);
+    } else {
+      AppState.activeDoc = { ready: false, file: null };
+      updateSidebarWidget({ ready: false, file: null });
+    }
+  }
+
   // Global Document / Ingest Status Poller & Synchronizer
   async function syncActiveDocument(signal = null) {
     try {
       const uid = getCurrentUserId();
       const reqOpts = signal ? { signal } : {};
-      const matsData = await ApiService.listMaterials(uid, reqOpts);
-      const mats = matsData.materials || [];
-      if (mats.length > 0) {
-        const top = mats[0];
-        const status = {
-          ready: true,
-          file: top.title || top.original_filename_or_url || "Active Study Material",
-          pages: top.chunk_count || 1,
-          concepts: top.concept_count || (top.concepts ? top.concepts.length : 0),
-          user_id: uid
-        };
-        AppState.activeDoc = status;
-        updateSidebarWidget(status);
-      } else {
-        AppState.activeDoc = { ready: false, file: null };
-        updateSidebarWidget({ ready: false, file: null });
+      const cached = ApiService.getSwr("materialsList", { userId: uid });
+      if (cached && cached.materials) {
+        syncMaterialStateFromList(cached.materials, uid);
       }
+      const matsData = await ApiService.fetchWithSwr("materialsList", null, { ...reqOpts, userId: uid }, (fresh) => {
+        if (fresh && fresh.materials) {
+          syncMaterialStateFromList(fresh.materials, uid);
+        }
+      });
+      const mats = (matsData && matsData.materials) ? matsData.materials : [];
+      syncMaterialStateFromList(mats, uid);
     } catch (e) {
       rethrowIfAbort(e);
       console.warn("Could not sync active document status:", e);
@@ -1274,6 +1306,10 @@
       ? ApiService.beginAbortScope("diagnostic")
       : new AbortController();
 
+    const diagTimeoutId = setTimeout(() => {
+      try { controller.abort(); } catch (_) {}
+    }, 12000);
+
     if (typeof modal.showModal === "function") {
       modal.showModal();
     } else {
@@ -1292,6 +1328,7 @@
 
     try {
       const res = await ApiService.startDiagnostic(getCurrentUserId(), { signal: controller.signal });
+      clearTimeout(diagTimeoutId);
       const questions = (res && res.questions && res.questions.length) ? res.questions : [];
       if (!questions.length) {
         throw new Error("No diagnostic questions could be generated. Ensure study materials are uploaded.");
@@ -1492,15 +1529,21 @@
 
       renderDiagQ();
     } catch (err) {
+      if (typeof diagTimeoutId !== "undefined") clearTimeout(diagTimeoutId);
       rethrowIfAbort(err);
       reportBackendError("Baseline diagnostic unavailable", err);
       body.innerHTML = `
         <div style="padding: 2rem; text-align: center;">
           <h4 style="color: var(--color-danger); margin-bottom: 0.5rem;">Diagnostic Error</h4>
-          <p style="color: var(--ink-secondary); margin-bottom: 1.25rem;">${esc(err.message)}</p>
-          <button class="btn btn-secondary" onclick="document.querySelector('#diagnostic-modal').close()">Close</button>
+          <p style="color: var(--ink-secondary); margin-bottom: 1.25rem;">${esc(err.message || "Failed to load diagnostic items.")}</p>
+          <div style="display:flex; justify-content:center; gap:0.5rem;">
+            <button class="btn btn-secondary" onclick="document.querySelector('#diagnostic-modal').close()">Close</button>
+            <button class="btn btn-primary" id="btn-diag-retry">Retry Assessment</button>
+          </div>
         </div>
       `;
+      const retryBtn = $("#btn-diag-retry", body);
+      if (retryBtn) retryBtn.onclick = () => startBaselineDiagnostic();
     }
   }
 
@@ -1896,320 +1939,578 @@
     `;
   }
 
+  // -------------------------------------------------------------------------
+  // Dashboard Decoupled Data Loader & Renderer (SWR + Promise.allSettled)
+  // -------------------------------------------------------------------------
+
+  function renderRecommendationCard(topRec, isPending = false) {
+    if (isPending) {
+      return `
+        <div class="card recommendation-card recommendation-card-skeleton" id="dashboard-rec-card">
+          <div>
+            <div class="rec-header-badge" style="width:fit-content;">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5"/><path d="M9 18h6"/><path d="M10 22h4"/></svg>
+              <span>AI Next Recommendation</span>
+            </div>
+            <div class="skeleton-shimmer" style="height:24px; width:70%; margin:0.85rem 0 0.5rem 0; border-radius:4px;"></div>
+            <div class="skeleton-shimmer" style="height:48px; width:100%; margin-bottom:1rem; border-radius:4px;"></div>
+          </div>
+
+          <div style="display:flex; gap:0.65rem;">
+            <div class="skeleton-shimmer" style="height:36px; width:110px; border-radius:6px;"></div>
+            <div class="skeleton-shimmer" style="height:36px; width:90px; border-radius:6px;"></div>
+          </div>
+        </div>
+      `;
+    }
+
+    return `
+      <div class="card recommendation-card" id="dashboard-rec-card">
+        <div>
+          <div class="rec-header-badge">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5"/><path d="M9 18h6"/><path d="M10 22h4"/></svg>
+            <span>Next Recommendation</span>
+          </div>
+          <h3 class="rec-concept-name">
+            ${topRec ? esc(topRec.type || "Recommendation") + ": " + esc(topRec.name || topRec.concept_name || "Ready to Learn") : "Ready to Learn"}
+          </h3>
+          <div class="rec-reason-box">
+            ${topRec ? esc(topRec.reason) : "Upload study material to generate personalized concept recommendations."}
+          </div>
+        </div>
+
+        <div style="display:flex; gap:0.65rem;">
+          ${topRec ? `
+            <a href="#practice" data-target-concept="${esc(topRec.conceptId || topRec.concept_id || '')}" class="btn btn-primary start-target-quiz start-remedial-review">
+              Start Review &rarr;
+            </a>
+            <a href="#tutor" class="btn btn-secondary">
+              Ask Tutor
+            </a>
+          ` : `
+            <a href="#upload" class="btn btn-primary">
+              Upload PDF &rarr;
+            </a>
+          `}
+        </div>
+      </div>
+    `;
+  }
+
+  function renderDashboard(data = {}) {
+    const masteryData = data.masteryData || [];
+    const loopStatus = data.loopStatus || { loop_state: "UNINITIALIZED", material_ready: false, baseline_completed: false };
+    const topRec = data.topRec || null;
+    const isRecPending = Boolean(data.isRecPending);
+    const dashboardError = data.dashboardError || null;
+
+    if (dashboardError && masteryData.length === 0) {
+      return `
+        <div class="page-header">
+          <div class="page-header-text">
+            <h1>Welcome back, ${esc(AppState.studentName)}!</h1>
+            <p>Your closed-loop epistemic learning platform.</p>
+          </div>
+        </div>
+        <div class="empty-state-card">
+          <h3 class="empty-state-title" style="color:var(--color-danger);">Backend Unavailable</h3>
+          <p class="empty-state-desc">${esc(dashboardError.message || "Could not load dashboard metrics from the backend.")}</p>
+          <button type="button" class="btn btn-primary" onclick="location.reload()">Retry Connection</button>
+        </div>
+      `;
+    }
+
+    const totalConcepts = masteryData.length;
+    const strongCount = masteryData.filter(c => getConceptStatus(c) === "strong").length;
+    const weakCount = masteryData.filter(c => getConceptStatus(c) === "weak").length;
+    const unknownCount = masteryData.filter(c => getConceptStatus(c) === "unknown").length;
+
+    const avgScore = totalConcepts > 0
+      ? Math.round((masteryData.reduce((acc, c) => acc + (c.attempts > 0 ? (c.score || 0) : 0), 0) / totalConcepts) * 100)
+      : 0;
+
+    // ── Empty-State Gating: No study materials uploaded ──────────────────
+    if (totalConcepts === 0) {
+      return `
+        <div class="page-header">
+          <div class="page-header-text">
+            <h1>Welcome back, ${esc(AppState.studentName)}! 👋</h1>
+            <p>Your closed-loop epistemic learning platform.</p>
+          </div>
+          <div class="page-header-actions">
+            <button class="btn btn-secondary btn-disabled-gated" disabled title="Upload study material first to unlock quizzes">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+              Start Quick Quiz
+            </button>
+          </div>
+        </div>
+
+        <div class="empty-state-card">
+          <div class="empty-state-icon">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/>
+              <path d="M12 12v9"/>
+              <path d="m16 16-4-4-4 4"/>
+            </svg>
+          </div>
+          <h3 class="empty-state-title">No Study Material Uploaded Yet</h3>
+          <p class="empty-state-desc">
+            No study material uploaded yet. Upload a PDF, lecture slides, YouTube link, or notes in the Study Material tab to generate your custom learning path.
+          </p>
+          <a href="#upload" class="btn btn-primary" style="margin-top:0.5rem;">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+            Upload Study Material &rarr;
+          </a>
+        </div>
+      `;
+    }
+
+    // ── Baseline Diagnostic Gating Check ─────────────────────────────────
+    const isBaselineDiagnosticActive = (loopStatus.loop_state === "BASELINE_DIAGNOSTIC" || !loopStatus.baseline_completed);
+
+    return `
+      <div class="page-header">
+        <div class="page-header-text">
+          <h1>Welcome back, ${esc(AppState.studentName)}! 👋</h1>
+          <p>Let's continue your closed-loop learning journey.</p>
+        </div>
+        <div class="page-header-actions">
+          ${isBaselineDiagnosticActive ? `
+            <button class="btn btn-secondary btn-disabled-gated" disabled title="Complete your Step 1 Baseline Diagnostic first">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+              Start Quick Quiz (Complete Baseline First)
+            </button>
+          ` : `
+            <a href="#practice" class="btn btn-primary">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+              Start Quick Quiz
+            </a>
+          `}
+        </div>
+      </div>
+
+      ${isBaselineDiagnosticActive ? `
+        <!-- Step 1: First-Run Baseline Diagnostic CTA Banner -->
+        <div class="diagnostic-cta-banner" id="baseline-diagnostic-banner">
+          <div>
+            <div class="diagnostic-badge-pill">Step 1 · Initial Knowledge Mapping</div>
+            <h2 class="diagnostic-title">Take Your Baseline Diagnostic Quiz</h2>
+            <p class="diagnostic-desc">
+              Answer 6 quick diagnostic questions to baseline what you already know and unlock your active learning path.
+            </p>
+          </div>
+          <button id="btn-start-baseline-diagnostic" class="btn btn-primary" style="background:#ffffff; color:#1e3a8a; border:none; font-weight:700;">
+            Start Baseline Diagnostic &rarr;
+          </button>
+        </div>
+      ` : ''}
+
+      <!-- Hero Section Grid -->
+      <div class="grid grid-dashboard-hero">
+        <!-- Card 1: Visual Learning Progress -->
+        <div class="card progress-hero-card">
+          <h3 style="margin-bottom: 1.25rem; font-size: 1.15rem;">Your Learning Progress</h3>
+          <div class="hero-content-split">
+            <div class="donut-chart-container">
+              ${createDonutSvg(avgScore, 130, 11, "#3b82f6")}
+              <div class="donut-chart-value">
+                <span class="val-number" style="color:#ffffff;">${avgScore}%</span>
+                <span class="val-label" style="color:#cbd5e1;">Mastery</span>
+              </div>
+            </div>
+
+            <div class="hero-stats-breakdown">
+              <div class="hero-metric-legend">
+                <div class="metric-legend-item">
+                  <div class="metric-legend-tag">
+                    <span class="legend-dot strong"></span>
+                    <span>Strong Concepts</span>
+                  </div>
+                  <span class="metric-legend-num">${strongCount} (${totalConcepts ? Math.round((strongCount/totalConcepts)*100) : 0}%)</span>
+                </div>
+                <div class="metric-legend-item">
+                  <div class="metric-legend-tag">
+                    <span class="legend-dot weak"></span>
+                    <span>Weak Concepts</span>
+                  </div>
+                  <span class="metric-legend-num">${weakCount} (${totalConcepts ? Math.round((weakCount/totalConcepts)*100) : 0}%)</span>
+                </div>
+                <div class="metric-legend-item">
+                  <div class="metric-legend-tag">
+                    <span class="legend-dot unknown"></span>
+                    <span>Unknown Concepts</span>
+                  </div>
+                  <span class="metric-legend-num">${unknownCount} (${totalConcepts ? Math.round((unknownCount/totalConcepts)*100) : 0}%)</span>
+                </div>
+              </div>
+
+              <div style="margin-top:0.5rem;">
+                <a href="#learning-path" class="btn btn-secondary btn-sm" style="background:rgba(255,255,255,0.15); color:#fff; border-color:rgba(255,255,255,0.25);">
+                  Continue Learning &rarr;
+                </a>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Card 2: Proactive Recommendation (Asynchronous Sub-container) -->
+        <div id="dashboard-rec-container" style="display:flex; flex-direction:column;">
+          ${renderRecommendationCard(topRec, isRecPending)}
+        </div>
+      </div>
+
+      <!-- Learning Journey Workflow Stepper -->
+      <div class="card journey-card">
+        <div class="card-header">
+          <h3 class="card-title">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+            Your Learning Journey
+          </h3>
+          <a href="#learning-path" class="btn btn-outline btn-sm">View Full Path &rarr;</a>
+        </div>
+
+        <div class="journey-pipeline">
+          <div class="journey-step ${AppState.activeDoc && AppState.activeDoc.ready ? 'completed' : 'active'}" data-nav="upload">
+            <div class="step-circle">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+            </div>
+            <span class="step-label">1. Upload<br>Material</span>
+          </div>
+
+          <div class="journey-step ${totalConcepts > 0 ? 'completed' : ''}" data-nav="learning-path">
+            <div class="step-circle">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
+            </div>
+            <span class="step-label">2. Learn<br>Concepts</span>
+          </div>
+
+          <div class="journey-step ${!isBaselineDiagnosticActive ? 'completed' : 'active'}" data-nav="practice">
+            <div class="step-circle">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></svg>
+            </div>
+            <span class="step-label">3. Take<br>Quiz</span>
+          </div>
+
+          <div class="journey-step ${weakCount > 0 ? 'active' : ''}" data-nav="progress">
+            <div class="step-circle">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+            </div>
+            <span class="step-label">4. Review<br>Weak Topics</span>
+          </div>
+
+          <div class="journey-step ${strongCount >= totalConcepts && totalConcepts > 0 ? 'completed' : ''}" data-nav="progress">
+            <div class="step-circle">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+            </div>
+            <span class="step-label">5. Master<br>Concept</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Concept Progress Quick Glance -->
+      <div class="card" style="margin-top: 1.5rem;">
+        <div class="card-header">
+          <h3 class="card-title">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+            Concept Mastery Status
+          </h3>
+          <a href="#progress" class="btn btn-outline btn-sm">Full Analytics &rarr;</a>
+        </div>
+
+        <div class="concept-preview-list">
+          ${masteryData.slice(0, 5).map(c => {
+            const badge = renderOutcomeBadge(c);
+            return `
+              <div class="concept-preview-item" style="display:flex; justify-content:space-between; align-items:center; padding:0.85rem 0; border-bottom:1px solid var(--border-subtle);">
+                <div class="concept-preview-left">
+                  <span class="concept-preview-name" style="font-weight:600; font-size:0.95rem;">${esc(c.name)}</span>
+                  <span class="concept-preview-stats" style="font-size:0.8rem; color:var(--ink-secondary); display:block; margin-top:0.2rem;">${c.attempts || 0} interaction(s) · Multi-Agent Pedagogical Assessment</span>
+                </div>
+                <div style="display:flex; align-items:center; gap:0.65rem;">
+                  ${badge}
+                  <button class="btn btn-outline btn-sm btn-inspect-deliberation" data-concept-id="${esc(c.id)}" data-concept-name="${esc(c.name)}" title="Inspect Multi-Agent Deliberation">
+                    Inspect Deliberation
+                  </button>
+                  <a href="#practice" data-target-concept="${esc(c.id)}" class="btn btn-secondary btn-sm start-target-quiz">Quiz</a>
+                </div>
+              </div>
+            `;
+          }).join("")}
+        </div>
+      </div>
+    `;
+  }
+
+  async function loadDashboard(signal = null, options = {}) {
+    const uid = getCurrentUserId();
+    const reqOpts = signal ? { signal } : {};
+
+    // 1. Check in-memory and sessionStorage SWR cache
+    const cachedSummary = ApiService.getSwr("dashboardSummary", { userId: uid });
+    const cachedMats = ApiService.getSwr("materialsList", { userId: uid }) || (cachedSummary ? { materials: cachedSummary.materials } : null);
+    const cachedMastery = ApiService.getSwr("mastery", { userId: uid }) || (cachedSummary ? { concepts: cachedSummary.concepts } : null);
+    const cachedLoop = ApiService.getSwr("loopStatus", { userId: uid }) || (cachedSummary ? cachedSummary.loop_status : null);
+    const cachedNotes = ApiService.getSwr("notesList", { userId: uid }) || (cachedSummary ? { notes: cachedSummary.notes } : null);
+    const cachedRec = ApiService.getSwr("recommend", { userId: uid }) || (cachedSummary ? { actions: cachedSummary.recommendations } : null);
+
+    const hasCachedFastData = (cachedSummary && Array.isArray(cachedSummary.concepts)) || (cachedMastery && Array.isArray(cachedMastery.concepts));
+
+    // 2. Fast batched summary promise (single round-trip <10ms) with fallback to parallel Promise.allSettled
+    const summaryPromise = ApiService.getDashboardSummary(uid, null, reqOpts).then(summary => {
+      if (summary && summary.ok) {
+        if (summary.materials) ApiService.setSwr("materialsList", { materials: summary.materials }, { userId: uid });
+        if (summary.concepts) ApiService.setSwr("mastery", { concepts: summary.concepts }, { userId: uid });
+        if (summary.loop_status) ApiService.setSwr("loopStatus", summary.loop_status, { userId: uid });
+        if (summary.notes) ApiService.setSwr("notesList", { notes: summary.notes }, { userId: uid });
+        if (summary.recommendations) ApiService.setSwr("recommend", { actions: summary.recommendations, ready: true }, { userId: uid });
+        return summary;
+      }
+      throw new Error("Invalid dashboard summary response");
+    }).catch(async (err) => {
+      if (isAbortError(err)) throw err;
+      // Fallback: parallel individual endpoints for backward compatibility
+      const [matsRes, masteryRes, loopRes, notesRes] = await Promise.allSettled([
+        ApiService.listMaterials(uid, reqOpts),
+        ApiService.getMastery(reqOpts),
+        ApiService.getLoopStatus(uid, reqOpts),
+        ApiService.getNotes(null, uid, reqOpts)
+      ]);
+      if (masteryRes.status === "rejected") {
+        rethrowIfAbort(masteryRes.reason);
+        reportBackendError("Failed fetching dashboard data", masteryRes.reason);
+        throw masteryRes.reason;
+      }
+
+      const mats = matsRes.status === "fulfilled" && matsRes.value ? (matsRes.value.materials || []) : [];
+      const concepts = masteryRes.status === "fulfilled" && masteryRes.value ? (masteryRes.value.concepts || []) : [];
+      const loopStatus = loopRes.status === "fulfilled" ? loopRes.value : null;
+      const notes = notesRes.status === "fulfilled" && notesRes.value ? (Array.isArray(notesRes.value) ? notesRes.value : (notesRes.value.notes || [])) : [];
+      return {
+        ok: true,
+        user_id: uid,
+        materials: mats,
+        concepts,
+        notes,
+        loop_status: loopStatus,
+        recommendations: [],
+        top_recommendation: null
+      };
+    });
+
+    const fastSettledPromise = summaryPromise.then(s => [
+      { status: "fulfilled", value: { materials: s.materials || [] } },
+      { status: "fulfilled", value: { concepts: s.concepts || [] } },
+      { status: "fulfilled", value: s.loop_status || { loop_state: "UNINITIALIZED", material_ready: false, baseline_completed: false } },
+      { status: "fulfilled", value: s.notes || [] }
+    ]).catch(err => {
+      if (isAbortError(err)) return [];
+      return [
+        { status: "rejected", reason: err },
+        { status: "rejected", reason: err },
+        { status: "rejected", reason: err },
+        { status: "rejected", reason: err }
+      ];
+    });
+
+    const recPromise = summaryPromise.then(s => {
+      if (s.recommendations && s.recommendations.length > 0) {
+        return { actions: s.recommendations, ready: true };
+      }
+      if (signal && signal.aborted) return { actions: [], ready: false };
+      return ApiService.getRecommendations(reqOpts);
+    }).catch(err => {
+      if (isAbortError(err) || (signal && signal.aborted)) {
+        return { actions: [], ready: false };
+      }
+      return ApiService.getRecommendations(reqOpts).catch(() => ({ actions: [], ready: false }));
+    });
+
+    return {
+      cached: hasCachedFastData ? {
+        summary: cachedSummary,
+        materials: cachedMats,
+        mastery: cachedMastery,
+        loopStatus: cachedLoop,
+        notes: cachedNotes,
+        rec: cachedRec
+      } : null,
+      summaryPromise,
+      fastSettledPromise,
+      recPromise
+    };
+  }
+
   // =========================================================================
   // VIEW RENDERERS
   // =========================================================================
 
   const Views = {
     // -----------------------------------------------------------------------
-    // A. DASHBOARD VIEW
+    // A. DASHBOARD VIEW (Optimized with Batched /api/dashboard-summary & SWR)
     // -----------------------------------------------------------------------
     async dashboard(signal = null) {
-      await syncActiveDocument(signal);
-      let masteryData = [];
-      let recData = { actions: [] };
-      let loopStatus = { loop_state: "UNINITIALIZED", material_ready: false, baseline_completed: false };
-      let dashboardError = null;
+      const uid = getCurrentUserId();
+      const { cached, summaryPromise, fastSettledPromise, recPromise } = await loadDashboard(signal);
 
-      try {
-        const reqOpts = signal ? { signal } : {};
-        const [mRes, rRes, lRes] = await Promise.all([
-          ApiService.getMastery(reqOpts).catch(e => { rethrowIfAbort(e); dashboardError = dashboardError || e; return null; }),
-          ApiService.getRecommendations(reqOpts).catch(e => { rethrowIfAbort(e); dashboardError = dashboardError || e; return null; }),
-          ApiService.getLoopStatus(getCurrentUserId(), reqOpts).catch(e => { rethrowIfAbort(e); dashboardError = dashboardError || e; return null; })
-        ]);
-        if (dashboardError) {
-          reportBackendError("Failed fetching dashboard data", dashboardError);
+      let masteryData = [];
+      let loopStatus = { loop_state: "UNINITIALIZED", material_ready: false, baseline_completed: false };
+      let topRec = null;
+      let isRecPending = true;
+
+      const wireAsyncRecommendation = (promise) => {
+        promise.then(rRes => {
+          if (signal && signal.aborted) return;
+          const actions = (rRes && Array.isArray(rRes.actions)) ? rRes.actions : [];
+          AppState.recommendations = actions;
+          const rec = actions.length > 0 ? actions[0] : null;
+          const recContainer = $("#dashboard-rec-container");
+          if (recContainer) {
+            recContainer.innerHTML = renderRecommendationCard(rec, false);
+            $$("#dashboard-rec-container .start-remedial-review").forEach(btn => {
+              btn.onclick = () => {
+                AppState.quizSession.remedialMode = true;
+                AppState.quizSession.targetConceptId = btn.getAttribute("data-target-concept");
+              };
+            });
+            $$("#dashboard-rec-container .start-target-quiz").forEach(btn => {
+              btn.onclick = () => {
+                AppState.quizSession.targetConceptId = btn.getAttribute("data-target-concept");
+              };
+            });
+          }
+        }).catch(err => {
+          if (isAbortError(err)) return;
+          console.warn("AI recommendation load error", err);
+          const recContainer = $("#dashboard-rec-container");
+          if (recContainer) {
+            recContainer.innerHTML = renderRecommendationCard(null, false);
+          }
+        });
+      };
+
+      if (cached) {
+        if (cached.materials && cached.materials.materials) {
+          syncMaterialStateFromList(cached.materials.materials, uid);
         }
-        masteryData = (mRes && mRes.concepts) ? mRes.concepts : [];
-        recData = rRes || { actions: [] };
-        AppState.masteryList = masteryData;
-        AppState.recommendations = recData.actions || [];
-        if (lRes) {
-          loopStatus = lRes;
-          AppState.loopStatus = lRes;
-          AppState.baselineCompleted = Boolean(lRes.baseline_completed);
-        } else if (!dashboardError) {
-          const totalAttempts = masteryData.reduce((acc, c) => acc + (c.attempts || 0), 0);
-          const localDone = (localStorage.getItem(`cm_baseline_${getCurrentUserId()}`) === "true");
-          const isDone = localDone || totalAttempts >= 3;
-          AppState.baselineCompleted = isDone;
-          loopStatus = {
-            loop_state: isDone ? "ACTIVE_LOOP" : (masteryData.length ? "BASELINE_DIAGNOSTIC" : "UNINITIALIZED"),
-            material_ready: masteryData.length > 0,
-            baseline_completed: isDone
-          };
+        if (cached.mastery && Array.isArray(cached.mastery.concepts)) {
+          masteryData = cached.mastery.concepts;
+          AppState.masteryList = masteryData;
+        }
+        if (cached.loopStatus) {
+          loopStatus = cached.loopStatus;
+          AppState.loopStatus = loopStatus;
+          AppState.baselineCompleted = Boolean(loopStatus.baseline_completed);
+        }
+        if (cached.rec && Array.isArray(cached.rec.actions) && cached.rec.actions.length > 0) {
+          topRec = cached.rec.actions[0];
+          AppState.recommendations = cached.rec.actions;
+          isRecPending = false;
+        }
+        if (cached.notes) {
+          AppState.smartNotes.savedNotes = Array.isArray(cached.notes) ? cached.notes : (cached.notes.notes || []);
+        }
+
+        // Silently revalidate in background without blocking perceived load
+        summaryPromise.then((summary) => {
+          if (signal && signal.aborted) return;
+          if (AppState.currentRoute !== "dashboard") return;
+
+          let hasChange = false;
+          if (summary.materials) {
+            syncMaterialStateFromList(summary.materials, uid);
+          }
+          if (summary.concepts) {
+            const freshConcepts = summary.concepts;
+            if (JSON.stringify(freshConcepts) !== JSON.stringify(AppState.masteryList)) {
+              AppState.masteryList = freshConcepts;
+              hasChange = true;
+            }
+          }
+          if (summary.loop_status) {
+            if (JSON.stringify(summary.loop_status) !== JSON.stringify(AppState.loopStatus)) {
+              AppState.loopStatus = summary.loop_status;
+              AppState.baselineCompleted = Boolean(summary.loop_status.baseline_completed);
+              hasChange = true;
+            }
+          }
+          if (summary.notes) {
+            AppState.smartNotes.savedNotes = summary.notes;
+          }
+          if (summary.recommendations) {
+            AppState.recommendations = summary.recommendations;
+          }
+
+          if (hasChange && $("#view")) {
+            const currentRec = AppState.recommendations && AppState.recommendations.length > 0 ? AppState.recommendations[0] : null;
+            $("#view").innerHTML = renderDashboard({
+              masteryData: AppState.masteryList,
+              loopStatus: AppState.loopStatus || loopStatus,
+              topRec: currentRec,
+              isRecPending: false
+            });
+            renderMath($("#view"));
+            AfterRender.dashboard();
+          }
+        }).catch(() => {});
+
+        wireAsyncRecommendation(recPromise);
+        return renderDashboard({
+          masteryData,
+          loopStatus,
+          topRec,
+          isRecPending
+        });
+      }
+
+      // Cold load without cached data: await single batched summary round-trip
+      let dashboardError = null;
+      try {
+        const summary = await summaryPromise;
+        if (summary.materials) {
+          syncMaterialStateFromList(summary.materials, uid);
+        }
+        if (summary.concepts) {
+          masteryData = summary.concepts;
+          AppState.masteryList = masteryData;
+        }
+        if (summary.loop_status) {
+          loopStatus = summary.loop_status;
+          AppState.loopStatus = loopStatus;
+          AppState.baselineCompleted = Boolean(loopStatus.baseline_completed);
+        }
+        if (summary.notes) {
+          AppState.smartNotes.savedNotes = summary.notes;
+        }
+        if (summary.recommendations && summary.recommendations.length > 0) {
+          AppState.recommendations = summary.recommendations;
+          topRec = summary.top_recommendation || summary.recommendations[0];
+          isRecPending = false;
+        } else {
+          isRecPending = true;
         }
       } catch (err) {
         rethrowIfAbort(err);
         dashboardError = err;
-        reportBackendError("Failed fetching dashboard data", err);
+        reportBackendError("Failed fetching dashboard data", dashboardError);
       }
 
       if (dashboardError && masteryData.length === 0) {
-        return `
-          <div class="page-header">
-            <div class="page-header-text">
-              <h1>Welcome back, ${esc(AppState.studentName)}!</h1>
-              <p>Your closed-loop epistemic learning platform.</p>
-            </div>
-          </div>
-          <div class="empty-state-card">
-            <h3 class="empty-state-title" style="color:var(--color-danger);">Backend Unavailable</h3>
-            <p class="empty-state-desc">${esc(dashboardError.message || "Could not load dashboard metrics from the backend.")}</p>
-            <button type="button" class="btn btn-primary" onclick="location.reload()">Retry Connection</button>
-          </div>
-        `;
+        return renderDashboard({ dashboardError, masteryData: [] });
       }
 
-      const totalConcepts = masteryData.length;
-      const strongCount = masteryData.filter(c => getConceptStatus(c) === "strong").length;
-      const weakCount = masteryData.filter(c => getConceptStatus(c) === "weak").length;
-      const unknownCount = masteryData.filter(c => getConceptStatus(c) === "unknown").length;
-
-      const avgScore = totalConcepts > 0
-        ? Math.round((masteryData.reduce((acc, c) => acc + (c.attempts > 0 ? (c.score || 0) : 0), 0) / totalConcepts) * 100)
-        : 0;
-
-      const topRec = recData.actions && recData.actions.length > 0 ? recData.actions[0] : null;
-
-      // ── Empty-State Gating: No study materials uploaded ──────────────────
-      if (totalConcepts === 0) {
-        return `
-          <div class="page-header">
-            <div class="page-header-text">
-              <h1>Welcome back, ${esc(AppState.studentName)}! 👋</h1>
-              <p>Your closed-loop epistemic learning platform.</p>
-            </div>
-            <div class="page-header-actions">
-              <button class="btn btn-secondary btn-disabled-gated" disabled title="Upload study material first to unlock quizzes">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-                Start Quick Quiz
-              </button>
-            </div>
-          </div>
-
-          <div class="empty-state-card">
-            <div class="empty-state-icon">
-              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/>
-                <path d="M12 12v9"/>
-                <path d="m16 16-4-4-4 4"/>
-              </svg>
-            </div>
-            <h3 class="empty-state-title">No Study Material Uploaded Yet</h3>
-            <p class="empty-state-desc">
-              No study material uploaded yet. Upload a PDF, lecture slides, YouTube link, or notes in the Study Material tab to generate your custom learning path.
-            </p>
-            <a href="#upload" class="btn btn-primary" style="margin-top:0.5rem;">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-              Upload Study Material &rarr;
-            </a>
-          </div>
-        `;
+      if (isRecPending) {
+        wireAsyncRecommendation(recPromise);
       }
 
-      // ── Baseline Diagnostic Gating Check ─────────────────────────────────
-      const isBaselineDiagnosticActive = (loopStatus.loop_state === "BASELINE_DIAGNOSTIC" || !loopStatus.baseline_completed);
-
-      return `
-        <div class="page-header">
-          <div class="page-header-text">
-            <h1>Welcome back, ${esc(AppState.studentName)}! 👋</h1>
-            <p>Let's continue your closed-loop learning journey.</p>
-          </div>
-          <div class="page-header-actions">
-            ${isBaselineDiagnosticActive ? `
-              <button class="btn btn-secondary btn-disabled-gated" disabled title="Complete your Step 1 Baseline Diagnostic first">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-                Start Quick Quiz (Complete Baseline First)
-              </button>
-            ` : `
-              <a href="#practice" class="btn btn-primary">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-                Start Quick Quiz
-              </a>
-            `}
-          </div>
-        </div>
-
-        ${isBaselineDiagnosticActive ? `
-          <!-- Step 1: First-Run Baseline Diagnostic CTA Banner -->
-          <div class="diagnostic-cta-banner" id="baseline-diagnostic-banner">
-            <div>
-              <div class="diagnostic-badge-pill">Step 1 · Initial Knowledge Mapping</div>
-              <h2 class="diagnostic-title">Take Your Baseline Diagnostic Quiz</h2>
-              <p class="diagnostic-desc">
-                Answer 6 quick diagnostic questions to baseline what you already know and unlock your active learning path.
-              </p>
-            </div>
-            <button id="btn-start-baseline-diagnostic" class="btn btn-primary" style="background:#ffffff; color:#1e3a8a; border:none; font-weight:700;">
-              Start Baseline Diagnostic &rarr;
-            </button>
-          </div>
-        ` : ''}
-
-        <!-- Hero Section Grid -->
-        <div class="grid grid-dashboard-hero">
-          <!-- Card 1: Visual Learning Progress -->
-          <div class="card progress-hero-card">
-            <h3 style="margin-bottom: 1.25rem; font-size: 1.15rem;">Your Learning Progress</h3>
-            <div class="hero-content-split">
-              <div class="donut-chart-container">
-                ${createDonutSvg(avgScore, 130, 11, "#3b82f6")}
-                <div class="donut-chart-value">
-                  <span class="val-number" style="color:#ffffff;">${avgScore}%</span>
-                  <span class="val-label" style="color:#cbd5e1;">Mastery</span>
-                </div>
-              </div>
-
-              <div class="hero-stats-breakdown">
-                <div class="hero-metric-legend">
-                  <div class="metric-legend-item">
-                    <div class="metric-legend-tag">
-                      <span class="legend-dot strong"></span>
-                      <span>Strong Concepts</span>
-                    </div>
-                    <span class="metric-legend-num">${strongCount} (${totalConcepts ? Math.round((strongCount/totalConcepts)*100) : 0}%)</span>
-                  </div>
-                  <div class="metric-legend-item">
-                    <div class="metric-legend-tag">
-                      <span class="legend-dot weak"></span>
-                      <span>Weak Concepts</span>
-                    </div>
-                    <span class="metric-legend-num">${weakCount} (${totalConcepts ? Math.round((weakCount/totalConcepts)*100) : 0}%)</span>
-                  </div>
-                  <div class="metric-legend-item">
-                    <div class="metric-legend-tag">
-                      <span class="legend-dot unknown"></span>
-                      <span>Unknown Concepts</span>
-                    </div>
-                    <span class="metric-legend-num">${unknownCount} (${totalConcepts ? Math.round((unknownCount/totalConcepts)*100) : 0}%)</span>
-                  </div>
-                </div>
-
-                <div style="margin-top:0.5rem;">
-                  <a href="#learning-path" class="btn btn-secondary btn-sm" style="background:rgba(255,255,255,0.15); color:#fff; border-color:rgba(255,255,255,0.25);">
-                    Continue Learning &rarr;
-                  </a>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <!-- Card 2: Proactive Recommendation -->
-          <div class="card recommendation-card">
-            <div>
-              <div class="rec-header-badge">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5"/><path d="M9 18h6"/><path d="M10 22h4"/></svg>
-                <span>Next Recommendation</span>
-              </div>
-              <h3 class="rec-concept-name">
-                ${topRec ? esc(topRec.type) + ": " + esc(topRec.name) : "Ready to Learn"}
-              </h3>
-              <div class="rec-reason-box">
-                ${topRec ? esc(topRec.reason) : "Upload study material to generate personalized concept recommendations."}
-              </div>
-            </div>
-
-            <div style="display:flex; gap:0.65rem;">
-              ${topRec ? `
-                <a href="#practice" data-target-concept="${esc(topRec.conceptId)}" class="btn btn-primary start-target-quiz start-remedial-review">
-                  Start Review &rarr;
-                </a>
-                <a href="#tutor" class="btn btn-secondary">
-                  Ask Tutor
-                </a>
-              ` : `
-                <a href="#upload" class="btn btn-primary">
-                  Upload PDF &rarr;
-                </a>
-              `}
-            </div>
-          </div>
-        </div>
-
-        <!-- Learning Journey Workflow Stepper -->
-        <div class="card journey-card">
-          <div class="card-header">
-            <h3 class="card-title">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-              Your Learning Journey
-            </h3>
-            <a href="#learning-path" class="btn btn-outline btn-sm">View Full Path &rarr;</a>
-          </div>
-
-          <div class="journey-pipeline">
-            <div class="journey-step ${AppState.activeDoc && AppState.activeDoc.ready ? 'completed' : 'active'}" data-nav="upload">
-              <div class="step-circle">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-              </div>
-              <span class="step-label">1. Upload<br>Material</span>
-            </div>
-
-            <div class="journey-step ${totalConcepts > 0 ? 'completed' : ''}" data-nav="learning-path">
-              <div class="step-circle">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
-              </div>
-              <span class="step-label">2. Learn<br>Concepts</span>
-            </div>
-
-            <div class="journey-step ${!isBaselineDiagnosticActive ? 'completed' : 'active'}" data-nav="practice">
-              <div class="step-circle">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></svg>
-              </div>
-              <span class="step-label">3. Take<br>Quiz</span>
-            </div>
-
-            <div class="journey-step ${weakCount > 0 ? 'active' : ''}" data-nav="progress">
-              <div class="step-circle">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
-              </div>
-              <span class="step-label">4. Review<br>Weak Topics</span>
-            </div>
-
-            <div class="journey-step ${strongCount >= totalConcepts && totalConcepts > 0 ? 'completed' : ''}" data-nav="progress">
-              <div class="step-circle">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
-              </div>
-              <span class="step-label">5. Master<br>Concept</span>
-            </div>
-          </div>
-        </div>
-
-        <!-- Concept Progress Quick Glance -->
-        <div class="card" style="margin-top: 1.5rem;">
-          <div class="card-header">
-            <h3 class="card-title">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
-              Concept Mastery Status
-            </h3>
-            <a href="#progress" class="btn btn-outline btn-sm">Full Analytics &rarr;</a>
-          </div>
-
-          <div class="concept-preview-list">
-            ${masteryData.slice(0, 5).map(c => {
-              const badge = renderOutcomeBadge(c);
-              return `
-                <div class="concept-preview-item" style="display:flex; justify-content:space-between; align-items:center; padding:0.85rem 0; border-bottom:1px solid var(--border-subtle);">
-                  <div class="concept-preview-left">
-                    <span class="concept-preview-name" style="font-weight:600; font-size:0.95rem;">${esc(c.name)}</span>
-                    <span class="concept-preview-stats" style="font-size:0.8rem; color:var(--ink-secondary); display:block; margin-top:0.2rem;">${c.attempts || 0} interaction(s) · Multi-Agent Pedagogical Assessment</span>
-                  </div>
-                  <div style="display:flex; align-items:center; gap:0.65rem;">
-                    ${badge}
-                    <button class="btn btn-outline btn-sm btn-inspect-deliberation" data-concept-id="${esc(c.id)}" data-concept-name="${esc(c.name)}" title="Inspect Multi-Agent Deliberation">
-                      Inspect Deliberation
-                    </button>
-                    <a href="#practice" data-target-concept="${esc(c.id)}" class="btn btn-secondary btn-sm start-target-quiz">Quiz</a>
-                  </div>
-                </div>
-              `;
-            }).join("")}
-          </div>
-        </div>
-      `;
+      return renderDashboard({
+        masteryData,
+        loopStatus,
+        topRec,
+        isRecPending
+      });
     },
+    loadDashboard,
+    renderDashboard,
 
     // -----------------------------------------------------------------------
     // B. STUDY MATERIAL / UPLOAD VIEW
@@ -2292,13 +2593,13 @@
               <div style="display:flex; flex-direction:column; gap:1rem;">
                 <div>
                   <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.4rem;">Source URL</label>
-                  <input type="url" id="input-material-url" class="form-control" placeholder="https://www.youtube.com/watch?v=... or https://www.geeksforgeeks.org/..." style="width:100%; padding:0.65rem 0.85rem; border:1px solid var(--border-subtle); border-radius:var(--radius-sm); font-size:0.9rem;">
+                  <input type="url" id="input-material-url" class="form-control" placeholder="https://www.youtube.com/watch?v=... or https://www.geeksforgeeks.org/..." style="width:100%; padding:0.65rem 0.85rem; border:1px solid var(--border-input); border-radius:var(--radius-sm); font-size:0.9rem; background:var(--surface-input); color:var(--ink-input);">
                 </div>
 
                 <div class="grid grid-cols-2" style="gap:0.75rem;">
                   <div>
                     <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.4rem;">Source Type</label>
-                    <select id="select-url-type" class="form-control" style="width:100%; padding:0.65rem; border:1px solid var(--border-subtle); border-radius:var(--radius-sm); font-size:0.88rem;">
+                    <select id="select-url-type" class="form-control" style="width:100%; padding:0.65rem; border:1px solid var(--border-input); border-radius:var(--radius-sm); font-size:0.88rem; background:var(--surface-input); color:var(--ink-input);">
                       <option value="auto">Auto-Detect</option>
                       <option value="youtube">YouTube Video</option>
                       <option value="web">Educational Website / Article</option>
@@ -2306,7 +2607,7 @@
                   </div>
                   <div>
                     <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.4rem;">Custom Title (Optional)</label>
-                    <input type="text" id="input-url-title" class="form-control" placeholder="e.g. Backpropagation Lecture" style="width:100%; padding:0.65rem 0.85rem; border:1px solid var(--border-subtle); border-radius:var(--radius-sm); font-size:0.88rem;">
+                    <input type="text" id="input-url-title" class="form-control" placeholder="e.g. Backpropagation Lecture" style="width:100%; padding:0.65rem 0.85rem; border:1px solid var(--border-input); border-radius:var(--radius-sm); font-size:0.88rem; background:var(--surface-input); color:var(--ink-input);">
                   </div>
                 </div>
 
@@ -2714,7 +3015,7 @@
           </div>
           <div class="page-header-actions" style="display:flex; align-items:center; gap:0.6rem;">
             <label for="recall-concept-select" style="font-size:0.85rem; font-weight:600; color:var(--ink-secondary);">Concept:</label>
-            <select id="recall-concept-select" class="form-select" style="padding:0.45rem 0.85rem; border-radius:var(--radius-sm); border:1px solid var(--border-subtle); background:var(--surface); font-size:0.88rem; font-weight:600; color:var(--ink-primary); cursor:pointer;">
+            <select id="recall-concept-select" class="form-select" style="padding:0.45rem 0.85rem; border-radius:var(--radius-sm); border:1px solid var(--border-input); background:var(--surface-input); font-size:0.88rem; font-weight:600; color:var(--ink-input); cursor:pointer;">
               ${conceptSelectHtml}
             </select>
           </div>
@@ -2934,7 +3235,7 @@
               <label for="custom-instructions-input" style="display:block; font-size:0.86rem; font-weight:600; margin-bottom:0.35rem; color:var(--ink-primary);">
                 Custom Instructions &amp; Guidance:
               </label>
-              <textarea id="custom-instructions-input" rows="2" class="form-input" style="width:100%; border-radius:var(--radius-md); padding:0.65rem; font-family:inherit; font-size:0.9rem;" placeholder="E.g., Include asymptotic runtime proof, emphasize recursion tree diagrams, and add boundary condition traps...">${esc(AppState.smartNotes.customInstructions || '')}</textarea>
+              <textarea id="custom-instructions-input" rows="2" class="form-input" style="width:100%; border-radius:var(--radius-md); padding:0.65rem; font-family:inherit; font-size:0.9rem; border:1px solid var(--border-input); background:var(--surface-input); color:var(--ink-input);" placeholder="E.g., Include asymptotic runtime proof, emphasize recursion tree diagrams, and add boundary condition traps...">${esc(AppState.smartNotes.customInstructions || '')}</textarea>
             </div>
 
             <!-- Step 2: Concept Selector & Generation Button -->
@@ -2943,7 +3244,7 @@
                 <label for="smart-notes-concept-select" style="font-size:0.88rem; font-weight:600; color:var(--ink-secondary);">
                   Target Concept:
                 </label>
-                <select id="smart-notes-concept-select" class="form-input" style="min-width:240px; padding:0.55rem 0.85rem; border-radius:var(--radius-md); font-weight:600;">
+                <select id="smart-notes-concept-select" class="form-input" style="min-width:240px; padding:0.55rem 0.85rem; border-radius:var(--radius-md); font-weight:600; border:1px solid var(--border-input); background:var(--surface-input); color:var(--ink-input);">
                   ${conceptsList.map(c => `
                     <option value="${esc(c.id)}" ${c.id === AppState.smartNotes.selectedConceptId ? 'selected' : ''}>
                       ${esc(c.label)}
@@ -2990,10 +3291,10 @@
                 <span style="font-size:0.86rem; font-weight:700; color:var(--primary); white-space:nowrap;">
                   🎧 Spoken Summary:
                 </span>
-                <audio controls src="${esc(ApiService.getArtifactUrl(activeNote.audio_url || AppState.smartNotes.activeAudioUrl || ''))}" style="flex:1; height:36px;" id="note-audio-element"></audio>
-                <a href="${esc(ApiService.getArtifactUrl(activeNote.audio_url || AppState.smartNotes.activeAudioUrl || ''))}" download class="btn btn-xs btn-outline" style="white-space:nowrap;">
-                  Save MP3
-                </a>
+                <audio controls src="${esc(AppState.smartNotes.activeAudioBlobUrl || ApiService.getArtifactUrl(activeNote.audio_url || AppState.smartNotes.activeAudioUrl || ''))}" style="flex:1; height:36px;" id="note-audio-element"></audio>
+                <button type="button" class="btn btn-xs btn-outline" style="white-space:nowrap;" id="btn-save-note-mp3">
+                  ${(activeNote.audio_url || AppState.smartNotes.activeAudioUrl || '').toLowerCase().endsWith('.wav') || AppState.smartNotes.activeAudioMediaType === 'audio/wav' ? 'Save WAV' : 'Save MP3'}
+                </button>
               </div>
 
               <!-- Inline Diagram SVG Container -->
@@ -3002,7 +3303,7 @@
                   <strong style="font-size:0.9rem; color:var(--ink-primary);">🖼️ Concept Flow Diagram</strong>
                   <span style="font-size:0.75rem; color:var(--ink-muted);">Interactive SVG</span>
                 </div>
-                <div id="note-diagram-inner" style="max-height:380px; overflow:auto;">
+                <div id="note-diagram-inner" style="min-height:280px; padding:16px; overflow-x:auto;">
                   ${AppState.smartNotes.diagramSvg || ''}
                 </div>
               </div>
@@ -3128,7 +3429,7 @@
           </div>
           <div class="page-header-actions" style="display:flex; align-items:center; gap:0.6rem;">
             <label for="practice-topic-select" style="font-size:0.85rem; font-weight:600; color:var(--ink-secondary);">Topic:</label>
-            <select id="practice-topic-select" class="form-select" style="padding:0.45rem 0.85rem; border-radius:var(--radius-sm); border:1px solid var(--border-subtle); background:var(--surface); font-size:0.88rem; font-weight:600; color:var(--ink-primary); cursor:pointer;">
+            <select id="practice-topic-select" class="form-select" style="padding:0.45rem 0.85rem; border-radius:var(--radius-sm); border:1px solid var(--border-input); background:var(--surface-input); font-size:0.88rem; font-weight:600; color:var(--ink-input); cursor:pointer;">
               <option value="">🎯 Auto-Adaptive (All Concepts)</option>
               ${conceptOptions}
             </select>
@@ -3541,7 +3842,7 @@
             <div style="display:flex; flex-direction:column; gap:1.25rem;">
               <div>
                 <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.4rem;">Student Name</label>
-                <input type="text" id="setting-student-name" value="${esc(AppState.studentName)}" style="padding:0.65rem 0.85rem; border:1px solid var(--border-subtle); border-radius:var(--radius-md); width:100%; background:var(--surface-subtle); color:var(--ink-primary);">
+                <input type="text" id="setting-student-name" value="${esc(AppState.studentName)}" style="padding:0.65rem 0.85rem; border:1px solid var(--border-input); border-radius:var(--radius-md); width:100%; background:var(--surface-input); color:var(--ink-input);">
               </div>
 
               <div>
@@ -3569,7 +3870,7 @@
 
               <div>
                 <label style="display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.4rem;">Backend Base URL</label>
-                <input type="text" id="setting-backend-base" value="${esc(conf.base)}" placeholder="e.g. http://localhost:8000 (empty for same host)" style="padding:0.65rem 0.85rem; border:1px solid var(--border-subtle); border-radius:var(--radius-md); width:100%; background:var(--surface-subtle); color:var(--ink-primary);">
+                <input type="text" id="setting-backend-base" value="${esc(conf.base)}" placeholder="e.g. http://localhost:8000 (empty for same host)" style="padding:0.65rem 0.85rem; border:1px solid var(--border-input); border-radius:var(--radius-md); width:100%; background:var(--surface-input); color:var(--ink-input);">
               </div>
 
               <div style="display:flex; align-items:center; gap:0.6rem;">
@@ -4652,27 +4953,83 @@
         const audioBtn = $("#btn-note-audio");
         const playerBox = $("#note-audio-player-box");
         const audioElement = $("#note-audio-element");
+        const saveMp3Btn = $("#btn-save-note-mp3");
+
+        const wireSaveAudio = (downloadUrl, filename, ext = "mp3") => {
+          if (!saveMp3Btn) return;
+          saveMp3Btn.innerText = ext === "wav" ? "Save WAV" : "Save MP3";
+          saveMp3Btn.onclick = async (e) => {
+            e.preventDefault();
+            try {
+              await triggerBrowserDownload(downloadUrl, filename);
+              showToast(`Spoken summary ${ext.toUpperCase()} downloaded!`, "success");
+            } catch (err) {
+              showToast(`${ext.toUpperCase()} download failed: ${err.message}`, "danger");
+            }
+          };
+        };
+
+        if (saveMp3Btn && (AppState.smartNotes.activeAudioBlobUrl || activeNote.audio_url || AppState.smartNotes.activeAudioUrl)) {
+          const initUrl = AppState.smartNotes.activeAudioBlobUrl || ApiService.getArtifactUrl(activeNote.audio_url || AppState.smartNotes.activeAudioUrl);
+          const safeConcept = (activeNote.concept_id || 'Note').replace(/[^\w-]/g, '_');
+          const isInitWav = (activeNote.audio_url || AppState.smartNotes.activeAudioUrl || "").toLowerCase().endsWith(".wav") || AppState.smartNotes.activeAudioMediaType === "audio/wav";
+          const initExt = isInitWav ? "wav" : "mp3";
+          wireSaveAudio(initUrl, `Audio_${safeConcept}_${activeNote.note_id || 'Summary'}.${initExt}`, initExt);
+        }
 
         if (audioBtn) {
           audioBtn.onclick = () => withButtonLock(audioBtn, async () => {
             try {
               const res = await ApiService.generateNoteAudio(activeNote.note_id, getCurrentUserId());
-              const audioUrl = ApiService.getArtifactUrl(res.audio_url || (activeNote.note_id ? `/api/artifacts/audio_${activeNote.note_id}.mp3` : ""));
-              AppState.smartNotes.activeAudioUrl = audioUrl;
+              const audioPath = res.audio_url || (activeNote.note_id ? `/api/artifacts/audio_${activeNote.note_id}.mp3` : "");
+              if (!audioPath) {
+                throw new Error("No audio URL returned by the server.");
+              }
+
+              // Fetch the audio stream and verify response.ok and non-empty stream
+              const audioBlob = await ApiService.fetchAudioBlob(audioPath);
+              const blobUrl = URL.createObjectURL(audioBlob);
+
+              const isWav = audioPath.toLowerCase().endsWith(".wav") ||
+                res.media_type === "audio/wav" ||
+                (audioBlob && audioBlob.type === "audio/wav");
+              const ext = isWav ? "wav" : "mp3";
+              AppState.smartNotes.activeAudioMediaType = isWav ? "audio/wav" : "audio/mpeg";
+
+              AppState.smartNotes.activeAudioUrl = audioPath;
+              AppState.smartNotes.activeAudioBlobUrl = blobUrl;
 
               if (playerBox) playerBox.classList.add("visible");
               if (audioElement) {
-                audioElement.src = audioUrl;
+                audioElement.src = blobUrl;
+                if (typeof audioElement.load === "function") {
+                  audioElement.load();
+                }
                 audioElement.play().catch(() => {});
               }
-              showToast("ElevenLabs audio summary ready!", "success");
-              audioBtn.innerHTML = "🎧 Audio Ready";
+
+              const safeConcept = (activeNote.concept_id || 'Note').replace(/[^\w-]/g, '_');
+              wireSaveAudio(blobUrl, `Audio_${safeConcept}_${activeNote.note_id || 'Summary'}.${ext}`, ext);
+
+              const provider = (res.provider_used || "").toLowerCase();
+              let engineLabel = "🎧 Audio Ready";
+              if (provider === "gemini") {
+                engineLabel = "🎧 Audio Ready (Gemini TTS)";
+              } else if (provider === "groq") {
+                engineLabel = "🎧 Audio Ready (Groq TTS)";
+              } else if (provider === "elevenlabs") {
+                engineLabel = "🎧 Audio Ready (ElevenLabs)";
+              } else if (provider === "local_fallback" || provider === "fallback") {
+                engineLabel = "🎧 Audio Ready (Fallback)";
+              }
+              showToast(`Audio summary ready (${provider ? provider.toUpperCase() : 'TTS'})!`, "success");
+              audioBtn.innerHTML = engineLabel;
             } catch (err) {
               showToast(`Audio generation failed: ${err.message}`, "danger");
               return false;
             }
           }, {
-            loadingHtml: "🎧 Synthesizing Flash Audio...",
+            loadingHtml: "🎧 Synthesizing Audio...",
             preserveLabelOnSuccess: true
           });
         }
@@ -4682,9 +5039,18 @@
         if (pdfBtn) {
           pdfBtn.onclick = () => withButtonLock(pdfBtn, async () => {
             try {
-              const res = await ApiService.exportNoteArtifact(activeNote.note_id, "pdf", getCurrentUserId());
+              const res = await ApiService.exportNoteArtifact(
+                activeNote.note_id,
+                "pdf",
+                getCurrentUserId(),
+                {
+                  markdown_content: activeNote.markdown_content || "",
+                  title: activeNote.title || "",
+                  concept_id: activeNote.concept_id || ""
+                }
+              );
               const pdfUrl = ApiService.getArtifactUrl(res.pdf_url || res.url || res.download_url || "");
-              triggerBrowserDownload(pdfUrl, `Note_${activeNote.concept_id}_${activeNote.note_id}.pdf`);
+              await triggerBrowserDownload(pdfUrl, `Note_${activeNote.concept_id}_${activeNote.note_id}.pdf`);
               showToast("PDF handout downloaded!", "success");
             } catch (err) {
               showToast(`PDF export failed: ${err.message}`, "danger");
@@ -4697,9 +5063,18 @@
         if (pptxBtn) {
           pptxBtn.onclick = () => withButtonLock(pptxBtn, async () => {
             try {
-              const res = await ApiService.exportNoteArtifact(activeNote.note_id, "pptx", getCurrentUserId());
+              const res = await ApiService.exportNoteArtifact(
+                activeNote.note_id,
+                "pptx",
+                getCurrentUserId(),
+                {
+                  markdown_content: activeNote.markdown_content || "",
+                  title: activeNote.title || "",
+                  concept_id: activeNote.concept_id || ""
+                }
+              );
               const pptxUrl = ApiService.getArtifactUrl(res.pptx_url || res.url || res.download_url || "");
-              triggerBrowserDownload(pptxUrl, `Deck_${activeNote.concept_id}_${activeNote.note_id}.pptx`);
+              await triggerBrowserDownload(pptxUrl, `Deck_${activeNote.concept_id}_${activeNote.note_id}.pptx`);
               showToast("PPTX slide deck downloaded!", "success");
             } catch (err) {
               showToast(`PPTX export failed: ${err.message}`, "danger");
@@ -4714,15 +5089,41 @@
 
         if (diagramBtn) {
           diagramBtn.onclick = () => withButtonLock(diagramBtn, async () => {
+            if (diagramBox) diagramBox.style.display = "block";
+            if (diagramInner) {
+              diagramInner.style.minHeight = "280px";
+              diagramInner.style.padding = "16px";
+              diagramInner.style.overflowX = "auto";
+              diagramInner.innerHTML = `
+                <div style="min-height:240px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; color:var(--ink-secondary);">
+                  <div class="spinner" style="width:36px; height:36px; border:3px solid rgba(56,189,248,0.2); border-top-color:#38bdf8; border-radius:50%; animation:spin 0.8s linear infinite;"></div>
+                  <div style="font-size:0.9rem; font-weight:600; color:var(--ink-primary);">Rendering Concept Flow Diagram...</div>
+                  <div style="font-size:0.8rem; color:var(--ink-muted);">Synthesizing interactive SVG grounded in course materials</div>
+                </div>
+              `;
+            }
             try {
               const res = await ApiService.generateToolArtifact("visual", activeNote.concept_id, "", 5, getCurrentUserId());
-              const svgContent = res.svg || res.code || (res.download_url ? `<img src="${esc(ApiService.getArtifactUrl(res.download_url))}" style="max-width:100%;" />` : "");
+              const svgContent = res.svg || res.code || res.svg_or_mermaid_code || (res.download_url ? `<img src="${esc(ApiService.getArtifactUrl(res.download_url))}" style="max-width:100%; height:auto;" />` : "");
+              if (!svgContent) {
+                throw new Error("No SVG diagram returned by the server.");
+              }
               AppState.smartNotes.diagramSvg = svgContent;
 
-              if (diagramBox) diagramBox.style.display = "block";
-              if (diagramInner) diagramInner.innerHTML = svgContent;
+              if (diagramInner) {
+                diagramInner.innerHTML = svgContent;
+              }
               showToast("SVG Architecture diagram embedded!", "success");
             } catch (err) {
+              if (diagramInner) {
+                diagramInner.innerHTML = `
+                  <div style="min-height:180px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px; color:var(--color-danger); text-align:center; padding:1.5rem;">
+                    <div style="font-size:1.5rem;">⚠️</div>
+                    <div style="font-size:0.9rem; font-weight:600;">Failed to render concept diagram</div>
+                    <div style="font-size:0.8rem; color:var(--ink-muted);">${esc(err.message)}</div>
+                  </div>
+                `;
+              }
               showToast(`Diagram generation failed: ${err.message}`, "danger");
             }
           }, { loadingHtml: "🖼️ Rendering Diagram..." });
@@ -4765,29 +5166,75 @@
           const noteId = btn.getAttribute("data-id");
           const existingUrl = btn.getAttribute("data-url");
           if (existingUrl) {
-            const url = ApiService.getArtifactUrl(existingUrl);
-            const playerBox = $("#note-audio-player-box");
-            const audioElement = $("#note-audio-element");
-            if (playerBox) playerBox.classList.add("visible");
-            if (audioElement) {
-              audioElement.src = url;
-              audioElement.play().catch(() => {});
+            try {
+              const audioBlob = await ApiService.fetchAudioBlob(existingUrl);
+              const blobUrl = URL.createObjectURL(audioBlob);
+              const isWav = existingUrl.toLowerCase().endsWith(".wav") || (audioBlob && audioBlob.type === "audio/wav");
+              const ext = isWav ? "wav" : "mp3";
+              const playerBox = $("#note-audio-player-box");
+              const audioElement = $("#note-audio-element");
+              const saveMp3Btn = $("#btn-save-note-mp3");
+              if (playerBox) playerBox.classList.add("visible");
+              if (audioElement) {
+                audioElement.src = blobUrl;
+                if (typeof audioElement.load === "function") {
+                  audioElement.load();
+                }
+                audioElement.play().catch(() => {});
+              }
+              if (saveMp3Btn) {
+                saveMp3Btn.innerText = ext === "wav" ? "Save WAV" : "Save MP3";
+                saveMp3Btn.onclick = async (e) => {
+                  e.preventDefault();
+                  await triggerBrowserDownload(blobUrl, `Audio_Saved_${noteId}.${ext}`);
+                };
+              }
+              showToast("Playing saved audio executive summary!", "info");
+            } catch (err) {
+              showToast(`Failed to load audio: ${err.message}`, "danger");
             }
-            showToast("Playing saved audio executive summary!", "info");
           } else {
             await withButtonLock(btn, async () => {
               try {
                 const res = await ApiService.generateNoteAudio(noteId, getCurrentUserId());
-                const url = ApiService.getArtifactUrl(res.audio_url || "");
-                btn.setAttribute("data-url", url);
+                const rawUrl = res.audio_url || "";
+                if (!rawUrl) throw new Error("No audio URL returned");
+                const audioBlob = await ApiService.fetchAudioBlob(rawUrl);
+                const blobUrl = URL.createObjectURL(audioBlob);
+                btn.setAttribute("data-url", rawUrl);
+                const isWav = rawUrl.toLowerCase().endsWith(".wav") || res.media_type === "audio/wav" || (audioBlob && audioBlob.type === "audio/wav");
+                const ext = isWav ? "wav" : "mp3";
                 const playerBox = $("#note-audio-player-box");
                 const audioElement = $("#note-audio-element");
+                const saveMp3Btn = $("#btn-save-note-mp3");
                 if (playerBox) playerBox.classList.add("visible");
                 if (audioElement) {
-                  audioElement.src = url;
+                  audioElement.src = blobUrl;
+                  if (typeof audioElement.load === "function") {
+                    audioElement.load();
+                  }
                   audioElement.play().catch(() => {});
                 }
-                showToast("ElevenLabs audio summary ready!", "success");
+                if (saveMp3Btn) {
+                  saveMp3Btn.innerText = ext === "wav" ? "Save WAV" : "Save MP3";
+                  saveMp3Btn.onclick = async (e) => {
+                    e.preventDefault();
+                    await triggerBrowserDownload(blobUrl, `Audio_Saved_${noteId}.${ext}`);
+                  };
+                }
+                const provider = (res.provider_used || "").toLowerCase();
+                let label = "🎧 Audio";
+                if (provider === "gemini") {
+                  label = "🎧 Audio (Gemini TTS)";
+                } else if (provider === "groq") {
+                  label = "🎧 Audio (Groq TTS)";
+                } else if (provider === "elevenlabs") {
+                  label = "🎧 Audio (ElevenLabs)";
+                } else if (provider === "local_fallback" || provider === "fallback") {
+                  label = "🎧 Audio (Fallback)";
+                }
+                btn.innerHTML = label;
+                showToast(`Audio summary ready (${provider ? provider.toUpperCase() : 'TTS'})!`, "success");
               } catch (err) {
                 showToast(`Audio synthesis failed: ${err.message}`, "danger");
               }
@@ -4799,44 +5246,54 @@
       $$(".btn-pdf-saved-note").forEach(btn => {
         btn.onclick = async () => {
           const noteId = btn.getAttribute("data-id");
-          const existingUrl = btn.getAttribute("data-url");
-          if (existingUrl) {
-            triggerBrowserDownload(ApiService.getArtifactUrl(existingUrl), `Note_${noteId}.pdf`);
-          } else {
-            await withButtonLock(btn, async () => {
-              try {
-                const res = await ApiService.exportNoteArtifact(noteId, "pdf", getCurrentUserId());
-                const url = ApiService.getArtifactUrl(res.pdf_url || res.url || "");
-                btn.setAttribute("data-url", url);
-                triggerBrowserDownload(url, `Note_${noteId}.pdf`);
-                showToast("PDF handout downloaded!", "success");
-              } catch (err) {
-                showToast(`PDF export failed: ${err.message}`, "danger");
-              }
-            }, { loadingText: "Exporting..." });
-          }
+          const noteObj = (AppState.smartNotes.savedNotes || []).find(n => n.note_id === noteId);
+          await withButtonLock(btn, async () => {
+            try {
+              const res = await ApiService.exportNoteArtifact(
+                noteId,
+                "pdf",
+                getCurrentUserId(),
+                {
+                  markdown_content: noteObj?.markdown_content || "",
+                  title: noteObj?.title || "",
+                  concept_id: noteObj?.concept_id || ""
+                }
+              );
+              const url = ApiService.getArtifactUrl(res.pdf_url || res.url || res.download_url || "");
+              btn.setAttribute("data-url", url);
+              await triggerBrowserDownload(url, `Note_${noteObj?.concept_id || noteId}_${noteId}.pdf`);
+              showToast("PDF handout downloaded!", "success");
+            } catch (err) {
+              showToast(`PDF export failed: ${err.message}`, "danger");
+            }
+          }, { loadingText: "Exporting..." });
         };
       });
 
       $$(".btn-pptx-saved-note").forEach(btn => {
         btn.onclick = async () => {
           const noteId = btn.getAttribute("data-id");
-          const existingUrl = btn.getAttribute("data-url");
-          if (existingUrl) {
-            triggerBrowserDownload(ApiService.getArtifactUrl(existingUrl), `Deck_${noteId}.pptx`);
-          } else {
-            await withButtonLock(btn, async () => {
-              try {
-                const res = await ApiService.exportNoteArtifact(noteId, "pptx", getCurrentUserId());
-                const url = ApiService.getArtifactUrl(res.pptx_url || res.url || "");
-                btn.setAttribute("data-url", url);
-                triggerBrowserDownload(url, `Deck_${noteId}.pptx`);
-                showToast("PPTX deck downloaded!", "success");
-              } catch (err) {
-                showToast(`PPTX export failed: ${err.message}`, "danger");
-              }
-            }, { loadingText: "Exporting..." });
-          }
+          const noteObj = (AppState.smartNotes.savedNotes || []).find(n => n.note_id === noteId);
+          await withButtonLock(btn, async () => {
+            try {
+              const res = await ApiService.exportNoteArtifact(
+                noteId,
+                "pptx",
+                getCurrentUserId(),
+                {
+                  markdown_content: noteObj?.markdown_content || "",
+                  title: noteObj?.title || "",
+                  concept_id: noteObj?.concept_id || ""
+                }
+              );
+              const url = ApiService.getArtifactUrl(res.pptx_url || res.url || res.download_url || "");
+              btn.setAttribute("data-url", url);
+              await triggerBrowserDownload(url, `Deck_${noteObj?.concept_id || noteId}_${noteId}.pptx`);
+              showToast("PPTX deck downloaded!", "success");
+            } catch (err) {
+              showToast(`PPTX export failed: ${err.message}`, "danger");
+            }
+          }, { loadingText: "Exporting..." });
         };
       });
 
@@ -5702,14 +6159,27 @@
     const view = $("#view");
     if (!view) return;
 
-    view.innerHTML = `
-      <div style="padding:4rem 2rem; text-align:center; color:var(--ink-muted);">
-        <div class="upload-icon-pulse" style="width:40px; height:40px; margin-bottom:1rem;">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+    // Check if cached data exists to eliminate blocking "Loading ${activeRoute}..."
+    let hasImmediateCache = false;
+    if (activeRoute === "dashboard") {
+      const uid = getCurrentUserId();
+      const cachedSummary = ApiService.getSwr("dashboardSummary", { userId: uid });
+      const cachedMastery = ApiService.getSwr("mastery", { userId: uid });
+      if ((cachedSummary && Array.isArray(cachedSummary.concepts)) || (cachedMastery && Array.isArray(cachedMastery.concepts)) || (AppState.masteryList && AppState.masteryList.length > 0)) {
+        hasImmediateCache = true;
+      }
+    }
+
+    if (!hasImmediateCache) {
+      view.innerHTML = `
+        <div style="padding:4rem 2rem; text-align:center; color:var(--ink-muted);">
+          <div class="upload-icon-pulse" style="width:40px; height:40px; margin-bottom:1rem;">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          </div>
+          Loading ${activeRoute}...
         </div>
-        Loading ${activeRoute}...
-      </div>
-    `;
+      `;
+    }
 
     try {
       const html = await Views[toCamelCase(activeRoute)](controller.signal);
@@ -5790,6 +6260,17 @@
         return;
       }
 
+      const dlLink = e.target.closest("a[download]");
+      if (dlLink) {
+        const href = dlLink.getAttribute("href") || "";
+        if (href && !href.startsWith("blob:") && (href.startsWith("/api/artifacts/") || href.includes("/api/artifacts/") || href.endsWith(".pdf") || href.endsWith(".pptx"))) {
+          e.preventDefault();
+          const filename = dlLink.getAttribute("download") || "";
+          triggerBrowserDownload(href, filename);
+          return;
+        }
+      }
+
       const targetLink = e.target.closest("a[href='#practice'], button.start-target-quiz, a.start-target-quiz");
       if (targetLink) {
         const cid = targetLink.getAttribute("data-target-concept");
@@ -5799,6 +6280,14 @@
         }
       }
     });
+
+    if (typeof window !== "undefined") {
+      window.loadDashboard = loadDashboard;
+      window.renderDashboard = renderDashboard;
+      window.renderRecommendationCard = renderRecommendationCard;
+      window.Views = Views;
+      window.AppState = AppState;
+    }
 
     handleHashChange();
   }

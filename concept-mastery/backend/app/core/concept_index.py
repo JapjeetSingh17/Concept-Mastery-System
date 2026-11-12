@@ -67,8 +67,70 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(
 """
 
 
+_INITIALIZED_DB_PATHS: set[str] = set()
+_INIT_LOCK = threading.Lock()
+
+
+def _ensure_db():
+    current_path = str(INDEX_DB_PATH)
+    if current_path not in _INITIALIZED_DB_PATHS:
+        with _INIT_LOCK:
+            if current_path not in _INITIALIZED_DB_PATHS:
+                config.VECTOR_STORE_PATH.mkdir(parents=True, exist_ok=True)
+                Path(INDEX_DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+                conn = sqlite3.connect(str(INDEX_DB_PATH))
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA foreign_keys=ON")
+                conn.execute("PRAGMA busy_timeout=10000")
+                try:
+                    conn.executescript(_SCHEMA_SQL)
+                    # Migrate existing tables if upgraded without DROP
+                    cols_chunks = [r[1] for r in conn.execute("PRAGMA table_info(chunks)").fetchall()]
+                    for col, col_type, default_val in [
+                        ("user_id", "TEXT", "'default'"),
+                        ("locator_label", "TEXT", "''"),
+                        ("source_id", "TEXT", "''"),
+                        ("source_type", "TEXT", "'pdf'"),
+                        ("source_title", "TEXT", "''"),
+                        ("origin_url_or_filename", "TEXT", "''")
+                    ]:
+                        if col not in cols_chunks:
+                            try:
+                                conn.execute(f"ALTER TABLE chunks ADD COLUMN {col} {col_type} DEFAULT {default_val}")
+                            except Exception:
+                                pass
+                    cols_concept_chunks = [r[1] for r in conn.execute("PRAGMA table_info(concept_chunks)").fetchall()]
+                    for col, col_type, default_val in [
+                        ("user_id", "TEXT", "'default'"),
+                        ("locator_label", "TEXT", "''"),
+                        ("source_type", "TEXT", "'pdf'")
+                    ]:
+                        if col not in cols_concept_chunks:
+                            try:
+                                conn.execute(f"ALTER TABLE concept_chunks ADD COLUMN {col} {col_type} DEFAULT {default_val}")
+                            except Exception:
+                                pass
+
+                    try:
+                        conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_user ON chunks(user_id)")
+                        conn.execute("CREATE INDEX IF NOT EXISTS idx_concept_chunks_user ON concept_chunks(user_id)")
+                    except Exception:
+                        pass
+                    conn.commit()
+                finally:
+                    conn.close()
+                _INITIALIZED_DB_PATHS.add(current_path)
+
+
+def init_db():
+    _ensure_db()
+
+
 @contextmanager
 def get_db():
+    _ensure_db()
     Path(INDEX_DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(INDEX_DB_PATH))
     conn.row_factory = sqlite3.Row
@@ -86,54 +148,18 @@ def get_db():
         conn.close()
 
 
-def init_db():
-    config.VECTOR_STORE_PATH.mkdir(parents=True, exist_ok=True)
-    with get_db() as conn:
-        conn.executescript(_SCHEMA_SQL)
-        # Migrate existing tables if upgraded without DROP
-        cols_chunks = [r[1] for r in conn.execute("PRAGMA table_info(chunks)").fetchall()]
-        for col, col_type, default_val in [
-            ("user_id", "TEXT", "'default'"),
-            ("locator_label", "TEXT", "''"),
-            ("source_id", "TEXT", "''"),
-            ("source_type", "TEXT", "'pdf'"),
-            ("source_title", "TEXT", "''"),
-            ("origin_url_or_filename", "TEXT", "''")
-        ]:
-            if col not in cols_chunks:
-                try:
-                    conn.execute(f"ALTER TABLE chunks ADD COLUMN {col} {col_type} DEFAULT {default_val}")
-                except Exception:
-                    pass
-        cols_concept_chunks = [r[1] for r in conn.execute("PRAGMA table_info(concept_chunks)").fetchall()]
-        for col, col_type, default_val in [
-            ("user_id", "TEXT", "'default'"),
-            ("locator_label", "TEXT", "''"),
-            ("source_type", "TEXT", "'pdf'")
-        ]:
-            if col not in cols_concept_chunks:
-                try:
-                    conn.execute(f"ALTER TABLE concept_chunks ADD COLUMN {col} {col_type} DEFAULT {default_val}")
-                except Exception:
-                    pass
-
-        try:
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_user ON chunks(user_id)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_concept_chunks_user ON concept_chunks(user_id)")
-        except Exception:
-            pass
-
-
-init_db()
-
-
 class ConceptIndex:
     """Vectorless Index managing document chunks, canonical concept links, and BM25 search."""
 
     def __init__(self):
-        init_db()
+        # Lazy DB initialization: do not connect to SQLite on instance creation
         self._lock = threading.RLock()
         self._index_cache = self._build_cache(MAX_ACTIVE_CONCEPT_CACHES)
+        self._retrieval_ops_count = 0
+
+    @property
+    def retrieval_ops_count(self) -> int:
+        return self._retrieval_ops_count
 
     @staticmethod
     def _build_cache(
@@ -247,6 +273,7 @@ class ConceptIndex:
 
     def retrieve_chunks(self, concept_id: str, max_chunks: int = 3, user_id: str = "default") -> list[ChunkMetadata]:
         """Strict vectorless retrieval: pull chunks by canonical concept ID scoped to user_id."""
+        self._retrieval_ops_count += 1
         cid = concept_id.lower().strip()
         cache_key = self._cache_key(user_id, "concept", cid, max_chunks)
         with self._lock:
@@ -280,6 +307,7 @@ class ConceptIndex:
 
     def search_bm25(self, query: str, max_chunks: int = 4, user_id: str = "default") -> list[tuple[float, ChunkMetadata]]:
         """Vectorless BM25 ranking over inverted full-text index scoped to user_id."""
+        self._retrieval_ops_count += 1
         import re
         from .text import STOP, GENERIC_NON_CONCEPTS
         cleaned_query = re.sub(r"[^\w\s]", " ", query).strip()

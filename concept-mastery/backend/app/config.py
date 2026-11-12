@@ -124,11 +124,16 @@ OPENROUTER_MODELS = (
 # Primary Provider: Google Gemini (Legacy/Direct)
 GEMINI_API_KEY = _e("GEMINI_API_KEY", "")
 GEMINI_MODEL = _e("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_TTS_MODEL = _e("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
+GEMINI_TTS_VOICE = _e("GEMINI_TTS_VOICE", "Kore")
 
 # Fallback Provider: Groq Cloud
 GROQ_API_KEY = _e("GROQ_API_KEY", "")
 GROQ_MODEL = _e("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_BASE_URL = _e("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+GROQ_TTS_MODEL = _e("GROQ_TTS_MODEL", "canopylabs/orpheus-v1-english")
+GROQ_TTS_VOICE = _e("GROQ_TTS_VOICE", "troy")
+GROQ_STT_MODEL = _e("GROQ_STT_MODEL", "whisper-large-v3-turbo")
 
 # TinyFish Web Search API
 TINYFISH_API_KEY = _e("TINYFISH_API_KEY", "")
@@ -138,6 +143,34 @@ TINYFISH_SEARCH_URL = _e("TINYFISH_SEARCH_URL", "https://api.search.tinyfish.ai"
 ELEVENLABS_API_KEY = _e("ELEVENLABS_API_KEY", "")
 ELEVENLABS_MODEL_ID = _e("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5")
 ELEVENLABS_VOICE_ID = _e("ELEVENLABS_VOICE_ID", "JBFqnCBsd6RMkjVDRZzb")
+
+# ── Settings Configuration Container ──────────────────────────────────────────
+class Settings:
+    """Config settings container for multi-provider TTS/STT and system config."""
+    ELEVENLABS_API_KEY: str = ELEVENLABS_API_KEY
+    ELEVENLABS_MODEL_ID: str = ELEVENLABS_MODEL_ID
+    ELEVENLABS_VOICE_ID: str = ELEVENLABS_VOICE_ID
+    GEMINI_API_KEY: str = GEMINI_API_KEY
+    GEMINI_TTS_MODEL: str = GEMINI_TTS_MODEL
+    GEMINI_TTS_VOICE: str = GEMINI_TTS_VOICE
+    GROQ_API_KEY: str = GROQ_API_KEY
+    GROQ_TTS_MODEL: str = GROQ_TTS_MODEL
+    GROQ_TTS_VOICE: str = GROQ_TTS_VOICE
+    GROQ_STT_MODEL: str = GROQ_STT_MODEL
+
+    def __init__(self):
+        self.ELEVENLABS_API_KEY = ELEVENLABS_API_KEY
+        self.ELEVENLABS_MODEL_ID = ELEVENLABS_MODEL_ID
+        self.ELEVENLABS_VOICE_ID = ELEVENLABS_VOICE_ID
+        self.GEMINI_API_KEY = GEMINI_API_KEY
+        self.GEMINI_TTS_MODEL = GEMINI_TTS_MODEL
+        self.GEMINI_TTS_VOICE = GEMINI_TTS_VOICE
+        self.GROQ_API_KEY = GROQ_API_KEY
+        self.GROQ_TTS_MODEL = GROQ_TTS_MODEL
+        self.GROQ_TTS_VOICE = GROQ_TTS_VOICE
+        self.GROQ_STT_MODEL = GROQ_STT_MODEL
+
+settings = Settings()
 
 # Legacy / Generic Provider
 LLM_PROVIDER, LLM_API_KEY, LLM_MODEL = _e("LLM_PROVIDER", "openai").lower(), _e("LLM_API_KEY"), _e("LLM_MODEL")

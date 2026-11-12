@@ -15,15 +15,59 @@ MAX_ACTIVE_VECTOR_INDICES = DEFAULT_LRU_MAXSIZE
 
 class VectorIndex:
     def __init__(self, chunks=None, idf=None, vecs=None):
-        self.chunks, self.idf, self.vecs = chunks or [], idf or {}, vecs or []
+        self.chunks = chunks or []
+        self._idf = idf
+        self._vecs = vecs
+
+    @property
+    def idf(self):
+        if self._idf is None:
+            self._ensure_built()
+        return self._idf
+
+    @idf.setter
+    def idf(self, val):
+        self._idf = val
+
+    @property
+    def vecs(self):
+        if self._vecs is None:
+            self._ensure_built()
+        return self._vecs
+
+    @vecs.setter
+    def vecs(self, val):
+        self._vecs = val
+
+    @property
+    def is_built(self) -> bool:
+        """True if vectors and IDF matrix have been computed."""
+        return self._idf is not None and self._vecs is not None
+
+    def _ensure_built(self):
+        if self._idf is not None and self._vecs is not None:
+            return
+        if not self.chunks:
+            self._idf = {}
+            self._vecs = []
+            return
+        docs = [
+            Counter(tokens(
+                (c.get("section", "") if isinstance(c, dict) else getattr(c, "section", ""))
+                + " "
+                + (c.get("text", "") if isinstance(c, dict) else getattr(c, "text", ""))
+            ))
+            for c in self.chunks
+        ]
+        df = Counter(t for d in docs for t in d)
+        n = len(docs)
+        self._idf = {t: math.log((1 + n) / (1 + f)) + 1 for t, f in df.items()}
+        self._vecs = [self._vec(d, self._idf) for d in docs]
 
     @classmethod
     def build(cls, chunks):
-        docs = [Counter(tokens(c["section"] + " " + c["text"])) for c in chunks]
-        df = Counter(t for d in docs for t in d)
-        n = len(docs)
-        idf = {t: math.log((1 + n) / (1 + f)) + 1 for t, f in df.items()}
-        return cls(chunks, idf, [cls._vec(d, idf) for d in docs])
+        """Lazy construction: stores chunks but defers vector computation until search or property access."""
+        return cls(chunks=chunks, idf=None, vecs=None)
 
     @staticmethod
     def _vec(counts, idf):
@@ -32,16 +76,23 @@ class VectorIndex:
         return {t: x / norm for t, x in v.items()}
 
     def search(self, query, k=4):
+        self._ensure_built()
         q = self._vec(Counter(tokens(query)), self.idf)
         scored = sorted(((sum(w * v.get(t, 0.0) for t, w in q.items()), i) for i, v in enumerate(self.vecs)), reverse=True)
         return [(s, self.chunks[i]) for s, i in scored[:k] if s > 0]
 
     def to_dict(self):
-        return {"chunks": self.chunks, "idf": self.idf, "vecs": self.vecs}
+        return {
+            "chunks": self.chunks,
+            "idf": self._idf if self._idf is not None else {},
+            "vecs": self._vecs if self._vecs is not None else [],
+        }
 
     @classmethod
     def from_dict(cls, d):
-        return cls(d["chunks"], d["idf"], d["vecs"])
+        idf = d.get("idf") if d.get("idf") else None
+        vecs = d.get("vecs") if d.get("vecs") else None
+        return cls(d.get("chunks", []), idf, vecs)
 
 
 class VectorIndexCache:
