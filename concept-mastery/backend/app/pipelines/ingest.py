@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import threading
 import uuid
 import urllib.parse
 import urllib.request
@@ -42,6 +43,56 @@ from ..core.concept_index import GLOBAL_INDEX
 from ..core.text import sentences, NORMALIZER
 from ..models.schemas import ChunkMetadata, IngestionState
 from . import concepts, mastery
+
+# ── Real-Time Ingestion Progress State Tracking ────────────────────────────
+_PROGRESS_LOCK = threading.Lock()
+_INGESTION_PROGRESS: Dict[str, Dict[str, Any]] = {}
+
+def set_ingest_progress(
+    material_id: str,
+    stage: str,
+    progress_pct: int,
+    detail: str,
+    status: str = "processing"
+) -> None:
+    """Thread-safe update for ingestion milestones."""
+    if not material_id:
+        return
+    with _PROGRESS_LOCK:
+        _INGESTION_PROGRESS[material_id] = {
+            "material_id": material_id,
+            "stage": stage,
+            "progress_pct": max(0, min(100, int(progress_pct))),
+            "detail": detail,
+            "status": status,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+def get_ingest_progress(material_id: str) -> Dict[str, Any]:
+    """Retrieve real-time ingestion status and progress percentage."""
+    with _PROGRESS_LOCK:
+        item = _INGESTION_PROGRESS.get(material_id)
+        if item:
+            return dict(item)
+    # Check if already persisted in study_materials
+    mat = store.get_study_material(material_id)
+    if mat:
+        return {
+            "material_id": material_id,
+            "stage": "Complete",
+            "progress_pct": 100,
+            "detail": "Material indexed. Launching Baseline Diagnostic...",
+            "status": "ready",
+            "updated_at": mat.get("created_at", datetime.now(timezone.utc).isoformat())
+        }
+    return {
+        "material_id": material_id,
+        "stage": "Pending",
+        "progress_pct": 0,
+        "detail": "Initializing ingestion...",
+        "status": "processing",
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }
 
 CHUNK_WORDS = 110
 _PAGE_NO = re.compile(r"^(page\s+)?\d+(\s*(of|/)\s*\d+)?$", re.I)
@@ -1168,6 +1219,8 @@ def detect_source_type_node(state: IngestionState) -> Dict[str, Any]:
 
 def extract_raw_content_node(state: IngestionState) -> Dict[str, Any]:
     """Node 2: Dispatch to specialized format loaders."""
+    mat_id = state.get("material_id", "")
+    set_ingest_progress(mat_id, "Content Extraction", 15, "Extracting transcript / document text...", "processing")
     target = state["input_target"]
     stype = state["source_type"]
     custom_title = state.get("custom_title")
@@ -1203,6 +1256,8 @@ def extract_raw_content_node(state: IngestionState) -> Dict[str, Any]:
 
 def semantic_section_chunker_node(state: IngestionState) -> Dict[str, Any]:
     """Node 3: Segment content at sentence and section boundaries."""
+    mat_id = state.get("material_id", "")
+    set_ingest_progress(mat_id, "Semantic Chunking", 40, "Performing boundary-aware semantic chunking...", "processing")
     chunks = chunk_extracted_items(
         items=state["raw_items"],
         source_id=state["material_id"],
@@ -1238,6 +1293,8 @@ def synonym_normalizer_node(state: IngestionState) -> Dict[str, Any]:
 
 def sqlite_bm25_index_node(state: IngestionState) -> Dict[str, Any]:
     """Node 5: Persist source in SQLite study_materials and index chunks into BM25 inverted index."""
+    mat_id = state.get("material_id", "")
+    set_ingest_progress(mat_id, "Indexing Knowledge Base", 65, "Building vector & BM25/TF-IDF concept indices...", "processing")
     material_record = {
         "material_id": state["material_id"],
         "user_id": state.get("user_id", "default"),
@@ -1258,6 +1315,8 @@ def sqlite_bm25_index_node(state: IngestionState) -> Dict[str, Any]:
 
 def update_prerequisite_dag_node(state: IngestionState) -> Dict[str, Any]:
     """Node 6: Merge all user study materials and rebuild unified Prerequisite DAG and BM25 Index."""
+    mat_id = state.get("material_id", "")
+    set_ingest_progress(mat_id, "Prerequisite Graph Synthesis", 85, "Extracting Concept Prerequisite DAG via LLM...", "processing")
     user_id = state.get("user_id", "default")
     UniversalMaterialIngestor.rebuild_unified_knowledge_base(user_id=user_id)
     return {}
@@ -1289,15 +1348,22 @@ class UniversalMaterialIngestor:
     """Unified Orchestrator for Multi-Format Study Material Ingestion & Knowledge Base Management."""
 
     @classmethod
-    def ingest_file(cls, path: Path, user_id: str = "default", title: Optional[str] = None) -> Dict[str, Any]:
+    def ingest_file(
+        cls,
+        path: Path,
+        user_id: str = "default",
+        title: Optional[str] = None,
+        material_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Ingest any supported file format (.pdf, .pptx, .md, .txt, .docx, .mp3, .wav, .m4a)."""
-        material_id = f"mat_{uuid.uuid4().hex[:10]}"
+        mat_id = material_id or f"mat_{uuid.uuid4().hex[:10]}"
+        set_ingest_progress(mat_id, "Type Detection", 5, "Detecting source format and structure...", "processing")
         initial_state: IngestionState = {
             "input_target": str(path.resolve()),
             "source_type": "auto",
             "user_id": user_id,
             "custom_title": title,
-            "material_id": material_id,
+            "material_id": mat_id,
             "title": "",
             "origin_name": path.name,
             "raw_text": "",
@@ -1308,29 +1374,42 @@ class UniversalMaterialIngestor:
             "edges": [],
             "error": None,
         }
-        final_state = INGESTION_GRAPH.invoke(initial_state)
-        return {
-            "material_id": material_id,
-            "title": final_state["title"],
-            "source_type": final_state["source_type"],
-            "original_filename_or_url": final_state["origin_name"],
-            "chunk_count": len(final_state["chunks"]),
-            "concepts": [c["name"] for c in final_state["concepts"]],
-            "concept_count": len(final_state["concepts"]),
-            "graph_nodes": len(final_state["concepts"]),
-            "graph_edges": len(final_state["edges"]),
-        }
+        try:
+            final_state = INGESTION_GRAPH.invoke(initial_state)
+            set_ingest_progress(mat_id, "Complete", 100, "Material indexed. Launching Baseline Diagnostic...", "ready")
+            return {
+                "material_id": mat_id,
+                "title": final_state["title"],
+                "source_type": final_state["source_type"],
+                "original_filename_or_url": final_state["origin_name"],
+                "chunk_count": len(final_state["chunks"]),
+                "concepts": [c["name"] for c in final_state["concepts"]],
+                "concept_count": len(final_state["concepts"]),
+                "graph_nodes": len(final_state["concepts"]),
+                "graph_edges": len(final_state["edges"]),
+            }
+        except Exception as e:
+            set_ingest_progress(mat_id, "Error", 0, f"Ingestion error: {e}", "error")
+            raise
 
     @classmethod
-    def ingest_url(cls, url: str, source_type: str = "auto", user_id: str = "default", title: Optional[str] = None) -> Dict[str, Any]:
+    def ingest_url(
+        cls,
+        url: str,
+        source_type: str = "auto",
+        user_id: str = "default",
+        title: Optional[str] = None,
+        material_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Ingest YouTube video or educational website."""
-        material_id = f"mat_{uuid.uuid4().hex[:10]}"
+        mat_id = material_id or f"mat_{uuid.uuid4().hex[:10]}"
+        set_ingest_progress(mat_id, "Type Detection", 5, "Detecting source format and structure...", "processing")
         initial_state: IngestionState = {
             "input_target": url.strip(),
             "source_type": source_type,
             "user_id": user_id,
             "custom_title": title,
-            "material_id": material_id,
+            "material_id": mat_id,
             "title": "",
             "origin_name": url.strip(),
             "raw_text": "",
@@ -1341,18 +1420,23 @@ class UniversalMaterialIngestor:
             "edges": [],
             "error": None,
         }
-        final_state = INGESTION_GRAPH.invoke(initial_state)
-        return {
-            "material_id": material_id,
-            "title": final_state["title"],
-            "source_type": final_state["source_type"],
-            "original_filename_or_url": final_state["origin_name"],
-            "chunk_count": len(final_state["chunks"]),
-            "concepts": [c["name"] for c in final_state["concepts"]],
-            "concept_count": len(final_state["concepts"]),
-            "graph_nodes": len(final_state["concepts"]),
-            "graph_edges": len(final_state["edges"]),
-        }
+        try:
+            final_state = INGESTION_GRAPH.invoke(initial_state)
+            set_ingest_progress(mat_id, "Complete", 100, "Material indexed. Launching Baseline Diagnostic...", "ready")
+            return {
+                "material_id": mat_id,
+                "title": final_state["title"],
+                "source_type": final_state["source_type"],
+                "original_filename_or_url": final_state["origin_name"],
+                "chunk_count": len(final_state["chunks"]),
+                "concepts": [c["name"] for c in final_state["concepts"]],
+                "concept_count": len(final_state["concepts"]),
+                "graph_nodes": len(final_state["concepts"]),
+                "graph_edges": len(final_state["edges"]),
+            }
+        except Exception as e:
+            set_ingest_progress(mat_id, "Error", 0, f"Ingestion error: {e}", "error")
+            raise
 
     @classmethod
     async def ingest_file_async(
@@ -1360,6 +1444,7 @@ class UniversalMaterialIngestor:
         path: Path,
         user_id: str = "default",
         title: Optional[str] = None,
+        material_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run synchronous file parsing, extraction, and indexing off the async event loop."""
         return await run_in_threadpool(
@@ -1367,6 +1452,7 @@ class UniversalMaterialIngestor:
             path=path,
             user_id=user_id,
             title=title,
+            material_id=material_id,
         )
 
     @classmethod
@@ -1376,6 +1462,7 @@ class UniversalMaterialIngestor:
         source_type: str = "auto",
         user_id: str = "default",
         title: Optional[str] = None,
+        material_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run synchronous URL fetching, parsing, extraction, and indexing off the async event loop."""
         return await run_in_threadpool(
@@ -1384,6 +1471,7 @@ class UniversalMaterialIngestor:
             source_type=source_type,
             user_id=user_id,
             title=title,
+            material_id=material_id,
         )
 
     @classmethod

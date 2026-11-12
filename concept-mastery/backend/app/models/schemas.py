@@ -271,6 +271,7 @@ class IngestUrlRequest(BaseModel):
     url: str = Field(..., description="Target web or YouTube URL")
     source_type: Literal["youtube", "web", "auto"] = Field(default="auto", description="Source format")
     title: str | None = Field(default=None, description="Optional custom title")
+    material_id: str | None = Field(default=None, description="Optional custom or pre-allocated material ID")
     user_id: str = Field(default="default", description="Active student user ID")
 
 
@@ -635,7 +636,23 @@ class DiagnosticSubmitReq(BaseModel):
     """Request payload for submitting baseline diagnostic answers."""
 
     user_id: str = "default"
+    material_id: str | None = None
     answers: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class BaselineDiagnosticReport(BaseModel):
+    """Authoritative baseline diagnostic evaluation, topic breakdown, and grounded study guide."""
+
+    report_id: str
+    material_id: str | None = None
+    user_id: str = "default"
+    overall_score: int
+    total_questions: int
+    correct_count: int
+    readiness_summary: str
+    topic_breakdown: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
+    weak_topics_guide: list[dict[str, Any]] = Field(default_factory=list)
+    created_at: str
 
 
 # ---------------------------------------------------------------------------

@@ -1606,6 +1606,22 @@ async function testTutorMarkdownFormattingAndBlockElements() {
   assert.ok(renderedUserHtml.includes("white-space: pre-wrap"), "User messages must preserve white-space: pre-wrap");
 }
 
+async function testBaselineDiagnosticGatingAndStudyGuideReport() {
+  const { ApiService } = createApiSandbox(() => Promise.resolve({ ok: true, json: async () => ({}) }));
+  assert.equal(typeof ApiService.getIngestStatus, "function", "ApiService.getIngestStatus must be defined");
+  assert.equal(typeof ApiService.getBaselineReport, "function", "ApiService.getBaselineReport must be defined");
+
+  // Verify CSS styles include the required classes
+  const css = fs.readFileSync(path.join(__dirname, "../css/styles.css"), "utf8");
+  assert.ok(css.includes(".ingest-live-progress-wrap"), "styles.css must include .ingest-live-progress-wrap");
+  assert.ok(css.includes(".ingest-progress-track"), "styles.css must include .ingest-progress-track");
+  assert.ok(css.includes(".ingest-progress-fill"), "styles.css must include .ingest-progress-fill");
+  assert.ok(css.includes(".baseline-compulsory-banner"), "styles.css must include .baseline-compulsory-banner");
+  assert.ok(css.includes(".tab-lock-badge"), "styles.css must include .tab-lock-badge");
+  assert.ok(css.includes(".study-guide-card"), "styles.css must include .study-guide-card");
+  assert.ok(css.includes(".study-guide-section"), "styles.css must include .study-guide-section");
+}
+
 (async function run() {
   await testApiServiceExportsAndDedupe();
   console.log("PASS: testApiServiceExportsAndDedupe");
@@ -1629,4 +1645,6 @@ async function testTutorMarkdownFormattingAndBlockElements() {
   console.log("PASS: testInputHighContrastAndThemeTokensAcrossProject");
   await testTutorMarkdownFormattingAndBlockElements();
   console.log("PASS: testTutorMarkdownFormattingAndBlockElements");
+  await testBaselineDiagnosticGatingAndStudyGuideReport();
+  console.log("PASS: testBaselineDiagnosticGatingAndStudyGuideReport");
 })();

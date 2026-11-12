@@ -1020,3 +1020,146 @@ def run_learning_observer(evidence_pkg: dict) -> SpecialistAgentAssessment:
         assessment_confidence=confidence,
         limitations=limitations,
     )
+
+
+# ── Post-Baseline Pedagogical Study Guide Generator ─────────────────────────
+
+def generate_pedagogical_study_guide(
+    concept_id: str,
+    concept_name: str,
+    course_chunks: List[Any],
+    missed_info: dict,
+    category: str = "Weak / Gap",
+) -> dict:
+    """Generate a 4-section grounded study guide for a Weak or Fragile concept.
+
+    Strictly satisfies the 4 pedagogical pillars:
+      1. Why You Missed This / Misconception Identified
+      2. Detailed Concept Explanation (strictly grounded with page/timestamp citations)
+      3. Key Mental Model / Formula / Mechanism
+      4. Step-by-Step Study Action Plan
+    """
+    citations: List[str] = []
+    chunk_excerpts: List[str] = []
+
+    for c in course_chunks:
+        lbl = getattr(c, "locator_label", None) or (c.get("locator_label") if isinstance(c, dict) else None)
+        txt = getattr(c, "text", None) or (c.get("text") if isinstance(c, dict) else str(c))
+        if lbl and lbl not in citations:
+            citations.append(lbl)
+        if txt:
+            chunk_excerpts.append(f"[{lbl or 'Source'}]: {txt.strip()}")
+
+    primary_cit = citations[0] if citations else "[Course Material]"
+
+    # Attempt LLM generation via Teaching Agent persona
+    system_prompt = (
+        "You are an expert Pedagogical Teaching Specialist.\n"
+        "Your task: construct a rigorous, supportive, and strictly grounded Study Guide for a student who missed or struggled with this concept during their baseline diagnostic assessment.\n\n"
+        "CRITICAL GROUNDING RULES:\n"
+        "1. Base your explanation strictly on the provided course material excerpts.\n"
+        "2. Cite exact source anchors ([Page X], [Slide X], [MM:SS], etc.) directly in your explanation.\n"
+        "3. Highlight specific misconceptions or subtle reasoning traps revealed by the student's answer.\n"
+        "4. Return strictly valid JSON with exact keys:\n"
+        "{\n"
+        '  "why_missed": "Clear pedagogical diagnosis of why the question was missed, identifying the student\'s misconception or missing intuition",\n'
+        '  "detailed_explanation": "Thorough, clear conceptual explanation strictly grounded in the course chunks, citing exact anchors like [Page X]",\n'
+        '  "mental_model": "An intuitive mental model, analogy, core mathematical formula, or causal mechanism that cements understanding",\n'
+        '  "action_plan": ["Actionable step 1...", "Actionable step 2...", "Actionable step 3..."]\n'
+        "}"
+    )
+
+    user_payload = {
+        "concept_id": concept_id,
+        "concept_name": concept_name,
+        "diagnostic_status": category,
+        "missed_details": missed_info,
+        "course_material_excerpts": chunk_excerpts[:4],
+    }
+
+    user_prompt = _format_agent_user_prompt(
+        "Generate the 4-part grounded study guide for this concept based on the student's baseline performance:",
+        user_payload,
+    )
+
+    parsed_llm = _call_llm_json(system_prompt, user_prompt, max_tokens=1000)
+    if (
+        parsed_llm
+        and isinstance(parsed_llm, dict)
+        and parsed_llm.get("why_missed")
+        and parsed_llm.get("detailed_explanation")
+    ):
+        raw_plan = parsed_llm.get("action_plan", [])
+        plan_list = [str(step) for step in raw_plan] if isinstance(raw_plan, list) else [str(raw_plan)]
+        return {
+            "concept_id": concept_id,
+            "concept_name": concept_name,
+            "category": category,
+            "why_missed": str(parsed_llm["why_missed"]),
+            "detailed_explanation": str(parsed_llm["detailed_explanation"]),
+            "mental_model": str(parsed_llm.get("mental_model") or f"Core mechanism governing {concept_name}."),
+            "action_plan": plan_list or [
+                f"Review foundational explanation in {primary_cit}.",
+                f"Contrast {concept_name} with related prerequisite concepts.",
+                "Complete targeted practice questions in Concept Check.",
+            ],
+            "citations": citations,
+        }
+
+    # ── High-Fidelity Grounded Heuristic Fallback ──────────────────────────────
+    raw_miscons = missed_info.get("misconceptions", [])
+    if raw_miscons:
+        why_missed = (
+            f"Misconception identified: {'; '.join(raw_miscons[:2])}. "
+            f"The diagnostic response revealed difficulty isolating the specific operational role of {concept_name}."
+        )
+    elif missed_info.get("student_answer"):
+        why_missed = (
+            f"Your diagnostic answer ('{missed_info.get('student_answer')}') conflicted with the verified definition in {primary_cit}. "
+            f"The assessment identified an intuitive gap in how {concept_name} behaves."
+        )
+    else:
+        why_missed = (
+            f"The baseline diagnostic revealed an incomplete understanding of {concept_name}, "
+            f"specifically in applying its governing principles to new problem contexts."
+        )
+
+    first_text = ""
+    if course_chunks:
+        first_c = course_chunks[0]
+        first_text = getattr(first_c, "text", None) or (first_c.get("text") if isinstance(first_c, dict) else str(first_c))
+    if first_text:
+        snippet = " ".join(first_text.strip().split()[:75])
+        detailed_explanation = (
+            f"As stated in your course material in {primary_cit}: \"{snippet}...\" "
+            f"In depth, {concept_name} establishes the essential relationships and state transitions required before advancing to higher-order topics. "
+            f"Mastering this foundation ensures you can evaluate boundary conditions reliably."
+        )
+    else:
+        detailed_explanation = (
+            f"In your study material ({primary_cit}), {concept_name} represents a foundational building block. "
+            f"It directly governs downstream dependencies and must be thoroughly consolidated."
+        )
+
+    mental_model = (
+        f"Mental Model for {concept_name}: Conceptualize this as an invariant rule or gateway mechanism in the system. "
+        f"According to {primary_cit}, changes to inputs flow through this concept to generate predictable, coherent outcomes."
+    )
+
+    action_plan = [
+        f"1. Reread the core source section in {primary_cit} to clarify exact definitions.",
+        f"2. Identify how {concept_name} connects with upstream and downstream prerequisites.",
+        "3. Complete 3 targeted practice questions in Concept Check to solidify active recall.",
+        "4. Ask the AI Tutor to stress-test your understanding with counterexamples.",
+    ]
+
+    return {
+        "concept_id": concept_id,
+        "concept_name": concept_name,
+        "category": category,
+        "why_missed": why_missed,
+        "detailed_explanation": detailed_explanation,
+        "mental_model": mental_model,
+        "action_plan": action_plan,
+        "citations": citations,
+    }

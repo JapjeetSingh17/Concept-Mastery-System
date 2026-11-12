@@ -85,6 +85,8 @@ const ENDPOINTS = {
   materialsList:       { method: "GET",    path: "/api/materials" },
   materialsIngestFile: { method: "POST",   path: "/api/materials/ingest-file" },
   materialsIngestUrl:  { method: "POST",   path: "/api/materials/ingest-url" },
+  materialsIngestStatus:{ method: "GET",    path: "/api/materials/{material_id}/ingest-status" },
+  materialsBaselineReport:{ method: "GET",  path: "/api/materials/{material_id}/baseline-report" },
   materialsPreview:    { method: "GET",    path: "/api/materials/{material_id}/preview" },
   materialsDelete:     { method: "DELETE", path: "/api/materials/{material_id}" },
   loopStatus:          { method: "GET",    path: "/api/loop/status" },
@@ -575,8 +577,10 @@ const ApiService = {
     return callApi("diagnosticStart", { user_id: userId }, options);
   },
 
-  async submitDiagnostic(answers, userId = "default", options = {}) {
-    return callApi("diagnosticSubmit", { user_id: userId, answers }, options);
+  async submitDiagnostic(answers, userId = "default", materialId = null, options = {}) {
+    const payload = { user_id: userId, answers };
+    if (materialId) payload.material_id = materialId;
+    return callApi("diagnosticSubmit", payload, options);
   },
 
   async getRemedialQuiz(conceptId = null, userId = "default", options = {}) {
@@ -629,22 +633,41 @@ const ApiService = {
     return callApi("materialsList", null, { ...options, params: { user_id: userId } });
   },
 
-  async ingestMaterialFile(files, userId = "default", title = "", options = {}) {
+  async ingestMaterialFile(files, userId = "default", title = "", materialId = null, options = {}) {
     const formData = new FormData();
     const fileList = Array.isArray(files) ? files : [files];
     fileList.forEach(f => formData.append("files", f));
     if (userId) formData.append("user_id", userId);
     if (title) formData.append("title", title);
+    if (materialId) formData.append("material_id", materialId);
     return callApi("materialsIngestFile", formData, options);
   },
 
-  async ingestMaterialUrl(url, sourceType = "auto", userId = "default", title = "", options = {}) {
-    return callApi("materialsIngestUrl", {
+  async ingestMaterialUrl(url, sourceType = "auto", userId = "default", title = "", materialId = null, options = {}) {
+    const payload = {
       url: url.trim(),
       source_type: sourceType,
       user_id: userId,
       title: title || undefined
-    }, options);
+    };
+    if (materialId) payload.material_id = materialId;
+    return callApi("materialsIngestUrl", payload, options);
+  },
+
+  async getIngestStatus(materialId, options = {}) {
+    return callApi("materialsIngestStatus", null, {
+      ...options,
+      pathParams: { material_id: materialId || "latest" },
+      skipCache: true
+    });
+  },
+
+  async getBaselineReport(materialId, options = {}) {
+    return callApi("materialsBaselineReport", null, {
+      ...options,
+      pathParams: { material_id: materialId || "latest" },
+      skipCache: true
+    });
   },
 
   async getMaterialPreview(materialId, options = {}) {

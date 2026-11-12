@@ -60,6 +60,8 @@ CREATE TABLE IF NOT EXISTS study_materials (
     structured_preview_json     TEXT NOT NULL DEFAULT '[]',
     chunk_count                 INTEGER NOT NULL DEFAULT 0,
     extracted_concepts_json     TEXT NOT NULL DEFAULT '[]',
+    baseline_completed          INTEGER NOT NULL DEFAULT 0,
+    baseline_report_json        TEXT NOT NULL DEFAULT '{}',
     created_at                  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_materials_user ON study_materials(user_id);
@@ -302,6 +304,13 @@ def init_materials_db():
         conn = _connect_materials_db()
         try:
             conn.executescript(_MATERIALS_SCHEMA)
+            # Automatic schema migration for existing SQLite databases
+            col_rows = conn.execute("PRAGMA table_info(study_materials)").fetchall()
+            existing_cols = {r["name"] for r in col_rows}
+            if "baseline_completed" not in existing_cols:
+                conn.execute("ALTER TABLE study_materials ADD COLUMN baseline_completed INTEGER NOT NULL DEFAULT 0")
+            if "baseline_report_json" not in existing_cols:
+                conn.execute("ALTER TABLE study_materials ADD COLUMN baseline_report_json TEXT NOT NULL DEFAULT '{}'")
         except BaseException:
             if conn.in_transaction:
                 try:
@@ -412,19 +421,35 @@ def save_study_material(mat: dict) -> dict:
         concepts_json = json.dumps(concepts_json)
 
     created_at = mat.get("created_at") or now_iso
+    baseline_completed = int(bool(mat.get("baseline_completed", 0)))
+    raw_report = mat.get("baseline_report_json", mat.get("baseline_report", {}))
+    baseline_report_json = json.dumps(raw_report) if isinstance(raw_report, (dict, list)) else (str(raw_report) if raw_report else "{}")
 
     with _materials_transaction(immediate=True) as conn:
         conn.execute(
             """
-            INSERT OR REPLACE INTO study_materials
+            INSERT INTO study_materials
             (material_id, user_id, title, source_type, original_filename_or_url,
              raw_extracted_text, structured_preview_json, chunk_count,
-             extracted_concepts_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             extracted_concepts_json, baseline_completed, baseline_report_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(material_id) DO UPDATE SET
+                user_id = excluded.user_id,
+                title = excluded.title,
+                source_type = excluded.source_type,
+                original_filename_or_url = excluded.original_filename_or_url,
+                raw_extracted_text = excluded.raw_extracted_text,
+                structured_preview_json = excluded.structured_preview_json,
+                chunk_count = excluded.chunk_count,
+                extracted_concepts_json = excluded.extracted_concepts_json,
+                baseline_completed = CASE WHEN excluded.baseline_completed != 0 THEN excluded.baseline_completed ELSE study_materials.baseline_completed END,
+                baseline_report_json = CASE WHEN excluded.baseline_report_json != '{}' THEN excluded.baseline_report_json ELSE study_materials.baseline_report_json END,
+                created_at = excluded.created_at
             """,
             (
                 material_id, user_id, title, source_type, origin,
-                raw_text, preview_json, chunk_count, concepts_json, created_at
+                raw_text, preview_json, chunk_count, concepts_json,
+                baseline_completed, baseline_report_json, created_at
             )
         )
     parsed_concepts = _parse_json_value(concepts_json, [])
@@ -437,6 +462,8 @@ def save_study_material(mat: dict) -> dict:
         "chunk_count": chunk_count,
         "concepts": parsed_concepts,
         "concept_count": len(parsed_concepts),
+        "baseline_completed": bool(baseline_completed),
+        "baseline_report": _parse_json_value(baseline_report_json, {}),
         "created_at": created_at,
     }
 
@@ -446,7 +473,8 @@ def list_study_materials(user_id: str = "default") -> list[dict]:
         rows = conn.execute(
             """
             SELECT material_id, user_id, title, source_type, original_filename_or_url,
-                   chunk_count, extracted_concepts_json, created_at
+                   chunk_count, extracted_concepts_json, baseline_completed,
+                   baseline_report_json, created_at
             FROM study_materials
             WHERE user_id = ?
             ORDER BY created_at DESC
@@ -466,6 +494,8 @@ def list_study_materials(user_id: str = "default") -> list[dict]:
                 "chunk_count": r["chunk_count"],
                 "concepts": str_concepts,
                 "concept_count": len(str_concepts),
+                "baseline_completed": bool(r["baseline_completed"]),
+                "baseline_report": _parse_json_value(r["baseline_report_json"], {}),
                 "created_at": r["created_at"],
             })
         return materials
@@ -495,8 +525,40 @@ def get_study_material(material_id: str, user_id: str | None = None) -> dict | N
             "chunk_count": row["chunk_count"],
             "concepts": concepts,
             "concept_count": len(concepts),
+            "baseline_completed": bool(row["baseline_completed"]),
+            "baseline_report": _parse_json_value(row["baseline_report_json"], {}),
             "created_at": row["created_at"],
         }
+
+def set_material_baseline_report(
+    material_id: str,
+    user_id: str = "default",
+    report: dict | None = None,
+    completed: bool = True
+) -> bool:
+    """Persist baseline diagnostic completion and grounded study guide report for a study material."""
+    report_json = json.dumps(report or {}) if isinstance(report, (dict, list)) else (str(report) if report else "{}")
+    completed_val = 1 if completed else 0
+    with _materials_transaction(immediate=True) as conn:
+        res = conn.execute(
+            """
+            UPDATE study_materials
+            SET baseline_completed = ?,
+                baseline_report_json = ?
+            WHERE material_id = ?
+            """,
+            (completed_val, report_json, material_id)
+        )
+        return res.rowcount > 0
+
+def get_material_baseline_report(material_id: str, user_id: str = "default") -> dict | None:
+    """Retrieve the baseline diagnostic report and grounded study guide for a study material."""
+    mat = get_study_material(material_id, user_id=user_id)
+    if not mat and user_id:
+        mat = get_study_material(material_id)
+    if mat:
+        return mat.get("baseline_report") or {}
+    return None
 
 def delete_study_material(material_id: str, user_id: str | None = None) -> bool:
     """Delete a study material by ID, optionally isolated by user_id."""
@@ -600,7 +662,8 @@ def get_dashboard_summary(user_id: str = "default", material_id: str | None = No
             active_mat_row = conn.execute(
                 """
                 SELECT material_id, user_id, title, source_type, original_filename_or_url,
-                       chunk_count, extracted_concepts_json, created_at
+                       chunk_count, extracted_concepts_json, baseline_completed,
+                       baseline_report_json, created_at
                 FROM study_materials
                 WHERE user_id = ? AND material_id = ?
                 LIMIT 1
@@ -612,7 +675,8 @@ def get_dashboard_summary(user_id: str = "default", material_id: str | None = No
             active_mat_row = conn.execute(
                 """
                 SELECT material_id, user_id, title, source_type, original_filename_or_url,
-                       chunk_count, extracted_concepts_json, created_at
+                       chunk_count, extracted_concepts_json, baseline_completed,
+                       baseline_report_json, created_at
                 FROM study_materials
                 WHERE user_id = ?
                 ORDER BY created_at DESC
@@ -624,7 +688,8 @@ def get_dashboard_summary(user_id: str = "default", material_id: str | None = No
         all_mat_rows = conn.execute(
             """
             SELECT material_id, user_id, title, source_type, original_filename_or_url,
-                   chunk_count, extracted_concepts_json, created_at
+                   chunk_count, extracted_concepts_json, baseline_completed,
+                   baseline_report_json, created_at
             FROM study_materials
             WHERE user_id = ?
             ORDER BY created_at DESC
@@ -644,6 +709,8 @@ def get_dashboard_summary(user_id: str = "default", material_id: str | None = No
                 "chunk_count": mr["chunk_count"],
                 "concepts": parsed_c,
                 "concept_count": len(parsed_c),
+                "baseline_completed": bool(mr["baseline_completed"]),
+                "baseline_report": _parse_json_value(mr["baseline_report_json"], {}),
                 "created_at": mr["created_at"],
             })
 
@@ -659,6 +726,8 @@ def get_dashboard_summary(user_id: str = "default", material_id: str | None = No
                 "chunk_count": active_mat_row["chunk_count"],
                 "concepts": parsed_ac,
                 "concept_count": len(parsed_ac),
+                "baseline_completed": bool(active_mat_row["baseline_completed"]),
+                "baseline_report": _parse_json_value(active_mat_row["baseline_report_json"], {}),
                 "created_at": active_mat_row["created_at"],
             }
 

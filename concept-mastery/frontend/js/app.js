@@ -1175,19 +1175,56 @@
     AppState.materials = mats || [];
     if (mats && mats.length > 0) {
       const top = mats[0];
+      AppState.activeMaterial = top;
+      const isCompleted = top.baseline_completed !== undefined
+        ? Boolean(top.baseline_completed)
+        : (AppState.loopStatus && AppState.loopStatus.baseline_completed !== undefined ? Boolean(AppState.loopStatus.baseline_completed) : true);
+      AppState.baselineCompleted = isCompleted;
       const status = {
         ready: true,
         file: top.title || top.original_filename_or_url || "Active Study Material",
+        material_id: top.material_id,
+        baseline_completed: isCompleted,
         pages: top.chunk_count || 1,
         concepts: top.concept_count || (top.concepts ? top.concepts.length : 0),
         user_id: uid
       };
       AppState.activeDoc = status;
       updateSidebarWidget(status);
+      if (typeof updateNavigation === "function") {
+        updateNavigation(AppState.currentRoute);
+      }
     } else {
+      AppState.activeMaterial = null;
       AppState.activeDoc = { ready: false, file: null };
       updateSidebarWidget({ ready: false, file: null });
     }
+  }
+
+  function isBaselineCompletedForActiveMaterial() {
+    if (!AppState.materials || AppState.materials.length === 0) {
+      return true; // Free exploration if no materials uploaded yet
+    }
+    if (AppState.activeMaterial) {
+      if (AppState.activeMaterial.baseline_completed === false) {
+        return false;
+      }
+      if (AppState.activeMaterial.baseline_completed === true) {
+        return true;
+      }
+    }
+    if (AppState.loopStatus) {
+      if (AppState.loopStatus.baseline_completed === false || AppState.loopStatus.loop_state === "BASELINE_DIAGNOSTIC") {
+        return false;
+      }
+      if (AppState.loopStatus.baseline_completed === true) {
+        return true;
+      }
+    }
+    if (AppState.baselineCompleted !== undefined) {
+      return Boolean(AppState.baselineCompleted);
+    }
+    return true;
   }
 
   // Global Document / Ingest Status Poller & Synchronizer
@@ -1296,9 +1333,280 @@
   }
 
   // -------------------------------------------------------------------------
+  // Real-Time Ingestion Progress Tracker
+  // -------------------------------------------------------------------------
+  async function runIngestionWithProgress(materialId, ingestPromise, onComplete) {
+    const container = $("#ingest-progress-container");
+    const stageLabel = $("#ingest-stage-label");
+    const pctBadge = $("#ingest-pct-badge");
+    const fillBar = $("#ingest-progress-fill");
+    const detailText = $("#ingest-detail-text");
+
+    if (container) container.style.display = "block";
+    if (fillBar) fillBar.style.width = "5%";
+    if (pctBadge) pctBadge.textContent = "5%";
+    if (stageLabel) stageLabel.innerHTML = `<span class="spinner" style="width:14px; height:14px; border-width:2px; display:inline-block;"></span> Type Detection & Document Setup...`;
+    if (detailText) detailText.textContent = "Extracting transcript / document text...";
+
+    let isDone = false;
+    const pollInterval = setInterval(async () => {
+      if (isDone) return;
+      try {
+        const res = await ApiService.getIngestStatus(materialId);
+        if (res && res.ok) {
+          const pct = res.progress_pct !== undefined ? res.progress_pct : 15;
+          if (fillBar) fillBar.style.width = `${pct}%`;
+          if (pctBadge) pctBadge.textContent = `${pct}%`;
+          if (stageLabel) stageLabel.innerHTML = `<span class="spinner" style="width:14px; height:14px; border-width:2px; display:inline-block;"></span> ${esc(res.stage || "Processing...")}`;
+          if (detailText) detailText.textContent = esc(res.detail || "");
+          if (res.status === "ready" || pct >= 100) {
+            isDone = true;
+            clearInterval(pollInterval);
+          }
+        }
+      } catch (_) {}
+    }, 350);
+
+    try {
+      const result = await ingestPromise;
+      isDone = true;
+      clearInterval(pollInterval);
+      if (fillBar) fillBar.style.width = "100%";
+      if (pctBadge) pctBadge.textContent = "100%";
+      if (stageLabel) stageLabel.textContent = "✓ Ingestion Complete";
+      if (detailText) detailText.textContent = "Material indexed. Launching Baseline Diagnostic...";
+      setTimeout(() => {
+        if (container) container.style.display = "none";
+      }, 3000);
+      if (typeof onComplete === "function") await onComplete(result);
+      return result;
+    } catch (err) {
+      isDone = true;
+      clearInterval(pollInterval);
+      if (stageLabel) stageLabel.textContent = "⚠ Ingestion Failed";
+      if (detailText) detailText.textContent = err.message || "An error occurred during ingestion.";
+      if (pctBadge) pctBadge.style.color = "var(--color-danger)";
+      throw err;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Baseline Diagnostic Report & Grounded Study Guide View Renderer
+  // -------------------------------------------------------------------------
+  function renderBaselineReportView(container, report, modal = null) {
+    if (!container || !report) return;
+    const scorePct = report.overall_score !== undefined ? report.overall_score : 50;
+    const breakdown = report.topic_breakdown || {};
+    const weakList = breakdown.weak || [];
+    const fragileList = breakdown.fragile || [];
+    const strongList = breakdown.strong || [];
+    const guides = report.weak_topics_guide || [];
+
+    container.innerHTML = `
+      <div class="baseline-report-modal-content">
+        <div class="baseline-report-header">
+          <div class="donut-chart-container" style="margin: 0 auto 1.25rem auto;">
+            ${createDonutSvg(scorePct, 120, 10, scorePct >= 65 ? "var(--color-strong)" : "var(--primary)")}
+            <div class="donut-chart-value">
+              <span class="val-number">${scorePct}%</span>
+              <span class="val-label">Baseline Score</span>
+            </div>
+          </div>
+          <h3 style="margin-bottom: 0.35rem; font-size:1.35rem;">Baseline Diagnostic Report & Grounded Study Guide</h3>
+          <p style="color: var(--ink-secondary); font-size: 0.92rem; max-width: 620px; margin: 0 auto 1.25rem auto; line-height: 1.5;">
+            ${esc(report.readiness_summary || "We evaluated your baseline knowledge across core prerequisites.")}
+          </p>
+
+          <div class="topic-breakdown-bar">
+            <span class="topic-badge-pill weak">
+              <strong>${weakList.length}</strong> Weak / Gap
+            </span>
+            <span class="topic-badge-pill fragile">
+              <strong>${fragileList.length}</strong> Developing / Fragile
+            </span>
+            <span class="topic-badge-pill mastered">
+              <strong>${strongList.length}</strong> Strong / Mastered
+            </span>
+          </div>
+        </div>
+
+        <div class="study-guides-container">
+          <h4 style="margin: 0 0 1rem 0; font-size: 1.05rem; display: flex; align-items: center; gap: 0.5rem;">
+            <span>📚 Personalized Study Guides for Weak & Fragile Topics</span>
+          </h4>
+
+          ${guides.length === 0 ? `
+            <div class="card" style="text-align: center; padding: 2rem;">
+              <p style="color: var(--color-strong); font-weight: 600; margin: 0;">
+                🎉 Outstanding performance! No foundational conceptual gaps identified in your baseline diagnostic.
+              </p>
+            </div>
+          ` : guides.map((g) => `
+            <div class="study-guide-card" id="guide-card-${esc(g.concept_id)}">
+              <div class="study-guide-card-header">
+                <h4 class="study-guide-topic-title">${esc(g.concept_name || g.concept_id)}</h4>
+                <span class="topic-badge-pill ${g.category && g.category.includes('Fragile') ? 'fragile' : 'weak'}">
+                  ${esc(g.category || 'Weak / Gap')}
+                </span>
+              </div>
+
+              <div class="study-guide-section">
+                <div class="study-guide-section-label">
+                  <span>🔍</span> Why You Missed This / Misconception Identified
+                </div>
+                <div class="study-guide-section-content">
+                  ${esc(g.why_missed || 'Diagnostic assessment revealed an incomplete grasp of the core mechanics.')}
+                </div>
+              </div>
+
+              <div class="study-guide-section">
+                <div class="study-guide-section-label">
+                  <span>📖</span> Detailed Concept Explanation (Grounded)
+                </div>
+                <div class="study-guide-section-content">
+                  ${esc(g.detailed_explanation || '')}
+                </div>
+                ${g.citations && g.citations.length ? `
+                  <div class="study-guide-citations">
+                    ${g.citations.map(c => `<span class="study-guide-citation-pill">Source: ${esc(c)}</span>`).join('')}
+                  </div>
+                ` : ''}
+              </div>
+
+              <div class="study-guide-section">
+                <div class="study-guide-section-label">
+                  <span>🧠</span> Key Mental Model / Formula / Mechanism
+                </div>
+                <div class="study-guide-section-content" style="font-style: italic; background: rgba(59, 130, 246, 0.06); padding: 0.6rem 0.85rem; border-radius: var(--radius-sm); border-left: 3px solid var(--primary);">
+                  ${esc(g.mental_model || '')}
+                </div>
+              </div>
+
+              <div class="study-guide-section">
+                <div class="study-guide-section-label">
+                  <span>📋</span> Step-by-Step Study Action Plan
+                </div>
+                <div class="study-guide-section-content">
+                  <ol style="margin: 0.4rem 0 0 1.25rem; padding: 0;">
+                    ${(g.action_plan || []).map(step => `<li style="margin-bottom: 0.35rem;">${esc(step)}</li>`).join('')}
+                  </ol>
+                </div>
+              </div>
+
+              <div class="study-guide-actions">
+                <button class="btn btn-secondary btn-teach-concept" data-concept-id="${esc(g.concept_id)}" data-concept-name="${esc(g.concept_name || g.concept_id)}">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/><circle cx="12" cy="12" r="1"/></svg>
+                  Teach Me This Concept
+                </button>
+                <button class="btn btn-primary btn-practice-concept" data-concept-id="${esc(g.concept_id)}" data-concept-name="${esc(g.concept_name || g.concept_id)}">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+                  Practice After Studying
+                </button>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+
+        <div style="display: flex; justify-content: flex-end; margin-top: 1.5rem; gap: 0.75rem;">
+          <button id="btn-report-continue" class="btn btn-primary">Continue to Dashboard &rarr;</button>
+        </div>
+      </div>
+    `;
+
+    renderMath(container);
+
+    // Wire action buttons
+    const teachBtns = container.querySelectorAll(".btn-teach-concept");
+    teachBtns.forEach(btn => {
+      btn.onclick = () => {
+        const cid = btn.getAttribute("data-concept-id");
+        const cname = btn.getAttribute("data-concept-name");
+        if (modal && typeof modal.close === "function") modal.close();
+        navigateTo("tutor");
+        setTimeout(() => {
+          const select = $("#tutor-concept-select");
+          if (select) {
+            select.value = cid;
+            select.dispatchEvent(new Event("change"));
+          }
+          const input = $("#tutor-input");
+          if (input) {
+            input.value = `Teach me the core concepts, mechanisms, and mental model of "${cname}". Explain the foundational principles with citations from my study material.`;
+            const sendBtn = $("#btn-tutor-send");
+            if (sendBtn) sendBtn.click();
+          }
+        }, 300);
+      };
+    });
+
+    const practiceBtns = container.querySelectorAll(".btn-practice-concept");
+    practiceBtns.forEach(btn => {
+      btn.onclick = () => {
+        const cid = btn.getAttribute("data-concept-id");
+        if (modal && typeof modal.close === "function") modal.close();
+        navigateTo("practice");
+        setTimeout(() => {
+          if (typeof startNewQuizSession === "function") {
+            startNewQuizSession(cid);
+          }
+        }, 300);
+      };
+    });
+
+    const continueBtn = $("#btn-report-continue", container);
+    if (continueBtn) {
+      continueBtn.onclick = () => {
+        if (modal && typeof modal.close === "function") modal.close();
+        showToast("Baseline complete! Learning path personalized and unlocked.", "success");
+        navigateTo("dashboard");
+      };
+    }
+  }
+
+  // Open existing baseline report modal on demand
+  async function openBaselineReportModal(materialId = "latest") {
+    const modal = $("#diagnostic-modal");
+    const body = $("#diagnostic-modal-body");
+    if (!modal || !body) return;
+
+    if (typeof modal.showModal === "function") {
+      modal.showModal();
+    } else {
+      modal.setAttribute("open", "");
+    }
+
+    body.innerHTML = `
+      <div style="padding: 2.5rem; text-align: center;">
+        <div class="upload-icon-pulse" style="width: 44px; height: 44px; margin: 0 auto 1rem auto;">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        </div>
+        <h4>Loading Baseline Diagnostic Report...</h4>
+        <p style="color: var(--ink-secondary); font-size: 0.88rem;">Retrieving grounded topic breakdown and personalized study guides...</p>
+      </div>
+    `;
+
+    try {
+      const res = await ApiService.getBaselineReport(materialId);
+      if (res && res.report) {
+        renderBaselineReportView(body, res.report, modal);
+      } else {
+        throw new Error("No baseline diagnostic report found. Complete your initial baseline diagnostic first.");
+      }
+    } catch (err) {
+      body.innerHTML = `
+        <div style="padding: 2rem; text-align: center;">
+          <h4 style="color: var(--color-danger); margin-bottom: 0.5rem;">Report Unavailable</h4>
+          <p style="color: var(--ink-secondary); margin-bottom: 1.25rem;">${esc(err.message)}</p>
+          <button class="btn btn-secondary" onclick="document.querySelector('#diagnostic-modal').close()">Close</button>
+        </div>
+      `;
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Baseline Knowledge Diagnostic Engine
   // -------------------------------------------------------------------------
-  async function startBaselineDiagnostic() {
+  async function startBaselineDiagnostic(targetMaterialId = null) {
     const modal = $("#diagnostic-modal");
     const body = $("#diagnostic-modal-body");
     if (!modal || !body) return;
@@ -1387,6 +1695,15 @@
         }
 
         body.innerHTML = `
+          <!-- Compulsory Baseline Diagnostic Banner -->
+          <div class="baseline-compulsory-banner">
+            <div class="baseline-banner-icon">🎯</div>
+            <div>
+              <div class="baseline-banner-title">Step 1 of Concept Mastery</div>
+              <div class="baseline-banner-desc">Complete your Baseline Diagnostic so the engine can map your weak topics and build your personalized teaching guide.</div>
+            </div>
+          </div>
+
           <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
             <span class="status-pill unknown">${esc(q.conceptName || q.concept_id || q.conceptId || "Concept")}</span>
             <div style="display:flex; align-items:center; gap:0.6rem;">
@@ -1470,41 +1787,49 @@
                     <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
                   </div>
                   <h4>Scoring Baseline Knowledge Profile...</h4>
-                  <p style="color: var(--ink-secondary); font-size: 0.88rem;">Conducting Multi-Agent Pedagogical Deliberation and unlocking prerequisite DAG...</p>
+                  <p style="color: var(--ink-secondary); font-size: 0.88rem;">Conducting Pedagogical Analysis & Synthesizing Grounded Study Guides...</p>
                 </div>
               `;
               try {
-                const subRes = await ApiService.submitDiagnostic(userAnswers, getCurrentUserId());
+                const subRes = await ApiService.submitDiagnostic(userAnswers, getCurrentUserId(), targetMaterialId);
                 const scorePct = subRes.score !== undefined ? subRes.score : 50;
                 const correctCnt = subRes.correct_count !== undefined ? subRes.correct_count : 0;
                 AppState.baselineCompleted = true;
+                if (AppState.activeMaterial) {
+                  AppState.activeMaterial.baseline_completed = true;
+                }
                 localStorage.setItem(`cm_baseline_${getCurrentUserId()}`, "true");
+                updateNavigation(AppState.currentRoute);
 
-                body.innerHTML = `
-                  <div style="padding: 2rem; text-align: center;">
-                    <div class="donut-chart-container" style="margin: 0 auto 1.25rem auto;">
-                      ${createDonutSvg(scorePct, 120, 10, scorePct >= 65 ? "var(--color-strong)" : "var(--primary)")}
-                      <div class="donut-chart-value">
-                        <span class="val-number">${scorePct}%</span>
-                        <span class="val-label">Baseline</span>
+                if (subRes && subRes.report) {
+                  renderBaselineReportView(body, subRes.report, modal);
+                } else {
+                  body.innerHTML = `
+                    <div style="padding: 2rem; text-align: center;">
+                      <div class="donut-chart-container" style="margin: 0 auto 1.25rem auto;">
+                        ${createDonutSvg(scorePct, 120, 10, scorePct >= 65 ? "var(--color-strong)" : "var(--primary)")}
+                        <div class="donut-chart-value">
+                          <span class="val-number">${scorePct}%</span>
+                          <span class="val-label">Baseline</span>
+                        </div>
+                      </div>
+                      <h3 style="margin-bottom: 0.4rem;">Baseline Diagnostic Completed!</h3>
+                      <p style="color: var(--ink-secondary); margin-bottom: 1.5rem; font-size: 0.9rem;">
+                        You demonstrated familiarity with <strong>${correctCnt} of ${questions.length}</strong> core concepts. Your personalized prerequisite roadmap has been generated.
+                      </p>
+                      <div style="display:flex; justify-content:center; gap:0.75rem;">
+                        <button id="btn-diag-done" class="btn btn-primary">Start Active Learning &rarr;</button>
                       </div>
                     </div>
-                    <h3 style="margin-bottom: 0.4rem;">Baseline Diagnostic Completed!</h3>
-                    <p style="color: var(--ink-secondary); margin-bottom: 1.5rem; font-size: 0.9rem;">
-                      You demonstrated familiarity with <strong>${correctCnt} of ${questions.length}</strong> core concepts. Your personalized prerequisite roadmap has been generated.
-                    </p>
-                    <div style="display:flex; justify-content:center; gap:0.75rem;">
-                      <button id="btn-diag-done" class="btn btn-primary">Start Active Learning &rarr;</button>
-                    </div>
-                  </div>
-                `;
-                const doneBtn = $("#btn-diag-done", body);
-                if (doneBtn) {
-                  doneBtn.onclick = () => {
-                    modal.close();
-                    showToast("Baseline complete! Learning path unlocked.", "success");
-                    navigateTo("dashboard");
-                  };
+                  `;
+                  const doneBtn = $("#btn-diag-done", body);
+                  if (doneBtn) {
+                    doneBtn.onclick = () => {
+                      modal.close();
+                      showToast("Baseline complete! Learning path unlocked.", "success");
+                      navigateTo("dashboard");
+                    };
+                  }
                 }
               } catch (submitErr) {
                 rethrowIfAbort(submitErr);
@@ -1544,7 +1869,7 @@
         </div>
       `;
       const retryBtn = $("#btn-diag-retry", body);
-      if (retryBtn) retryBtn.onclick = () => startBaselineDiagnostic();
+      if (retryBtn) retryBtn.onclick = () => startBaselineDiagnostic(targetMaterialId);
     }
   }
 
@@ -2067,7 +2392,7 @@
     }
 
     // ── Baseline Diagnostic Gating Check ─────────────────────────────────
-    const isBaselineDiagnosticActive = (loopStatus.loop_state === "BASELINE_DIAGNOSTIC" || !loopStatus.baseline_completed);
+    const isBaselineDiagnosticActive = !isBaselineCompletedForActiveMaterial() || (loopStatus.loop_state === "BASELINE_DIAGNOSTIC" || !loopStatus.baseline_completed);
 
     return `
       <div class="page-header">
@@ -2082,6 +2407,9 @@
               Start Quick Quiz (Complete Baseline First)
             </button>
           ` : `
+            <button id="btn-view-baseline-report-dash" class="btn btn-secondary" style="font-weight:600; margin-right:0.5rem;" title="Inspect post-baseline diagnostic report and grounded study guide">
+              📋 Diagnostic Report & Study Guide
+            </button>
             <a href="#practice" class="btn btn-primary">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg>
               Start Quick Quiz
@@ -2091,13 +2419,13 @@
       </div>
 
       ${isBaselineDiagnosticActive ? `
-        <!-- Step 1: First-Run Baseline Diagnostic CTA Banner -->
+        <!-- Step 1: Compulsory Baseline Diagnostic CTA Banner -->
         <div class="diagnostic-cta-banner" id="baseline-diagnostic-banner">
           <div>
-            <div class="diagnostic-badge-pill">Step 1 · Initial Knowledge Mapping</div>
+            <div class="diagnostic-badge-pill">Step 1 of Concept Mastery</div>
             <h2 class="diagnostic-title">Take Your Baseline Diagnostic Quiz</h2>
             <p class="diagnostic-desc">
-              Answer 6 quick diagnostic questions to baseline what you already know and unlock your active learning path.
+              Complete your Baseline Diagnostic so the engine can map your weak topics and build your personalized teaching guide.
             </p>
           </div>
           <button id="btn-start-baseline-diagnostic" class="btn btn-primary" style="background:#ffffff; color:#1e3a8a; border:none; font-weight:700;">
@@ -2643,6 +2971,24 @@
           <!-- Processing Stages & Status Card -->
           <div class="card">
             <h3 style="margin-bottom: 1.25rem;">LangGraph Ingestion Pipeline</h3>
+
+            <!-- Real-Time Ingestion Progress Bar -->
+            <div class="ingest-live-progress-wrap" id="ingest-progress-container" style="display:none;">
+              <div class="ingest-progress-header">
+                <span class="ingest-stage-label" id="ingest-stage-label">
+                  <span class="spinner" style="width:14px; height:14px; border-width:2px; display:inline-block;"></span>
+                  Initializing Ingestion...
+                </span>
+                <span class="ingest-pct-badge" id="ingest-pct-badge">0%</span>
+              </div>
+              <div class="ingest-progress-track">
+                <div class="ingest-progress-fill" id="ingest-progress-fill" style="width: 0%;"></div>
+              </div>
+              <div class="ingest-detail-text" id="ingest-detail-text">
+                Extracting transcript / document text...
+              </div>
+            </div>
+
             <div class="stages-list" id="ingest-stages">
               <div class="stage-item ${doc && doc.ready ? 'done' : ''}" id="stage-1">
                 <div class="stage-status-icon">
@@ -2724,6 +3070,7 @@
                     <th>Material Title & Source</th>
                     <th>Extracted Chunks</th>
                     <th>Canonical Concepts</th>
+                    <th>Baseline Status</th>
                     <th>Added On</th>
                     <th style="text-align:right;">Actions</th>
                   </tr>
@@ -2748,11 +3095,27 @@
                         <td>
                           <span style="font-size:0.85rem;">${m.concept_count} concept(s)</span>
                         </td>
+                        <td>
+                          ${m.baseline_completed ? `
+                            <span class="topic-badge-pill mastered" style="padding:0.18rem 0.55rem; font-size:0.75rem;">✓ Completed</span>
+                          ` : `
+                            <span class="topic-badge-pill fragile" style="padding:0.18rem 0.55rem; font-size:0.75rem;">⚠ Required</span>
+                          `}
+                        </td>
                         <td style="font-size:0.82rem; color:var(--ink-muted);">
                           ${(m.created_at || '').slice(0, 10)}
                         </td>
                         <td style="text-align:right;">
-                          <div class="material-actions" style="justify-content:flex-end;">
+                          <div class="material-actions" style="justify-content:flex-end; gap:0.4rem;">
+                            ${m.baseline_completed ? `
+                              <button class="btn btn-sm btn-secondary btn-view-baseline-report" data-id="${esc(m.material_id)}" title="View Grounded Study Guide">
+                                📋 Report
+                              </button>
+                            ` : `
+                              <button class="btn btn-sm btn-primary btn-take-baseline" data-id="${esc(m.material_id)}" title="Take Compulsory Baseline Diagnostic">
+                                🎯 Baseline
+                              </button>
+                            `}
                             <button class="btn btn-sm btn-secondary btn-preview-mat" data-id="${esc(m.material_id)}">
                               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
                               Preview
@@ -4181,6 +4544,11 @@
         diagBtn.onclick = () => withButtonLock(diagBtn, () => startBaselineDiagnostic());
       }
 
+      const viewReportBtn = $("#btn-view-baseline-report-dash");
+      if (viewReportBtn) {
+        viewReportBtn.onclick = () => openBaselineReportModal("latest");
+      }
+
       $$(".start-remedial-review").forEach(btn => {
         btn.onclick = () => {
           AppState.quizSession.remedialMode = true;
@@ -4287,16 +4655,15 @@
           const stages = [$("#stage-1"), $("#stage-2"), $("#stage-3"), $("#stage-4")];
           stages.forEach(s => s && (s.className = "stage-item running"));
 
+          const clientMatId = "mat_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 7);
           try {
-            // If strictly PDFs, call uploadPdf for backward compatibility; otherwise ingestMaterialFile
-            await ApiService.ingestMaterialFile(selectedFiles, getCurrentUserId());
-
-            stages.forEach(s => s && (s.className = "stage-item done"));
-            showToast("Material ingested successfully into vectorless index!", "success");
-            await syncActiveDocument();
-            setTimeout(() => {
-              navigateTo("upload");
-            }, 800);
+            const ingestPromise = ApiService.ingestMaterialFile(selectedFiles, getCurrentUserId(), null, clientMatId);
+            await runIngestionWithProgress(clientMatId, ingestPromise, async (result) => {
+              stages.forEach(s => s && (s.className = "stage-item done"));
+              showToast("Material ingested successfully into vectorless index!", "success");
+              await syncActiveDocument();
+              startBaselineDiagnostic(result && result.material_id ? result.material_id : clientMatId);
+            });
           } catch (err) {
             stages.forEach(s => s && (s.className = "stage-item"));
             showToast(`Ingestion error: ${err.message}`, "danger");
@@ -4327,17 +4694,17 @@
             const stages = [$("#stage-1"), $("#stage-2"), $("#stage-3"), $("#stage-4")];
             stages.forEach(s => s && (s.className = "stage-item running"));
 
+            const clientMatId = "mat_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 7);
             try {
               const sourceType = urlTypeSelect ? urlTypeSelect.value : "auto";
               const customTitle = urlTitleInput ? urlTitleInput.value.trim() : "";
-              await ApiService.ingestMaterialUrl(rawUrl, sourceType, getCurrentUserId(), customTitle);
-
-              stages.forEach(s => s && (s.className = "stage-item done"));
-              showToast("URL material successfully parsed and indexed!", "success");
-              await syncActiveDocument();
-              setTimeout(() => {
-                navigateTo("upload");
-              }, 800);
+              const ingestPromise = ApiService.ingestMaterialUrl(rawUrl, sourceType, getCurrentUserId(), customTitle, clientMatId);
+              await runIngestionWithProgress(clientMatId, ingestPromise, async (result) => {
+                stages.forEach(s => s && (s.className = "stage-item done"));
+                showToast("URL material successfully parsed and indexed!", "success");
+                await syncActiveDocument();
+                startBaselineDiagnostic(result && result.material_id ? result.material_id : clientMatId);
+              });
             } catch (err) {
               stages.forEach(s => s && (s.className = "stage-item"));
               showToast(`Ingest URL error: ${err.message}`, "danger");
@@ -4420,17 +4787,17 @@
             const stages = [$("#stage-1"), $("#stage-2"), $("#stage-3"), $("#stage-4")];
             stages.forEach(s => s && (s.className = "stage-item running"));
 
+            const clientMatId = "mat_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 7);
             try {
               const fileName = `voice_note_${Date.now()}.webm`;
               const audioFile = new File([recordedAudioBlob], fileName, { type: "audio/webm" });
-              await ApiService.ingestMaterialFile([audioFile], getCurrentUserId(), "Spoken Lecture Voice Note");
-
-              stages.forEach(s => s && (s.className = "stage-item done"));
-              showToast("Voice note transcribed & indexed successfully!", "success");
-              await syncActiveDocument();
-              setTimeout(() => {
-                navigateTo("upload");
-              }, 800);
+              const ingestPromise = ApiService.ingestMaterialFile([audioFile], getCurrentUserId(), "Spoken Lecture Voice Note", clientMatId);
+              await runIngestionWithProgress(clientMatId, ingestPromise, async (result) => {
+                stages.forEach(s => s && (s.className = "stage-item done"));
+                showToast("Voice note transcribed & indexed successfully!", "success");
+                await syncActiveDocument();
+                startBaselineDiagnostic(result && result.material_id ? result.material_id : clientMatId);
+              });
             } catch (err) {
               stages.forEach(s => s && (s.className = "stage-item"));
               showToast(`Voice note ingestion error: ${err.message}`, "danger");
@@ -4450,14 +4817,14 @@
           const stages = [$("#stage-1"), $("#stage-2"), $("#stage-3"), $("#stage-4")];
           stages.forEach(s => s && (s.className = "stage-item running"));
 
+          const clientMatId = "mat_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 7);
           try {
-            await ApiService.loadSamplePdf();
-            stages.forEach(s => s && (s.className = "stage-item done"));
-            showToast("Sample 'Machine Learning Basics' loaded successfully!", "success");
-            await syncActiveDocument();
-            setTimeout(() => {
-              navigateTo("upload");
-            }, 800);
+            await runIngestionWithProgress(clientMatId, ApiService.loadSamplePdf(), async (result) => {
+              stages.forEach(s => s && (s.className = "stage-item done"));
+              showToast("Sample 'Machine Learning Basics' loaded successfully!", "success");
+              await syncActiveDocument();
+              startBaselineDiagnostic(result && result.material_id ? result.material_id : clientMatId);
+            });
           } catch (e) {
             stages.forEach(s => s && (s.className = "stage-item"));
             showToast(`Could not load sample: ${e.message}`, "danger");
@@ -4490,6 +4857,23 @@
               return false;
             }
           }, { keepLockedOnSuccess: true });
+        };
+      });
+
+      // 6b. Baseline Diagnostic & Report Actions from Materials Table
+      $$(".btn-take-baseline").forEach(btn => {
+        btn.onclick = e => {
+          e.stopPropagation();
+          const matId = btn.getAttribute("data-id");
+          startBaselineDiagnostic(matId);
+        };
+      });
+
+      $$(".btn-view-baseline-report").forEach(btn => {
+        btn.onclick = e => {
+          e.stopPropagation();
+          const matId = btn.getAttribute("data-id");
+          openBaselineReportModal(matId);
         };
       });
 
@@ -4941,6 +5325,7 @@
               return false;
             }
           }, {
+            allowInitiallyDisabled: true,
             loadingHtml: "Evaluating Retrieval...",
             keepLockedOnSuccess: true
           });
@@ -6236,9 +6621,27 @@
   // =========================================================================
 
   function updateNavigation(routeId) {
+    const isBaselineDone = isBaselineCompletedForActiveMaterial();
+
     $$(".nav-link").forEach(link => {
       const target = link.getAttribute("data-nav");
       link.classList.toggle("active", target === routeId);
+
+      // Visual lock badge for free practice & active recall until baseline is done
+      if (target === "practice" || target === "active-recall") {
+        let lockBadge = link.querySelector(".tab-lock-badge");
+        if (!isBaselineDone) {
+          if (!lockBadge) {
+            lockBadge = document.createElement("span");
+            lockBadge.className = "tab-lock-badge";
+            lockBadge.title = "Complete Step 1 Baseline Diagnostic First";
+            lockBadge.textContent = "🔒";
+            link.appendChild(lockBadge);
+          }
+        } else if (lockBadge) {
+          lockBadge.remove();
+        }
+      }
     });
 
     const pageTitle = $("#topbar-page-title");
@@ -6270,6 +6673,13 @@
   async function navigateTo(routeId) {
     const validRoutes = ["dashboard", "upload", "tutor", "active-recall", "smart-notes", "practice", "learning-path", "progress", "settings"];
     const activeRoute = validRoutes.includes(routeId) ? routeId : "dashboard";
+
+    if ((activeRoute === "practice" || activeRoute === "active-recall") && !isBaselineCompletedForActiveMaterial()) {
+      showToast("Complete your Step 1 Baseline Diagnostic first to unlock guided practice and active recall.", "warning");
+      startBaselineDiagnostic();
+      return;
+    }
+
     AppState.currentRoute = activeRoute;
     AppState._navigationSeq = (AppState._navigationSeq || 0) + 1;
     const navSeq = AppState._navigationSeq;

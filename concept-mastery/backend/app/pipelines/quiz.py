@@ -1156,3 +1156,176 @@ def evaluate_answer(student_answer: str, concept_id: str, question_text: str = "
         "misconceptions": res.misconceptions,
         "feedback": f"Grounded response for {concept_id} recorded: {res.reasoning_depth_level}."
     }
+
+
+# ── Baseline Diagnostic Report & Grounded Study Guide Generator ──────────────
+
+def generate_baseline_diagnostic_report(
+    user_id: str = "default",
+    submissions: list[dict | QuizSubmission] | None = None,
+    evaluations: list[dict] | None = None,
+    material_id: str | None = None,
+) -> dict:
+    """Generate and persist a BaselineDiagnosticReport containing:
+      - overall_score and readiness summary
+      - topic_breakdown: Weak / Gap, Developing / Fragile, Strong / Mastered
+      - weak_topics_guide: 4 grounded sections for each Weak and Fragile topic
+      - persists in store and marks material baseline_completed = True
+    """
+    from datetime import datetime, timezone
+    from .pedagogical_agents import generate_pedagogical_study_guide
+
+    subs: list[QuizSubmission] = []
+    if submissions:
+        for s in submissions:
+            if isinstance(s, dict):
+                subs.append(QuizSubmission(**s))
+            elif isinstance(s, QuizSubmission):
+                subs.append(s)
+
+    eval_list: list[dict] = []
+    if evaluations:
+        eval_list = list(evaluations)
+    else:
+        for sub in subs:
+            res = evaluate_submission(sub)
+            eval_list.append(res.model_dump())
+
+    # Map concepts from KB
+    kb = store.get_kb(user_id)
+    concepts_by_id = {}
+    if kb and kb.get("ready"):
+        for c in kb.get("concepts", []):
+            cid = c.get("id") or c.get("concept_id") or c.get("name")
+            concepts_by_id[cid] = c.get("name") or cid
+            if c.get("name"):
+                concepts_by_id[c["name"]] = c["name"]
+
+    # If material_id not provided, try to detect from active material
+    target_mat_id = material_id
+    if not target_mat_id:
+        dash_summary = store.get_dashboard_summary(user_id=user_id)
+        active_mat = dash_summary.get("active_material")
+        if active_mat:
+            target_mat_id = active_mat.get("material_id")
+        else:
+            all_mats = store.list_study_materials(user_id=user_id)
+            if all_mats:
+                target_mat_id = all_mats[0]["material_id"]
+
+    # Group scores by concept_id
+    concept_scores: dict[str, list[float]] = {}
+    concept_items: dict[str, list[dict]] = {}
+
+    for idx, e in enumerate(eval_list):
+        cid = e.get("concept_id") or (subs[idx].concept_id if idx < len(subs) else "concept_core")
+        score = float(e.get("score", 1.0 if e.get("is_correct") else 0.0))
+        concept_scores.setdefault(cid, []).append(score)
+        concept_items.setdefault(cid, []).append(e)
+
+    weak_list = []
+    fragile_list = []
+    strong_list = []
+    weak_topics_guide = []
+
+    for cid, scores in concept_scores.items():
+        avg = sum(scores) / max(len(scores), 1)
+        cname = concepts_by_id.get(cid, cid.replace("_", " ").title())
+        item_data = {
+            "concept_id": cid,
+            "concept_name": cname,
+            "score": round(avg, 2),
+        }
+
+        # Retrieve grounded chunks
+        chunks = GLOBAL_INDEX.retrieve_chunks(cid, max_chunks=3, user_id=user_id)
+        if not chunks:
+            bm25_matches = GLOBAL_INDEX.search_bm25(cname, max_chunks=3, user_id=user_id)
+            chunks = [m[1] for m in bm25_matches]
+
+        items_for_c = concept_items.get(cid, [])
+        all_miscons = []
+        for it in items_for_c:
+            all_miscons.extend(it.get("misconceptions", []))
+
+        missed_info = {
+            "concept_id": cid,
+            "concept_name": cname,
+            "scores": scores,
+            "misconceptions": all_miscons,
+            "student_answer": (items_for_c[0].get("user_answer") if items_for_c else "") or "",
+        }
+
+        if avg >= 0.80:
+            item_data["status"] = "Strong / Mastered"
+            strong_list.append(item_data)
+        elif avg >= 0.50:
+            item_data["status"] = "Developing / Fragile"
+            fragile_list.append(item_data)
+            guide = generate_pedagogical_study_guide(
+                concept_id=cid,
+                concept_name=cname,
+                course_chunks=chunks,
+                missed_info=missed_info,
+                category="Developing / Fragile"
+            )
+            weak_topics_guide.append(guide)
+        else:
+            item_data["status"] = "Weak / Gap"
+            weak_list.append(item_data)
+            guide = generate_pedagogical_study_guide(
+                concept_id=cid,
+                concept_name=cname,
+                course_chunks=chunks,
+                missed_info=missed_info,
+                category="Weak / Gap"
+            )
+            weak_topics_guide.append(guide)
+
+    total_q = max(len(eval_list), 1)
+    correct_cnt = sum(1 for e in eval_list if e.get("is_correct") or e.get("score", 0) >= 0.8)
+    overall_pct = round((correct_cnt / total_q) * 100)
+
+    if overall_pct >= 80:
+        readiness_summary = (
+            f"Strong foundational baseline ({overall_pct}%)! You demonstrated mastery of core prerequisites. "
+            f"Review the targeted guides for any fragile areas before advancing."
+        )
+    elif overall_pct >= 50:
+        readiness_summary = (
+            f"Developing baseline ({overall_pct}%). Foundational knowledge is present, but critical misconceptions "
+            f"were identified in {len(weak_list) + len(fragile_list)} prerequisite topics. Follow the grounded study guide below."
+        )
+    else:
+        readiness_summary = (
+            f"Prerequisite gaps detected ({overall_pct}%). The baseline diagnostic mapped foundational weaknesses in "
+            f"{len(weak_list)} concepts. Complete your study action plans before entering active learning."
+        )
+
+    report = {
+        "report_id": f"diag_rep_{uuid.uuid4().hex[:8]}",
+        "material_id": target_mat_id,
+        "user_id": user_id,
+        "overall_score": overall_pct,
+        "total_questions": len(eval_list),
+        "correct_count": correct_cnt,
+        "readiness_summary": readiness_summary,
+        "topic_breakdown": {
+            "weak": weak_list,
+            "fragile": fragile_list,
+            "strong": strong_list,
+        },
+        "weak_topics_guide": weak_topics_guide,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    # Persist report to study_materials and mark baseline_completed
+    if target_mat_id:
+        store.set_material_baseline_report(
+            material_id=target_mat_id,
+            user_id=user_id,
+            report=report,
+            completed=True
+        )
+
+    return report

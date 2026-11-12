@@ -829,10 +829,17 @@ def post_diagnostic_baseline_evaluate(
     request: Request,
     current_user: User = Depends(get_current_user),
 ):
-    """Evaluate baseline diagnostic answers and transition learner lifecycle to ACTIVE_LEARNING."""
+    """Evaluate baseline diagnostic answers, generate grounded study guide, and transition to ACTIVE_LEARNING."""
     uid = _resolve_tenant_user_id(current_user, request, body.user_id)
     try:
-        return loop.evaluate_baseline_diagnostic(user_id=uid, submissions=body.submissions)
+        res = loop.evaluate_baseline_diagnostic(user_id=uid, submissions=body.submissions)
+        report = quiz.generate_baseline_diagnostic_report(
+            user_id=uid,
+            submissions=body.submissions,
+            evaluations=res.get("evaluations", []),
+        )
+        res["report"] = report
+        return res
     except store.UserError as ue:
         raise HTTPException(status_code=400, detail=str(ue))
     except Exception as e:
@@ -1060,7 +1067,7 @@ def post_diagnostic_submit(
     request: Request,
     current_user: User = Depends(get_current_user),
 ):
-    """Grade baseline diagnostic submissions, update epistemic beliefs, and unlock active loop."""
+    """Grade baseline diagnostic submissions, update epistemic beliefs, generate grounded study guide, and unlock active loop."""
     uid = _resolve_tenant_user_id(current_user, request, body.user_id)
     results = []
     correct_count = 0
@@ -1087,6 +1094,21 @@ def post_diagnostic_submit(
 
     total = max(len(body.answers), 1)
     score_pct = round((correct_count / total) * 100)
+
+    # Generate authoritative Baseline Diagnostic Report & Grounded Study Guide
+    report = quiz.generate_baseline_diagnostic_report(
+        user_id=uid,
+        submissions=body.answers,
+        evaluations=results,
+        material_id=body.material_id,
+    )
+
+    # Transition lifecycle to ACTIVE_LEARNING
+    try:
+        loop.set_lifecycle_state(uid, loop.LIFECYCLE_ACTIVE_LEARNING)
+    except Exception:
+        pass
+
     return {
         "ok": True,
         "score": score_pct,
@@ -1094,10 +1116,71 @@ def post_diagnostic_submit(
         "total": len(body.answers),
         "baseline_completed": True,
         "results": results,
+        "report": report,
     }
 
 
 # ── 7. Universal Multi-Format Study Materials & Interactive Preview ──────────
+
+@router.get("/materials/{material_id}/ingest-status")
+@router.get("/materials/{material_id}/ingest-status/")
+def get_material_ingest_status(
+    material_id: str,
+    request: Request,
+    user_id: str = "default",
+    current_user: User = Depends(get_current_user),
+):
+    """Retrieve real-time ingestion stage and progress percentage."""
+    uid = _resolve_tenant_user_id(current_user, request, user_id)
+    resolved_mid = material_id
+    if resolved_mid == "latest":
+        summary = store.get_dashboard_summary(user_id=uid)
+        active_m = summary.get("active_material")
+        if active_m:
+            resolved_mid = active_m["material_id"]
+        else:
+            mats = store.list_study_materials(user_id=uid)
+            if mats:
+                resolved_mid = mats[0]["material_id"]
+
+    status_info = ingest.get_ingest_progress(resolved_mid)
+    return {
+        "ok": True,
+        **status_info
+    }
+
+
+@router.get("/materials/{material_id}/baseline-report")
+@router.get("/materials/{material_id}/baseline-report/")
+def get_material_baseline_report_endpoint(
+    material_id: str,
+    request: Request,
+    user_id: str = "default",
+    current_user: User = Depends(get_current_user),
+):
+    """Retrieve post-baseline diagnostic report and grounded study guide for a study material."""
+    uid = _resolve_tenant_user_id(current_user, request, user_id)
+    resolved_mid = material_id
+    if resolved_mid == "latest":
+        summary = store.get_dashboard_summary(user_id=uid)
+        active_m = summary.get("active_material")
+        if active_m:
+            resolved_mid = active_m["material_id"]
+        else:
+            mats = store.list_study_materials(user_id=uid)
+            if mats:
+                resolved_mid = mats[0]["material_id"]
+
+    report = store.get_material_baseline_report(resolved_mid, user_id=uid)
+    if not report:
+        raise HTTPException(status_code=404, detail="No baseline report found for this material.")
+    return {
+        "ok": True,
+        "material_id": resolved_mid,
+        "baseline_completed": True,
+        "report": report
+    }
+
 
 @router.post("/materials/ingest-file")
 @router.post("/materials/ingest-file/")
@@ -1105,6 +1188,7 @@ async def post_materials_ingest_file(
     request: Request,
     files: list[UploadFile] = File(default=[]),
     file: UploadFile | None = File(default=None),
+    material_id: str | None = Form(None),
     user_id: str = Form("default"),
     title: str | None = Form(None),
     current_user: User = Depends(get_current_user),
@@ -1142,6 +1226,7 @@ async def post_materials_ingest_file(
                 path=dest,
                 user_id=uid,
                 title=title or Path(f.filename).stem.replace("_", " ").title(),
+                material_id=material_id,
             )
             ingested_materials.append(mat_res)
         except store.UserError as ue:
@@ -1154,6 +1239,7 @@ async def post_materials_ingest_file(
         "ok": True,
         "count": len(ingested_materials),
         "materials": ingested_materials,
+        "material_id": ingested_materials[0]["material_id"] if ingested_materials else material_id,
         "active_kb": {
             "ready": active_kb.get("ready", False),
             "title": active_kb.get("file", ""),
@@ -1183,6 +1269,7 @@ async def post_materials_ingest_url(
             source_type=req.source_type,
             user_id=uid,
             title=req.title,
+            material_id=req.material_id,
         )
     except store.UserError as ue:
         raise HTTPException(status_code=400, detail=str(ue))
@@ -1193,6 +1280,7 @@ async def post_materials_ingest_url(
     return {
         "ok": True,
         "material": mat_res,
+        "material_id": mat_res.get("material_id"),
         "active_kb": {
             "ready": active_kb.get("ready", False),
             "title": active_kb.get("file", ""),
