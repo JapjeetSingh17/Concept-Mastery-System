@@ -588,10 +588,11 @@
       const cleanType = esc(type);
       return `<button class="grounded-citation-chip view-citation-chip" data-loc="${cleanLoc}" data-type="${cleanType}" type="button">📖 ${cleanType} ${cleanLoc}</button>`;
     });
-    out = out.replace(/\[(?:Video\s+)?(\d{1,2}:\d{2}(?::\d{2})?)\]/gi, (match, ts) => {
+    out = out.replace(/\[(?:Video\s+)?(\d{1,2}:\d{2}(?::\d{2})?)(?:\s*-\s*(\d{1,2}:\d{2}(?::\d{2})?))?\]/gi, (match, ts, tsEnd) => {
       const cleanTs = esc(ts.trim());
+      const label = tsEnd ? `${cleanTs} - ${esc(tsEnd.trim())}` : cleanTs;
       const sec = parseTimestampToSeconds(cleanTs);
-      return `<button class="timestamp-citation-chip view-timestamp-chip" data-seconds="${sec}" data-timestamp="${cleanTs}" type="button">▶ [${cleanTs}]</button>`;
+      return `<button class="timestamp-citation-chip view-timestamp-chip" data-seconds="${sec}" data-timestamp="${cleanTs}" type="button">▶ [${label}]</button>`;
     });
     return out;
   }
@@ -3890,6 +3891,137 @@
     }
   };
 
+  // Dedicated Markdown Formatter for AI Tutor Chat
+  function formatTutorMarkdown(mdText) {
+    if (!mdText) return "";
+    const raw = String(mdText).replace(/\r\n/g, "\n");
+    const lines = raw.split("\n");
+    let html = "";
+    let inList = false;
+    let listType = "";
+    let inCodeBlock = false;
+    let codeBlockContent = "";
+    let codeLang = "";
+
+    function closeList() {
+      if (inList) {
+        html += (listType === "ul" ? "</ul>" : "</ol>");
+        inList = false;
+        listType = "";
+      }
+    }
+
+    function formatInline(str) {
+      if (!str) return "";
+      let s = esc(str);
+      // Code spans `...`
+      s = s.replace(/`([^`]+)`/g, '<code class="inline-code" style="background:var(--surface-subtle); padding:0.15rem 0.35rem; border-radius:4px; font-size:0.88em; font-family:monospace;">$1</code>');
+      // Bold **...**
+      s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+      // Italics *...* or _..._
+      s = s.replace(/(^|[^*])\*([^*]+)\*([^*]|$)/g, '$1<em>$2</em>$3');
+      s = s.replace(/(^|[^_])_([^_]+)_([^_]|$)/g, '$1<em>$2</em>$3');
+      // Grounded citations & timestamps
+      s = formatGroundedCitations(s);
+      return s;
+    }
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const trimmed = line.trim();
+
+      // Code blocks
+      if (trimmed.startsWith("```")) {
+        if (!inCodeBlock) {
+          closeList();
+          inCodeBlock = true;
+          codeLang = trimmed.slice(3).trim();
+          codeBlockContent = "";
+        } else {
+          inCodeBlock = false;
+          html += `<pre class="tutor-code-block" style="background:var(--surface-subtle); border:1px solid var(--border-subtle); padding:0.75rem; border-radius:var(--radius-sm); overflow-x:auto; margin:0.5rem 0;"><code class="language-${esc(codeLang)}">${esc(codeBlockContent)}</code></pre>`;
+        }
+        continue;
+      }
+
+      if (inCodeBlock) {
+        codeBlockContent += (codeBlockContent ? "\n" : "") + line;
+        continue;
+      }
+
+      // Horizontal rules
+      if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
+        closeList();
+        html += `<hr style="border:0; border-top:1px solid var(--border-subtle); margin:0.85rem 0; opacity:0.6;" />`;
+        continue;
+      }
+
+      // Headings ###, ##, #
+      const h3Match = line.match(/^###\s+(.*)$/);
+      if (h3Match) {
+        closeList();
+        html += `<h4 class="tutor-heading" style="margin:0.85rem 0 0.35rem 0; font-size:1.02rem; font-weight:700; color:var(--ink-primary); line-height:1.4;">${formatInline(h3Match[1])}</h4>`;
+        continue;
+      }
+
+      const h2Match = line.match(/^##\s+(.*)$/);
+      if (h2Match) {
+        closeList();
+        html += `<h3 class="tutor-heading" style="margin:0.95rem 0 0.4rem 0; font-size:1.1rem; font-weight:700; color:var(--ink-primary); line-height:1.4;">${formatInline(h2Match[1])}</h3>`;
+        continue;
+      }
+
+      const h1Match = line.match(/^#\s+(.*)$/);
+      if (h1Match) {
+        closeList();
+        html += `<h2 class="tutor-heading" style="margin:1rem 0 0.45rem 0; font-size:1.2rem; font-weight:700; color:var(--ink-primary); line-height:1.4;">${formatInline(h1Match[1])}</h2>`;
+        continue;
+      }
+
+      // Unordered lists: * item, - item, • item
+      const ulMatch = line.match(/^(\s*)([-*•])\s+(.*)$/);
+      if (ulMatch) {
+        if (!inList || listType !== "ul") {
+          closeList();
+          html += `<ul class="tutor-bullet-list" style="margin:0.35rem 0 0.6rem 1.25rem; padding:0; list-style-type:disc;">`;
+          inList = true;
+          listType = "ul";
+        }
+        html += `<li style="margin-bottom:0.25rem; line-height:1.5;">${formatInline(ulMatch[3])}</li>`;
+        continue;
+      }
+
+      // Ordered lists: 1. item, 2. item
+      const olMatch = line.match(/^(\s*)\d+\.\s+(.*)$/);
+      if (olMatch) {
+        if (!inList || listType !== "ol") {
+          closeList();
+          html += `<ol class="tutor-numbered-list" style="margin:0.35rem 0 0.6rem 1.25rem; padding:0; list-style-type:decimal;">`;
+          inList = true;
+          listType = "ol";
+        }
+        html += `<li style="margin-bottom:0.25rem; line-height:1.5;">${formatInline(olMatch[2])}</li>`;
+        continue;
+      }
+
+      // Empty line closes active list
+      if (!trimmed) {
+        closeList();
+        continue;
+      }
+
+      // Paragraph line
+      closeList();
+      html += `<p style="margin:0.35rem 0 0.5rem 0; line-height:1.6;">${formatInline(line)}</p>`;
+    }
+
+    closeList();
+    if (inCodeBlock) {
+      html += `<pre class="tutor-code-block" style="background:var(--surface-subtle); border:1px solid var(--border-subtle); padding:0.75rem; border-radius:var(--radius-sm); overflow-x:auto; margin:0.5rem 0;"><code>${esc(codeBlockContent)}</code></pre>`;
+    }
+    return html;
+  }
+
   // Helper to render chat message
   function renderChatMessage(msg) {
     const isUser = msg.sender === "user";
@@ -3981,7 +4113,7 @@
           `}
         </div>
         <div class="message-bubble">
-          <div>${msg.text}</div>
+          ${isUser ? `<div style="white-space: pre-wrap; line-height: 1.55;">${esc(msg.text)}</div>` : `<div class="tutor-markdown-body" style="line-height: 1.6;">${formatTutorMarkdown(msg.text)}</div>`}
           ${citationsHtml}
           ${artifactsHtml}
           ${linksHtml}
@@ -4611,7 +4743,7 @@
             input.value = "";
 
             // Append student message
-            const userMsg = { sender: "user", text: esc(question) };
+            const userMsg = { sender: "user", text: question };
             AppState.chatMessages.push(userMsg);
             stream.insertAdjacentHTML("beforeend", renderChatMessage(userMsg));
             renderMath(stream);
@@ -4638,7 +4770,7 @@
 
               const tutorMsg = {
                 sender: "assistant",
-                text: esc(resp.answer),
+                text: resp.answer || "",
                 citations: resp.citations || [],
                 artifacts: resp.artifacts || [],
                 external_links: resp.external_links || []
@@ -6287,6 +6419,8 @@
       window.renderRecommendationCard = renderRecommendationCard;
       window.Views = Views;
       window.AppState = AppState;
+      window.renderChatMessage = renderChatMessage;
+      window.formatTutorMarkdown = formatTutorMarkdown;
     }
 
     handleHashChange();

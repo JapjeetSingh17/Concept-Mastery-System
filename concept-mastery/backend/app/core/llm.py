@@ -136,9 +136,8 @@ def is_free_model(model_name: str) -> bool:
 def get_verified_candidate_models(models_pool: list[str]) -> list[str]:
     """Verify and order models so that models with active tokens come FIRST.
 
-    If a model (like Model 1) is verified to have 0 tokens/credits, it is moved past
-    so the pipeline starts directly with Model 2. If Model 2 also runs out, it repeats
-    the same and switches the start to Model 3.
+    If a model has returned an error or exhausted its tokens, it is moved past
+    so the pipeline starts directly with the next candidate in the priority chain.
     """
     now = time.time()
     candidates = []
@@ -148,30 +147,6 @@ def get_verified_candidate_models(models_pool: list[str]) -> list[str]:
         alias = OPENROUTER_SLUG_ALIASES.get(m)
         if alias and alias not in candidates:
             candidates.append(alias)
-
-    status = check_openrouter_account_status()
-    has_paid = status.get("has_paid_credits", True)
-    free_remaining = status.get("free_remaining", 50)
-
-    # Preflight check: If OpenRouter account has 0 paid credits, mark paid models as out of tokens
-    if not has_paid:
-        for m in candidates:
-            if not is_free_model(m) and m not in _MODEL_TOKEN_STATUS:
-                _MODEL_TOKEN_STATUS[m] = {
-                    "has_tokens": False,
-                    "cooldown_until": now + 3600,
-                    "reason": "OpenRouter account balance is $0.00",
-                }
-
-    # If free tier daily quota is 0, mark free models as exhausted
-    if free_remaining <= 0:
-        for m in candidates:
-            if is_free_model(m) and m not in _MODEL_TOKEN_STATUS:
-                _MODEL_TOKEN_STATUS[m] = {
-                    "has_tokens": False,
-                    "cooldown_until": now + 3600,
-                    "reason": "OpenRouter daily free requests limit reached (0 remaining)",
-                }
 
     available_models = []
     exhausted_models = []
@@ -183,7 +158,7 @@ def get_verified_candidate_models(models_pool: list[str]) -> list[str]:
         else:
             available_models.append(m)
 
-    # Models with tokens available come first at the start!
+    # Available candidate models come first at the start
     if available_models:
         return available_models
     return exhausted_models
@@ -719,16 +694,13 @@ def _call_openrouter(system: str, user: str, max_tokens: int = 700, timeout: Opt
     start_t = time.time()
     per_model_timeout = min(timeout, 8.0) if timeout is not None else 8.0
 
-    # Fast-path preflight: if account has $0 paid credits and 0 free daily quota remaining,
-    # skip doomed sequential HTTP attempts and route immediately to secondary provider.
+    # Check account status for informational telemetry
     status = check_openrouter_account_status()
     if status.get("fully_exhausted"):
-        logger.info(
-            f"[OpenRouter Gateway] Account has $0.00 credits and free tier daily limit reached "
-            f"({status.get('free_remaining', 0)} free remaining). "
-            f"Immediately cascading to secondary provider (Gemini / Groq) with 0ms delay."
+        logger.debug(
+            f"[OpenRouter Gateway] Preflight status indicates 0 paid credits and 0 free daily quota remaining; "
+            f"proceeding to verify live candidate models..."
         )
-        return None
 
     headers = {
         "Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
@@ -788,63 +760,55 @@ def _call_openrouter(system: str, user: str, max_tokens: int = 700, timeout: Opt
                         content = msg.get("content") or msg.get("reasoning") or ""
                         if content:
                             resolved = data.get("model", model)
+                            # If we retried without response_format and JSON was requested, parse/extract JSON block
+                            if is_json and "response_format" not in payload:
+                                extracted = extract_json_payload(content)
+                                if extracted:
+                                    content = extracted
                             logger.info(f"OpenRouter answered successfully via model: {resolved}")
                             return content.strip()
 
-                # If 400 Bad Request, check if it's due to response_format
-                if r.status_code == 400 and attempt == 1 and "response_format" in payload:
-                    logger.info(f"OpenRouter model {model} rejected response_format; retrying without it...")
+                # If model call failed when response_format was used, retry once without response_format
+                if attempt == 1 and "response_format" in payload:
+                    logger.info(
+                        f"[OpenRouter] Model '{model}' returned HTTP {r.status_code} with response_format. "
+                        f"Retrying once without response_format..."
+                    )
                     payload.pop("response_format", None)
                     continue
+
+                # Log exact HTTP status code, model slug, and full error body from OpenRouter
+                logger.warning(
+                    f"[OpenRouter Failover] Model '{model}' returned HTTP {r.status_code}: {r.text}"
+                )
+
+                # Do NOT permanently trip or cooldown models on HTTP 400 (schema/response_format mismatch)
+                if r.status_code == 400:
+                    break
 
                 # Handle 402 Payment Required / Insufficient credits
                 if r.status_code == 402:
                     mark_model_token_exhausted(model, reason="402 Payment Required / Credit Exhausted", cooldown_seconds=3600)
-                    logger.warning(
-                        f"[OpenRouter Failover] Model '{model}' returned 402 (Payment Required / Credit Exhausted). "
-                        f"Permanently switching starting model to next in priority chain..."
-                    )
-                    # Account has 0 paid credits; mark all paid models so we don't repeat 402 calls
-                    for cm in candidate_models:
-                        if not is_free_model(cm):
-                            mark_model_token_exhausted(cm, reason="Account has $0.00 credits", cooldown_seconds=3600)
                     break
 
                 # Handle 404 Model Not Found / Retired
                 if r.status_code == 404:
                     mark_model_token_exhausted(model, reason="404 Model Retired / Unavailable", cooldown_seconds=86400)
-                    logger.warning(
-                        f"[OpenRouter Failover] Model '{model}' returned 404 (Retired/Unavailable). "
-                        f"Permanently switching starting model to next in priority chain..."
-                    )
                     break
 
                 # Handle 429/403 Rate Limit / Quota Exceeded
                 if r.status_code in (429, 403) or "rate_limit" in r.text.lower():
                     mark_model_token_exhausted(model, reason=f"HTTP {r.status_code} Rate Limit / Quota Exceeded", cooldown_seconds=600)
-                    logger.warning(
-                        f"[OpenRouter Failover] Model '{model}' returned {r.status_code} (Rate Limit). "
-                        f"Automatically switching starting model to next in priority chain..."
-                    )
-                    if is_free_model(model) and ("free" in r.text.lower() or "limit" in r.text.lower() or r.status_code == 429):
-                        # Daily free quota reached; mark other free models to avoid redundant HTTP requests
-                        for cm in candidate_models:
-                            if is_free_model(cm):
-                                mark_model_token_exhausted(cm, reason="Daily free requests limit reached", cooldown_seconds=600)
                     break
 
-                # Other HTTP errors (5xx, etc.)
-                logger.warning(
-                    f"[OpenRouter Failover] Model '{model}' returned HTTP {r.status_code}: {r.text[:120]}. "
-                    f"Switching to next model..."
-                )
+                # Other HTTP errors (5xx, etc.): switch to next model without permanent lockout
                 break
 
             except httpx.TimeoutException:
-                mark_model_token_exhausted(model, reason="Timeout", cooldown_seconds=300)
+                # Do NOT permanently trip or cooldown models on transient timeouts
                 logger.warning(
-                    f"[OpenRouter Failover] Model '{model}' timed out. "
-                    f"Automatically switching starting model to next in priority chain..."
+                    f"[OpenRouter Failover] Model '{model}' timed out after {cur_timeout:.1f}s. "
+                    f"Switching to next model..."
                 )
                 break
             except Exception as e:

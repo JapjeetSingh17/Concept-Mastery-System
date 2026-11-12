@@ -1568,6 +1568,44 @@ function testInputHighContrastAndThemeTokensAcrossProject() {
   assert.ok(lightContrast >= 7.0, `Light theme input contrast must exceed 7:1 (WCAG AAA); actual is ${lightContrast.toFixed(2)}:1`);
 }
 
+async function testTutorMarkdownFormattingAndBlockElements() {
+  const harness = await createAppHarness(async () => jsonResponse({ ok: true }));
+
+  // Test Assistant Message Rendering with Markdown
+  const sampleAssistantMsg = {
+    sender: "assistant",
+    text: `### 1. Core Concept Explanation\nAttention mechanisms allow models to focus dynamically.\n\n### 2. Grounded Evidence from Your Material\nAccording to [Page 4]:\n* Key projection matrix\n* Query-Key dot product scaling\n\n### 3. Intuitive Analogy / Worked Example\n1. Calculate attention scores\n2. Apply softmax normalization`,
+    citations: [
+      { page: 4, snippet: "Self-Attention", source_type: "document" }
+    ]
+  };
+
+  const renderedHtml = harness.windowObj.renderChatMessage(sampleAssistantMsg);
+
+  // Assert headings are formatted as block h4 elements with proper spacing
+  assert.ok(renderedHtml.includes('<h4 class="tutor-heading"'), "Headings (###) must render as h4.tutor-heading block elements");
+  assert.ok(renderedHtml.includes("1. Core Concept Explanation"), "Heading text must be preserved");
+
+  // Assert bullet points render as unordered lists
+  assert.ok(renderedHtml.includes('<ul class="tutor-bullet-list"'), "Bullet points (* or -) must render as ul.tutor-bullet-list");
+  assert.ok(renderedHtml.includes("Key projection matrix</li>"), "Bullet items must render as li items");
+
+  // Assert numbered lists render as ordered lists
+  assert.ok(renderedHtml.includes('<ol class="tutor-numbered-list"'), "Numbered lists (1.) must render as ol.tutor-numbered-list");
+  assert.ok(renderedHtml.includes("Calculate attention scores</li>"), "Numbered items must render as li items");
+
+  // Assert paragraph breaks exist and are not collapsed into inline text
+  assert.ok(renderedHtml.includes("<p"), "Paragraphs must render as block elements rather than collapsed inline text");
+
+  // Test User Message preserves pre-wrap
+  const sampleUserMsg = {
+    sender: "user",
+    text: "Line 1\nLine 2"
+  };
+  const renderedUserHtml = harness.windowObj.renderChatMessage(sampleUserMsg);
+  assert.ok(renderedUserHtml.includes("white-space: pre-wrap"), "User messages must preserve white-space: pre-wrap");
+}
+
 (async function run() {
   await testApiServiceExportsAndDedupe();
   console.log("PASS: testApiServiceExportsAndDedupe");
@@ -1589,4 +1627,6 @@ function testInputHighContrastAndThemeTokensAcrossProject() {
   console.log("PASS: testDashboardSummaryBatchedEndpointFastPath");
   testInputHighContrastAndThemeTokensAcrossProject();
   console.log("PASS: testInputHighContrastAndThemeTokensAcrossProject");
+  await testTutorMarkdownFormattingAndBlockElements();
+  console.log("PASS: testTutorMarkdownFormattingAndBlockElements");
 })();

@@ -13,7 +13,7 @@ BASE = Path(__file__).resolve().parents[1]          # backend/
 try:
     from dotenv import load_dotenv
     if os.getenv("SKIP_DOTENV", "").strip().lower() not in ("1", "true", "yes"):
-        load_dotenv(BASE / ".env")
+        load_dotenv(BASE / ".env", override=True)
 except ImportError:
     pass
 
@@ -104,13 +104,13 @@ JWT_EXPIRES_MINUTES = _int("JWT_EXPIRES_MINUTES", 10080)  # 7 days
 # ── Unified OpenRouter Gateway & Fallback Models ───────────────────────────────
 DEFAULT_OPENROUTER_MODELS = [
     "google/gemini-2.5-flash",
-    "nvidia/nemotron-3-ultra-550b-a55b:free",
-    "deepseek/deepseek-chat-v3-0324:free",
-    "nvidia/nemotron-3.5-super-vl:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
+    "openai/gpt-4o-mini",
+    "deepseek/deepseek-chat-v3-0324",
+    "meta-llama/llama-3.3-70b-instruct",
+    "google/gemini-2.0-flash-001",
     "openrouter/auto",
 ]
-OPENROUTER_API_KEY = _e("OPENROUTER_API_KEY", "")
+OPENROUTER_API_KEY = _e("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_BASE_URL = _e("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 OPENROUTER_PRIMARY_MODEL = _e("OPENROUTER_MODEL", "google/gemini-2.5-flash")
 _raw_openrouter_models = _e("OPENROUTER_MODELS", "")

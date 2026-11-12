@@ -23,10 +23,10 @@ def test_openrouter_configuration():
     assert len(config.OPENROUTER_MODELS) == 6
     assert config.OPENROUTER_MODELS == [
         "google/gemini-2.5-flash",
-        "nvidia/nemotron-3-ultra-550b-a55b:free",
-        "deepseek/deepseek-chat-v3-0324:free",
-        "nvidia/nemotron-3.5-super-vl:free",
-        "meta-llama/llama-3.3-70b-instruct:free",
+        "openai/gpt-4o-mini",
+        "deepseek/deepseek-chat-v3-0324",
+        "meta-llama/llama-3.3-70b-instruct",
+        "google/gemini-2.0-flash-001",
         "openrouter/auto",
     ]
 
@@ -91,12 +91,12 @@ def test_openrouter_batch_partitioning():
     assert len(batches[1]) == 3
     assert batches[0] == [
         "google/gemini-2.5-flash",
-        "nvidia/nemotron-3-ultra-550b-a55b:free",
-        "deepseek/deepseek-chat-v3-0324:free",
+        "openai/gpt-4o-mini",
+        "deepseek/deepseek-chat-v3-0324",
     ]
     assert batches[1] == [
-        "nvidia/nemotron-3.5-super-vl:free",
-        "meta-llama/llama-3.3-70b-instruct:free",
+        "meta-llama/llama-3.3-70b-instruct",
+        "google/gemini-2.0-flash-001",
         "openrouter/auto",
     ]
 
@@ -154,7 +154,7 @@ def test_openrouter_automatic_model_switching_on_402_and_429(monkeypatch):
         import json as json_lib
         if model == "google/gemini-2.5-flash":
             return MockResponse(402, {"error": {"message": "Insufficient credits", "code": 402}})
-        elif model == "nvidia/nemotron-3-ultra-550b-a55b:free":
+        elif model == "openai/gpt-4o-mini":
             return MockResponse(200, {
                 "model": model,
                 "choices": [{"message": {"role": "assistant", "content": '{"failover": "SUCCESS"}'}}]
@@ -174,20 +174,22 @@ def test_openrouter_automatic_model_switching_on_402_and_429(monkeypatch):
     monkeypatch.setattr(httpx, "get", mock_get)
     monkeypatch.setattr(httpx, "post", mock_post)
 
-    # 1. Verification mechanism check: account has 0 paid credits, so starting model is auto-switched to free tier model
+    # 1. Failover check: model 1 returns 402, automatically cascades to model 2 (openai/gpt-4o-mini)
     result1 = llm._call_openrouter("System", "User prompt")
     assert result1 == '{"failover": "SUCCESS"}'
-    # Starting model was shifted past gemini-2.5-flash directly to nemotron!
-    assert call_models[0] == "nvidia/nemotron-3-ultra-550b-a55b:free"
-    assert "google/gemini-2.5-flash" not in call_models
+    assert call_models[0] == "google/gemini-2.5-flash"
+    assert call_models[1] == "openai/gpt-4o-mini"
 
-    # 2. In-flight token exhaustion: if nemotron now runs out of tokens (e.g. 429 quota reached)
+    # 2. In-flight token exhaustion: if gemini-2.5-flash was marked exhausted, next call starts directly with gpt-4o-mini
     call_models.clear()
-    llm.mark_model_token_exhausted("nvidia/nemotron-3-ultra-550b-a55b:free", reason="Quota reached", cooldown_seconds=600)
     candidates = llm.get_verified_candidate_models(config.OPENROUTER_MODELS)
-    # The starting model has now repeated the shift to the next available model
-    assert candidates[0] != "nvidia/nemotron-3-ultra-550b-a55b:free"
-    assert candidates[0] != "google/gemini-2.5-flash"
-    assert "free" in candidates[0].lower() or "nemotron" in candidates[0].lower()
+    assert candidates[0] == "openai/gpt-4o-mini"
+
+    # If gpt-4o-mini also runs out of tokens (e.g. 429 quota reached)
+    llm.mark_model_token_exhausted("openai/gpt-4o-mini", reason="Quota reached", cooldown_seconds=600)
+    candidates2 = llm.get_verified_candidate_models(config.OPENROUTER_MODELS)
+    assert candidates2[0] == "deepseek/deepseek-chat-v3-0324"
+    assert candidates2[0] != "openai/gpt-4o-mini"
+    assert candidates2[0] != "google/gemini-2.5-flash"
     assert llm._STATE["openrouter_exhausted"] is False
 

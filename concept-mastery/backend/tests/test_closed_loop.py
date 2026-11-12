@@ -11,7 +11,7 @@ import pytest
 from pathlib import Path
 
 from app import config
-from app.core import store
+from app.core import store, llm
 from app.core.concept_index import GLOBAL_INDEX
 from app.pipelines import ingest, concepts, mastery, tutor, quiz, loop
 from app.models.schemas import MasteryStatus, QuizSubmission
@@ -381,3 +381,114 @@ def test_7_mixed_question_types_generation_and_evaluation():
     assert res_typed_shallow.is_correct is False
     assert res_typed_shallow.reasoning_depth_level == "SURFACE_ROTE"
     print("\n[PASSED] Mixed Question Types: MCQ, Fill-in-the-Blanks, and Typed Q&A fully validated.")
+
+
+def test_8_tutor_overview_meta_intent_grounding():
+    """Verify tutor overview/meta queries ('what is the lecture about?') ground directly in material
+    without falling back to web search or claiming 'I cannot see your upload directly'."""
+    test_uid = "test_meta_user_99"
+    # Ingest a sample video material for this user
+    mat = store.save_study_material({
+        "material_id": "mat_test_meta_vid",
+        "user_id": test_uid,
+        "title": "Deep Learning Architectures Video",
+        "source_type": "youtube",
+        "original_filename_or_url": "https://youtube.com/watch?v=mock123",
+        "chunk_count": 4,
+        "concepts": ["Attention", "Weights", "Gradients", "Transformers"],
+        "structured_preview": [
+            {
+                "page_number": 1,
+                "section_title": "Video [00:00 - 03:00]",
+                "text": "In this lecture we trace the historical evolution of deep learning architectures from perceptrons to transformers.",
+                "locator_label": "00:00 - 03:00"
+            },
+            {
+                "page_number": 2,
+                "section_title": "Video [15:00 - 18:00]",
+                "text": "Weights and gradient vectors interact during backpropagation to minimize empirical risk.",
+                "locator_label": "15:00 - 18:00"
+            }
+        ]
+    })
+
+    # Test meta overview query
+    query = "the youtube lecture I uploaded what is it about?"
+    resp = tutor.chat(query, user_id=test_uid)
+
+    # 1. Must NOT claim inability to see upload or fall back to web search
+    ans_lower = resp.answer.lower()
+    assert "cannot see your upload" not in ans_lower
+    assert "don't have access" not in ans_lower
+    assert "cannot watch" not in ans_lower
+
+    # 2. Must cite the uploaded material
+    assert "Deep Learning Architectures Video" in resp.answer or "Attention" in resp.answer or "Weights" in resp.answer
+
+    # 3. Must follow the 4 pedagogical pillars
+    assert "### 1. Core Concept Explanation" in resp.answer
+    assert "### 2. Grounded Evidence from Your Material" in resp.answer
+    assert "### 3. Intuitive Analogy / Worked Example" in resp.answer
+    assert "### 4. Socratic Check-in Question" in resp.answer
+
+    # 4. Citations must be from the document/video, not external web
+    assert len(resp.citations) > 0
+    assert any(c.source_type == "document" for c in resp.citations)
+    print("\n[PASSED] Tutor Overview Meta-Intent Grounding & 4-Pillar Pedagogical Output.")
+
+
+def test_9_openrouter_retry_without_response_format_and_no_timeout_cooldown(monkeypatch):
+    """Verify OpenRouter retry without response_format on schema error, and verify 400 and timeouts
+    do NOT permanently trip or cooldown candidate models."""
+    monkeypatch.setenv("OPENROUTER_LIVE", "1")
+    llm.reset_exhaustion_state()
+
+    call_history = []
+
+    def mock_post(url, headers=None, json=None, timeout=None):
+        model = json.get("model")
+        has_rf = "response_format" in json
+        call_history.append((model, has_rf))
+
+        class MockResponse:
+            def __init__(self, status_code, data_or_text):
+                self.status_code = status_code
+                self._data = data_or_text if isinstance(data_or_text, dict) else {}
+                self.text = json_lib.dumps(data_or_text) if isinstance(data_or_text, dict) else str(data_or_text)
+
+            def json(self):
+                return self._data
+
+        import json as json_lib
+        # First attempt with response_format returns 400 (unsupported response_format)
+        if has_rf:
+            return MockResponse(400, {"error": {"message": "response_format is not supported by this model", "code": 400}})
+        # Second attempt without response_format returns 200 with JSON payload
+        return MockResponse(200, {
+            "model": model,
+            "choices": [{"message": {"role": "assistant", "content": '```json\n{"status": "RETRY_SUCCESS"}\n```'}}]
+        })
+
+    import httpx
+    monkeypatch.setattr(httpx, "post", mock_post)
+
+    # Call with system containing 'json' so response_format is requested
+    res = llm._call_openrouter("Return json", "Prompt")
+    assert res == '{"status": "RETRY_SUCCESS"}'
+    # Verify first call had response_format=True, retry had response_format=False
+    assert call_history[0] == ("google/gemini-2.5-flash", True)
+    assert call_history[1] == ("google/gemini-2.5-flash", False)
+
+    # Verify model is NOT marked exhausted on 400 or transient timeout
+    assert "google/gemini-2.5-flash" not in llm._MODEL_TOKEN_STATUS
+
+    # Simulate timeout
+    def mock_post_timeout(url, headers=None, json=None, timeout=None):
+        raise httpx.TimeoutException("Network read timeout")
+
+    monkeypatch.setattr(httpx, "post", mock_post_timeout)
+    res_to = llm._call_openrouter("System", "Prompt")
+    assert res_to is None
+    # Model must still NOT be permanently marked exhausted after transient timeout
+    assert "google/gemini-2.5-flash" not in llm._MODEL_TOKEN_STATUS
+    print("\n[PASSED] OpenRouter response_format Retry & No False Circuit Tripping on 400/Timeout.")

@@ -507,6 +507,36 @@ def delete_study_material(material_id: str, user_id: str | None = None) -> bool:
             res = conn.execute("DELETE FROM study_materials WHERE material_id = ?", (material_id,))
         return res.rowcount > 0
 
+
+def get_concepts(material_id: str, user_id: str | None = None) -> list[dict]:
+    """Retrieve full list of extracted concepts for a specific material."""
+    mat = get_study_material(material_id, user_id=user_id)
+    if not mat and user_id:
+        mat = get_study_material(material_id)
+    if not mat:
+        return []
+    raw = mat.get("concepts", [])
+    result = []
+    for c in raw:
+        if isinstance(c, dict):
+            result.append(c)
+        elif isinstance(c, str):
+            result.append({"id": c.lower().replace(" ", "_"), "name": c})
+    return result
+
+
+def get_active_material(user_id: str = "default") -> dict | None:
+    """Retrieve the active or most recent study material for a user."""
+    mats = list_study_materials(user_id)
+    if mats:
+        return get_study_material(mats[0]["material_id"], user_id=user_id)
+    if user_id != "default":
+        def_mats = list_study_materials("default")
+        if def_mats:
+            return get_study_material(def_mats[0]["material_id"], user_id="default")
+    return None
+
+
 def clear_all_study_materials(user_id: str | None = None):
     with _materials_transaction(immediate=True) as conn:
         if user_id:
