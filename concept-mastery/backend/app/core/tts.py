@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from fastapi.concurrency import run_in_threadpool
 import httpx
 
 from .. import config
@@ -25,6 +26,8 @@ from . import store
 from . import llm
 
 logger = logging.getLogger("concept_mastery.tts")
+_TTS_TIMEOUT = httpx.Timeout(30.0, connect=5.0)
+_MOCK_MP3_BYTES = b"\xff\xfb\x90\x00" + (b"\x00" * 128)
 
 _AUDIO_CACHE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS audio_cache (
@@ -44,9 +47,10 @@ def get_audio_cache_db():
     """Context manager for SQLite audio cache database connections."""
     config.VECTOR_STORE_PATH.mkdir(parents=True, exist_ok=True)
     db_path = config.VECTOR_STORE_PATH / "study_materials.db"
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(db_path), timeout=10.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=10000")
     try:
         yield conn
         conn.commit()
@@ -176,6 +180,75 @@ def sanitize_latex_for_speech(text: str) -> str:
     return s
 
 
+def _prepare_synthesis_context(text: str, cache_key: Optional[str]) -> tuple[str, str, Path, str, str]:
+    """Sanitize input text and resolve cache paths and model identifier."""
+    cleaned_text = sanitize_latex_for_speech(text)
+    key = cache_key or hashlib.md5(cleaned_text.encode("utf-8")).hexdigest()
+    config.GENERATED_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    mp3_file = config.GENERATED_ARTIFACTS_DIR / f"{key}.mp3"
+    audio_url = f"/api/artifacts/{key}.mp3"
+    model_id = config.ELEVENLABS_MODEL_ID or "eleven_flash_v2_5"
+    return cleaned_text, key, mp3_file, audio_url, model_id
+
+
+def _is_audio_cached(cache_key: str, mp3_file: Path) -> bool:
+    """Check SQLite audio_cache and disk presence for existing synthesized audio."""
+    init_audio_cache_db()
+    try:
+        with get_audio_cache_db() as conn:
+            row = conn.execute(
+                "SELECT * FROM audio_cache WHERE cache_key = ?", (cache_key,)
+            ).fetchone()
+            return bool(row and mp3_file.exists())
+    except Exception as e:
+        logger.warning("Error checking audio_cache: %s", e)
+        return mp3_file.exists()
+
+
+def _build_elevenlabs_request(cleaned_text: str, model_id: str) -> tuple[str, dict[str, str], dict]:
+    """Build ElevenLabs Flash v2.5 HTTP request URL, headers, and payload."""
+    voice_id = config.ELEVENLABS_VOICE_ID or "JBFqnCBsd6RMkjVDRZzb"
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    headers = {
+        "xi-api-key": config.ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+    }
+    body = {
+        "text": cleaned_text,
+        "model_id": model_id,
+        "voice_settings": {
+            "stability": 0.5,
+            "similarity_boost": 0.75,
+        },
+    }
+    return url, headers, body
+
+
+def _persist_tts_result(
+    cache_key: str,
+    user_id: str,
+    mp3_file: Path,
+    audio_url: str,
+    cleaned_text: str,
+    model_id: str,
+    audio_bytes: bytes,
+    fallback_mode: Optional[str] = None,
+) -> dict:
+    """Write MP3 bytes to disk, record cache metadata, and build response dict."""
+    mp3_file.parent.mkdir(parents=True, exist_ok=True)
+    mp3_file.write_bytes(audio_bytes)
+    _record_audio_cache(cache_key, user_id, str(mp3_file), cleaned_text, model_id)
+    res = {
+        "audio_url": audio_url,
+        "cached": False,
+        "model_id": model_id,
+        "transcript": cleaned_text,
+    }
+    if fallback_mode:
+        res["fallback_mode"] = fallback_mode
+    return res
+
+
 def synthesize_elevenlabs_audio(
     text: str,
     user_id: str = "default",
@@ -190,31 +263,9 @@ def synthesize_elevenlabs_audio(
     - If live API key is present: calls ElevenLabs Flash v2.5 endpoint.
     - If key is empty or network fails / offline in pytest: writes valid mock MP3.
     """
-    cleaned_text = sanitize_latex_for_speech(text)
-    if not cache_key:
-        cache_key = hashlib.md5(cleaned_text.encode("utf-8")).hexdigest()
+    cleaned_text, cache_key, mp3_file, audio_url, model_id = _prepare_synthesis_context(text, cache_key)
 
-    config.GENERATED_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-    mp3_file = config.GENERATED_ARTIFACTS_DIR / f"{cache_key}.mp3"
-    audio_url = f"/api/artifacts/{cache_key}.mp3"
-    model_id = config.ELEVENLABS_MODEL_ID or "eleven_flash_v2_5"
-
-    # 1. Check cache
-    init_audio_cache_db()
-    is_cached = False
-    try:
-        with get_audio_cache_db() as conn:
-            row = conn.execute(
-                "SELECT * FROM audio_cache WHERE cache_key = ?", (cache_key,)
-            ).fetchone()
-            if row and mp3_file.exists():
-                is_cached = True
-    except Exception as e:
-        logger.warning("Error checking audio_cache: %s", e)
-        if mp3_file.exists():
-            is_cached = True
-
-    if is_cached:
+    if _is_audio_cached(cache_key, mp3_file):
         return {
             "audio_url": audio_url,
             "cached": True,
@@ -222,73 +273,96 @@ def synthesize_elevenlabs_audio(
             "transcript": cleaned_text,
         }
 
-    # 2. Live ElevenLabs call if API key is present
     if config.ELEVENLABS_API_KEY:
         try:
-            voice_id = config.ELEVENLABS_VOICE_ID or "JBFqnCBsd6RMkjVDRZzb"
-            url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-            headers = {
-                "xi-api-key": config.ELEVENLABS_API_KEY,
-                "Content-Type": "application/json",
-            }
-            body = {
-                "text": cleaned_text,
-                "model_id": model_id,
-                "voice_settings": {
-                    "stability": 0.5,
-                    "similarity_boost": 0.75,
-                },
-            }
-            resp = httpx.post(url, headers=headers, json=body, timeout=30.0)
+            url, headers, body = _build_elevenlabs_request(cleaned_text, model_id)
+            resp = httpx.post(url, headers=headers, json=body, timeout=_TTS_TIMEOUT)
             if resp.status_code == 200 and resp.content:
-                mp3_file.write_bytes(resp.content)
-                _record_audio_cache(cache_key, user_id, str(mp3_file), cleaned_text, model_id)
-                return {
-                    "audio_url": audio_url,
-                    "cached": False,
-                    "model_id": model_id,
-                    "transcript": cleaned_text,
-                }
-            else:
-                logger.warning(
-                    "ElevenLabs API returned %s: %s", resp.status_code, resp.text[:200]
+                return _persist_tts_result(
+                    cache_key, user_id, mp3_file, audio_url, cleaned_text, model_id, resp.content
                 )
+            logger.warning(
+                "ElevenLabs API returned %s: %s", resp.status_code, resp.text[:200]
+            )
         except Exception as e:
             logger.warning("ElevenLabs TTS request failed: %s", e)
 
-    # 3. Fallback: valid mock MP3 file
-    mock_audio = b"\xff\xfb\x90\x00" + (b"\x00" * 128)
-    mp3_file.write_bytes(mock_audio)
-    _record_audio_cache(cache_key, user_id, str(mp3_file), cleaned_text, "mock_tts")
-    return {
-        "audio_url": audio_url,
-        "cached": False,
-        "fallback_mode": "browser_speech_synthesis",
-        "model_id": "mock_tts",
-        "transcript": cleaned_text,
-    }
+    return _persist_tts_result(
+        cache_key,
+        user_id,
+        mp3_file,
+        audio_url,
+        cleaned_text,
+        "mock_tts",
+        _MOCK_MP3_BYTES,
+        fallback_mode="browser_speech_synthesis",
+    )
 
 
-def generate_deep_material_audio(
-    material: dict,
+async def synthesize_elevenlabs_audio_async(
+    text: str,
     user_id: str = "default",
-    section_or_slide_index: int = 0,
+    cache_key: Optional[str] = None,
 ) -> dict:
-    """Generate a professor-style deep spoken explanation for a PDF or PPTX slide.
+    """Non-blocking async variant using httpx.AsyncClient and threadpool disk/SQLite I/O."""
+    cleaned_text, cache_key, mp3_file, audio_url, model_id = await run_in_threadpool(
+        _prepare_synthesis_context, text, cache_key
+    )
 
-    - STRICT GATE: Inspects source_type. Only 'pdf' and 'pptx' are permitted.
-      Raises store.UserError if material is youtube, web, audio, markdown, or docx.
-    - Extracts page or slide content from structured_preview_json or raw_extracted_text.
-    - Generates a deep conversational lecture explanation and synthesizes it.
-    """
-    # Strict format gate
+    if await run_in_threadpool(_is_audio_cached, cache_key, mp3_file):
+        return {
+            "audio_url": audio_url,
+            "cached": True,
+            "model_id": model_id,
+            "transcript": cleaned_text,
+        }
+
+    if config.ELEVENLABS_API_KEY:
+        try:
+            url, headers, body = _build_elevenlabs_request(cleaned_text, model_id)
+            async with httpx.AsyncClient(timeout=_TTS_TIMEOUT) as client:
+                resp = await client.post(url, headers=headers, json=body)
+            if resp.status_code == 200 and resp.content:
+                return await run_in_threadpool(
+                    _persist_tts_result,
+                    cache_key,
+                    user_id,
+                    mp3_file,
+                    audio_url,
+                    cleaned_text,
+                    model_id,
+                    resp.content,
+                )
+            logger.warning(
+                "ElevenLabs API returned %s: %s", resp.status_code, resp.text[:200]
+            )
+        except Exception as e:
+            logger.warning("ElevenLabs async TTS request failed: %s", e)
+
+    return await run_in_threadpool(
+        _persist_tts_result,
+        cache_key,
+        user_id,
+        mp3_file,
+        audio_url,
+        cleaned_text,
+        "mock_tts",
+        _MOCK_MP3_BYTES,
+        "browser_speech_synthesis",
+    )
+
+
+def _prepare_deep_audio_spec(
+    material: dict,
+    section_or_slide_index: int = 0,
+) -> tuple[str, str, str, str, Optional[str]]:
+    """Validate material format and prepare LLM prompt, fallback script, and cache key."""
     source_type = (material.get("source_type") or "").strip().lower()
     if source_type not in ("pdf", "pptx"):
         raise store.UserError(
             "Deep audio explanation is exclusively supported for PDF and PPTX materials."
         )
 
-    # Extract preview items
     preview = material.get("structured_preview")
     if not preview:
         preview_raw = material.get("structured_preview_json")
@@ -304,7 +378,6 @@ def generate_deep_material_audio(
 
     target_item = None
     if isinstance(preview, list) and preview:
-        # Match by explicit index field (both 0-based and 1-based)
         for item in preview:
             if isinstance(item, dict) and item.get("index") == section_or_slide_index:
                 target_item = item
@@ -314,7 +387,6 @@ def generate_deep_material_audio(
                 if isinstance(item, dict) and item.get("index") == (section_or_slide_index + 1):
                     target_item = item
                     break
-        # Match by array offset
         if not target_item:
             if 0 <= section_or_slide_index < len(preview):
                 target_item = preview[section_or_slide_index]
@@ -344,8 +416,6 @@ def generate_deep_material_audio(
 
     material_title = str(material.get("title", "Study Material")).strip()
 
-    # Generate professor-style spoken explanation
-    spoken_explanation = ""
     prompt_system = (
         "You are an inspiring university professor providing an engaging, crystal-clear spoken audio lecture "
         "explaining a specific slide or page from the study material. Break down the core intuition, mathematical formulas, "
@@ -359,6 +429,37 @@ def generate_deep_material_audio(
         "Deliver a deep, spoken tutorial explaining this concept clearly."
     )
 
+    lines = [line.strip() for line in slide_text.splitlines() if line.strip() and not line.startswith("#")]
+    summary_snippet = " ".join(lines[:4]) if lines else "the fundamental concepts presented on this slide"
+    fallback_script = (
+        f"Welcome back. In this lecture section on {target_label} from {material_title}, "
+        f"let us examine the key mechanics. {summary_snippet}. "
+        f"Observe how these mathematical and theoretical foundations operate together in practice. "
+        f"Keep this intuition in mind as we build toward the next set of concepts."
+    )
+
+    mat_id = material.get("material_id")
+    cache_key = f"deep_{mat_id}_{section_or_slide_index}" if mat_id else None
+    return prompt_system, prompt_user, fallback_script, slide_text, cache_key
+
+
+def generate_deep_material_audio(
+    material: dict,
+    user_id: str = "default",
+    section_or_slide_index: int = 0,
+) -> dict:
+    """Generate a professor-style deep spoken explanation for a PDF or PPTX slide.
+
+    - STRICT GATE: Inspects source_type. Only 'pdf' and 'pptx' are permitted.
+      Raises store.UserError if material is youtube, web, audio, markdown, or docx.
+    - Extracts page or slide content from structured_preview_json or raw_extracted_text.
+    - Generates a deep conversational lecture explanation and synthesizes it.
+    """
+    prompt_system, prompt_user, fallback_script, _, cache_key = _prepare_deep_audio_spec(
+        material, section_or_slide_index
+    )
+
+    spoken_explanation = ""
     try:
         if hasattr(llm, "complete"):
             res = llm.complete(prompt_system, prompt_user, max_tokens=500)
@@ -367,16 +468,33 @@ def generate_deep_material_audio(
     except Exception as e:
         logger.warning("LLM call for deep material audio explanation failed: %s", e)
 
-    if not spoken_explanation:
-        lines = [line.strip() for line in slide_text.splitlines() if line.strip() and not line.startswith("#")]
-        summary_snippet = " ".join(lines[:4]) if lines else "the fundamental concepts presented on this slide"
-        spoken_explanation = (
-            f"Welcome back. In this lecture section on {target_label} from {material_title}, "
-            f"let us examine the key mechanics. {summary_snippet}. "
-            f"Observe how these mathematical and theoretical foundations operate together in practice. "
-            f"Keep this intuition in mind as we build toward the next set of concepts."
-        )
+    return synthesize_elevenlabs_audio(
+        spoken_explanation or fallback_script, user_id=user_id, cache_key=cache_key
+    )
 
-    mat_id = material.get("material_id")
-    cache_key = f"deep_{mat_id}_{section_or_slide_index}" if mat_id else None
-    return synthesize_elevenlabs_audio(spoken_explanation, user_id=user_id, cache_key=cache_key)
+
+generate_deep_material_audio._is_default_sync_deep_audio = True
+
+
+async def generate_deep_material_audio_async(
+    material: dict,
+    user_id: str = "default",
+    section_or_slide_index: int = 0,
+) -> dict:
+    """Async non-blocking version of generate_deep_material_audio."""
+    prompt_system, prompt_user, fallback_script, _, cache_key = _prepare_deep_audio_spec(
+        material, section_or_slide_index
+    )
+
+    spoken_explanation = ""
+    try:
+        if hasattr(llm, "complete"):
+            res = await run_in_threadpool(llm.complete, prompt_system, prompt_user, 500)
+            if res and len(res.strip()) > 30:
+                spoken_explanation = res.strip()
+    except Exception as e:
+        logger.warning("LLM call for deep material audio explanation failed: %s", e)
+
+    return await synthesize_elevenlabs_audio_async(
+        spoken_explanation or fallback_script, user_id=user_id, cache_key=cache_key
+    )

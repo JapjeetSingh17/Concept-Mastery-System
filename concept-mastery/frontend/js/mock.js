@@ -1,9 +1,29 @@
 /**
  * Concept Mastery Platform - Mock Demo Service
  * Isolated demo dataset for frontend-only previews and offline testing.
+ * Strictly gated behind explicit ?mock=true or localStorage.getItem("USE_MOCK") === "true".
  */
 
 (function() {
+  function isMockModeAllowed() {
+    try {
+      if (typeof window !== "undefined" && window.location && typeof window.location.search === "string") {
+        const params = new URLSearchParams(window.location.search);
+        if (params.get("mock") === "true") return true;
+      }
+    } catch {}
+    try {
+      if (typeof localStorage !== "undefined" && localStorage.getItem("USE_MOCK") === "true") {
+        return true;
+      }
+    } catch {}
+    return false;
+  }
+
+  if (!isMockModeAllowed()) {
+    return;
+  }
+
   const MOCK_CONCEPTS = [
     { id: "loss-functions", name: "Loss Functions", x: 90, y: 70, deps: [] },
     { id: "gradient-descent", name: "Gradient Descent", x: 260, y: 70, deps: ["loss-functions"] },

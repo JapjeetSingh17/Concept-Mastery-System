@@ -568,7 +568,9 @@ def generate_diagnostic_quiz(
                     )
 
                 questions.append(q)
-                REGISTRY[qid] = q.model_dump()
+                reg_entry = q.model_dump()
+                reg_entry["user_id"] = user_id
+                REGISTRY[qid] = reg_entry
                 prior_served.append(q.question_text)
                 prior_sentences.add(sent)
 
@@ -812,6 +814,7 @@ def next_question(concept_id: str | None = None, user_id: str = "default") -> di
     c_name = by.get(q.concept_id, {}).get("name", q.concept_id)
 
     RECENT_QUESTIONS[q.question_id] = {
+        "user_id": user_id,
         "correct": q.correct_option_idx,
         "conceptId": q.concept_id,
         "concept_id": q.concept_id,
@@ -878,8 +881,10 @@ def evaluate_answer(student_answer: str, concept_id: str, question_text: str = "
     explanation = ground_truth or (concept_obj.get("definition") if concept_obj else "") or f"Conceptual explanation of {concept_id}"
     source_page = (concept_obj.get("page") or concept_obj.get("source_page") or 1) if concept_obj else 1
 
-    REGISTRY["freeform"] = {
-        "question_id": "freeform",
+    freeform_qid = f"freeform:{user_id}"
+    REGISTRY[freeform_qid] = {
+        "question_id": freeform_qid,
+        "user_id": user_id,
         "concept_id": concept_id,
         "question_type": "typed_qa",
         "question": question_text or f"Explain {concept_id}",
@@ -892,7 +897,8 @@ def evaluate_answer(student_answer: str, concept_id: str, question_text: str = "
     }
 
     sub = QuizSubmission(
-        question_id="freeform",
+        user_id=user_id,
+        question_id=freeform_qid,
         concept_id=concept_id,
         selected_option_idx=None,
         typed_answer=raw_ans,

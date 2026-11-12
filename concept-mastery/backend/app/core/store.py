@@ -3,22 +3,50 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Any
 from .. import config
+from .lru_cache import DEFAULT_LRU_MAXSIZE, DiskBackedLRUCache
 from .vector_index import VectorIndex
 
 class UserError(Exception):
     """A problem the user can fix. Becomes a 400 response with this message."""
 
+
+def _serialize_kb_entry(kb_data: dict) -> dict:
+    out = dict(kb_data)
+    idx = out.get("index")
+    if isinstance(idx, VectorIndex) or (idx is not None and hasattr(idx, "to_dict")):
+        out["index"] = idx.to_dict()
+        out["_index_type"] = "VectorIndex"
+    if isinstance(out.get("concepts"), list):
+        out["concepts"] = [c.model_dump() if hasattr(c, "model_dump") else c for c in out["concepts"]]
+    if isinstance(out.get("edges"), list):
+        out["edges"] = [e.model_dump() if hasattr(e, "model_dump") else e for e in out["edges"]]
+    return out
+
+
+def _deserialize_kb_entry(payload: dict) -> dict:
+    out = dict(payload)
+    if out.pop("_index_type", None) == "VectorIndex" and isinstance(out.get("index"), dict):
+        out["index"] = VectorIndex.from_dict(out["index"])
+    return out
+
+
 KB: dict = {"ready": False}
-USER_KBS: dict[str, dict] = {}
+USER_KBS: DiskBackedLRUCache = DiskBackedLRUCache(
+    cache_dir=lambda: config.VECTOR_STORE_PATH / "kb_cache",
+    maxsize=DEFAULT_LRU_MAXSIZE,
+    serializer=_serialize_kb_entry,
+    deserializer=_deserialize_kb_entry,
+)
 KB_FILE = config.VECTOR_STORE_PATH / "kb.json"
 MASTERY_FILE = config.VECTOR_STORE_PATH / "mastery.json"
-MATERIALS_DB_PATH = config.VECTOR_STORE_PATH / "study_materials.db"
+MATERIALS_DB_PATH = config.SQLITE_MATERIALS_DB_PATH
 
 _MATERIALS_SCHEMA = """
 -- Study Materials
@@ -150,22 +178,117 @@ CREATE TABLE IF NOT EXISTS explainable_mastery_decisions (
 CREATE INDEX IF NOT EXISTS idx_mastery_decisions_user_concept ON explainable_mastery_decisions(user_id, concept_id);
 """
 
-@contextmanager
-def get_materials_db():
-    conn = sqlite3.connect(str(MATERIALS_DB_PATH))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
+_INIT_LOCK = threading.Lock()
+_INITIALIZED_DB_KEYS: set[tuple[str, int, int]] = set()
+
+
+def _db_identity(db_path: Path) -> tuple[str, int, int] | None:
+    """Return a filesystem identity key for ``db_path`` to avoid redundant DDL."""
     try:
-        yield conn
-        conn.commit()
+        st = db_path.stat()
+        return (str(db_path.resolve()), st.st_dev, st.st_ino)
+    except OSError:
+        return None
+
+
+def _connect_materials_db() -> sqlite3.Connection:
+    """Centralized SQLite connection factory configuring WAL mode, timeouts, and FKs."""
+    db_path = Path(MATERIALS_DB_PATH)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path), timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    # Set busy_timeout first so mode/pragma checks wait up to 10s under contention.
+    conn.execute("PRAGMA busy_timeout=10000;")
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    return conn
+
+
+def _ensure_materials_db() -> None:
+    """Ensure schema exists for the active MATERIALS_DB_PATH without redundant DDL."""
+    ident = _db_identity(Path(MATERIALS_DB_PATH))
+    if ident is not None and ident in _INITIALIZED_DB_KEYS:
+        return
+    init_materials_db()
+
+
+@contextmanager
+def _materials_transaction(immediate: bool = False):
+    """Yield a connection wrapped in an explicit transaction with rollback on exception."""
+    _ensure_materials_db()
+    conn = _connect_materials_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+        try:
+            yield conn
+        except BaseException:
+            if conn.in_transaction:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+            raise
+        else:
+            if conn.in_transaction:
+                conn.commit()
     finally:
         conn.close()
 
+
+def _parse_json_value(val: Any, default: Any) -> Any:
+    """Decode JSON text defensively while preserving already-parsed values."""
+    if val is None:
+        return default
+    if isinstance(val, (list, dict)):
+        return val
+    try:
+        return json.loads(val) if val else default
+    except Exception:
+        return default
+
+
+def _hydrate_mastery_decision_row(row: sqlite3.Row) -> dict:
+    """Convert an explainable_mastery_decisions row into its hydrated API dict."""
+    res = dict(row)
+    res.pop("rn", None)
+    for key in (
+        "demonstrated_understanding",
+        "remaining_gaps",
+        "unresolved_disagreements",
+        "supporting_evidence_refs",
+    ):
+        res[key] = _parse_json_value(res.get(f"{key}_json") or "[]", [])
+    fu_raw = res.get("follow_up_question_json")
+    res["follow_up_question"] = _parse_json_value(fu_raw, None) if fu_raw else None
+    res["evaluation_pending"] = bool(res.get("evaluation_pending", 0))
+    res["explainable_summary"] = res.get("explainable_summary", "")
+    return res
+
+
+@contextmanager
+def get_materials_db():
+    with _materials_transaction(immediate=False) as conn:
+        yield conn
+
 def init_materials_db():
-    config.VECTOR_STORE_PATH.mkdir(parents=True, exist_ok=True)
-    with get_materials_db() as conn:
-        conn.executescript(_MATERIALS_SCHEMA)
+    db_path = Path(MATERIALS_DB_PATH)
+    with _INIT_LOCK:
+        conn = _connect_materials_db()
+        try:
+            conn.executescript(_MATERIALS_SCHEMA)
+        except BaseException:
+            if conn.in_transaction:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+            raise
+        finally:
+            conn.close()
+        ident = _db_identity(db_path)
+        if ident is not None:
+            _INITIALIZED_DB_KEYS.add(ident)
 
 init_materials_db()
 
@@ -173,15 +296,19 @@ init_materials_db()
 
 def upsert_user(user_id: str, email: str, full_name: str = "", picture_url: str = "") -> dict:
     """Create or update student profile upon Google OAuth sign-in."""
-    init_materials_db()
     now_iso = datetime.now(timezone.utc).isoformat()
-    with get_materials_db() as conn:
+    with _materials_transaction(immediate=True) as conn:
         existing = conn.execute("SELECT created_at FROM users WHERE user_id = ?", (user_id,)).fetchone()
         created_at = existing["created_at"] if existing else now_iso
         conn.execute(
             """
-            INSERT OR REPLACE INTO users (user_id, email, full_name, picture_url, created_at, last_login_at)
+            INSERT INTO users (user_id, email, full_name, picture_url, created_at, last_login_at)
             VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                email = excluded.email,
+                full_name = excluded.full_name,
+                picture_url = excluded.picture_url,
+                last_login_at = excluded.last_login_at
             """,
             (user_id, email, full_name or "", picture_url or "", created_at, now_iso)
         )
@@ -196,24 +323,21 @@ def upsert_user(user_id: str, email: str, full_name: str = "", picture_url: str 
 
 def get_user(user_id: str) -> dict | None:
     """Lookup student account by user_id."""
-    init_materials_db()
-    with get_materials_db() as conn:
+    with _materials_transaction(immediate=False) as conn:
         row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
         return dict(row) if row else None
 
 def get_user_by_email(email: str) -> dict | None:
     """Lookup student account by verified email."""
-    init_materials_db()
-    with get_materials_db() as conn:
+    with _materials_transaction(immediate=False) as conn:
         row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
         return dict(row) if row else None
 
 def record_login_log(user_id: str, ip_address: str | None = None, user_agent: str | None = None) -> dict:
     """Record an audit log entry for student login."""
-    init_materials_db()
     now_iso = datetime.now(timezone.utc).isoformat()
     log_id = f"log_{uuid.uuid4().hex[:12]}"
-    with get_materials_db() as conn:
+    with _materials_transaction(immediate=True) as conn:
         conn.execute(
             """
             INSERT INTO user_login_logs (log_id, user_id, logged_in_at, ip_address, user_agent)
@@ -231,8 +355,7 @@ def record_login_log(user_id: str, ip_address: str | None = None, user_agent: st
 
 def get_user_login_logs(user_id: str, limit: int = 20) -> list[dict]:
     """Retrieve recent login audit history for user."""
-    init_materials_db()
-    with get_materials_db() as conn:
+    with _materials_transaction(immediate=False) as conn:
         rows = conn.execute(
             "SELECT * FROM user_login_logs WHERE user_id = ? ORDER BY logged_in_at DESC LIMIT ?",
             (user_id, limit)
@@ -243,7 +366,6 @@ def get_user_login_logs(user_id: str, limit: int = 20) -> list[dict]:
 
 def save_study_material(mat: dict) -> dict:
     """Save or update a study material in the SQLite database."""
-    init_materials_db()
     now_iso = datetime.now(timezone.utc).isoformat()
     material_id = mat.get("material_id") or mat.get("id") or f"mat_{int(datetime.now().timestamp()*1000)}"
     user_id = mat.get("user_id", "default")
@@ -256,7 +378,7 @@ def save_study_material(mat: dict) -> dict:
         preview_json = json.dumps(mat.get("structured_preview", []))
     elif not isinstance(preview_json, str):
         preview_json = json.dumps(preview_json)
-        
+
     chunk_count = int(mat.get("chunk_count", 0))
     concepts_json = mat.get("extracted_concepts_json")
     if concepts_json is None:
@@ -266,7 +388,7 @@ def save_study_material(mat: dict) -> dict:
 
     created_at = mat.get("created_at") or now_iso
 
-    with get_materials_db() as conn:
+    with _materials_transaction(immediate=True) as conn:
         conn.execute(
             """
             INSERT OR REPLACE INTO study_materials
@@ -280,6 +402,7 @@ def save_study_material(mat: dict) -> dict:
                 raw_text, preview_json, chunk_count, concepts_json, created_at
             )
         )
+    parsed_concepts = _parse_json_value(concepts_json, [])
     return {
         "material_id": material_id,
         "user_id": user_id,
@@ -287,15 +410,14 @@ def save_study_material(mat: dict) -> dict:
         "source_type": source_type,
         "original_filename_or_url": origin,
         "chunk_count": chunk_count,
-        "concepts": json.loads(concepts_json),
-        "concept_count": len(json.loads(concepts_json)),
+        "concepts": parsed_concepts,
+        "concept_count": len(parsed_concepts),
         "created_at": created_at,
     }
 
 def list_study_materials(user_id: str = "default") -> list[dict]:
     """Retrieve all study materials for the given learner."""
-    init_materials_db()
-    with get_materials_db() as conn:
+    with _materials_transaction(immediate=False) as conn:
         rows = conn.execute(
             """
             SELECT material_id, user_id, title, source_type, original_filename_or_url,
@@ -308,7 +430,7 @@ def list_study_materials(user_id: str = "default") -> list[dict]:
         ).fetchall()
         materials = []
         for r in rows:
-            concepts = json.loads(r["extracted_concepts_json"]) if r["extracted_concepts_json"] else []
+            concepts = _parse_json_value(r["extracted_concepts_json"], [])
             materials.append({
                 "material_id": r["material_id"],
                 "user_id": r["user_id"],
@@ -324,8 +446,7 @@ def list_study_materials(user_id: str = "default") -> list[dict]:
 
 def get_study_material(material_id: str, user_id: str | None = None) -> dict | None:
     """Retrieve full details and structured preview for a specific material."""
-    init_materials_db()
-    with get_materials_db() as conn:
+    with _materials_transaction(immediate=False) as conn:
         query = "SELECT * FROM study_materials WHERE material_id = ?"
         params = [material_id]
         if user_id:
@@ -334,8 +455,8 @@ def get_study_material(material_id: str, user_id: str | None = None) -> dict | N
         row = conn.execute(query, tuple(params)).fetchone()
         if not row:
             return None
-        concepts = json.loads(row["extracted_concepts_json"]) if row["extracted_concepts_json"] else []
-        preview = json.loads(row["structured_preview_json"]) if row["structured_preview_json"] else []
+        concepts = _parse_json_value(row["extracted_concepts_json"], [])
+        preview = _parse_json_value(row["structured_preview_json"], [])
         return {
             "material_id": row["material_id"],
             "user_id": row["user_id"],
@@ -353,8 +474,7 @@ def get_study_material(material_id: str, user_id: str | None = None) -> dict | N
 
 def delete_study_material(material_id: str, user_id: str | None = None) -> bool:
     """Delete a study material by ID, optionally isolated by user_id."""
-    init_materials_db()
-    with get_materials_db() as conn:
+    with _materials_transaction(immediate=True) as conn:
         if user_id:
             res = conn.execute("DELETE FROM study_materials WHERE material_id = ? AND user_id = ?", (material_id, user_id))
         else:
@@ -362,8 +482,7 @@ def delete_study_material(material_id: str, user_id: str | None = None) -> bool:
         return res.rowcount > 0
 
 def clear_all_study_materials(user_id: str | None = None):
-    init_materials_db()
-    with get_materials_db() as conn:
+    with _materials_transaction(immediate=True) as conn:
         if user_id:
             conn.execute("DELETE FROM study_materials WHERE user_id = ?", (user_id,))
         else:
@@ -374,7 +493,6 @@ def clear_all_study_materials(user_id: str | None = None):
 
 def save_active_recall_session(session: dict) -> dict:
     """Save or initialize an active recall session in SQLite."""
-    init_materials_db()
     now_iso = datetime.now(timezone.utc).isoformat()
     session_id = session.get("session_id") or f"ar_{uuid.uuid4().hex[:12]}"
     user_id = session.get("user_id", "default")
@@ -405,7 +523,7 @@ def save_active_recall_session(session: dict) -> dict:
 
     created_at = session.get("created_at") or now_iso
 
-    with get_materials_db() as conn:
+    with _materials_transaction(immediate=True) as conn:
         conn.execute(
             """
             INSERT OR REPLACE INTO active_recall_sessions
@@ -435,12 +553,26 @@ def save_active_recall_session(session: dict) -> dict:
     }
 
 
-def update_active_recall_session(session_id: str, updates: dict) -> dict | None:
-    """Update an existing active recall session with student submission and AI evaluation."""
-    init_materials_db()
-    existing = get_active_recall_session(session_id)
-    if not existing:
+def _apply_active_recall_updates(
+    conn: sqlite3.Connection,
+    session_id: str,
+    updates: dict,
+    user_id: str | None = None,
+) -> dict | None:
+    """Shared transactional update helper for active_recall_sessions."""
+    if user_id is not None:
+        row = conn.execute(
+            "SELECT * FROM active_recall_sessions WHERE session_id = ? AND user_id = ?",
+            (session_id, user_id),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT * FROM active_recall_sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+    if not row:
         return None
+    existing = dict(row)
 
     for k, v in updates.items():
         if k in ("lesson_json", "verification_question_json", "retained_concepts_json", "missed_gaps_json") and not isinstance(v, str):
@@ -448,36 +580,74 @@ def update_active_recall_session(session_id: str, updates: dict) -> dict | None:
         else:
             existing[k] = v
 
-    with get_materials_db() as conn:
-        conn.execute(
-            """
-            UPDATE active_recall_sessions
-            SET recall_submission_text = ?,
-                retrieval_score = ?,
-                retained_concepts_json = ?,
-                missed_gaps_json = ?,
-                lesson_json = ?,
-                verification_question_json = ?
-            WHERE session_id = ?
-            """,
-            (
-                existing["recall_submission_text"],
-                existing["retrieval_score"],
-                existing["retained_concepts_json"] if isinstance(existing["retained_concepts_json"], str) else json.dumps(existing["retained_concepts_json"]),
-                existing["missed_gaps_json"] if isinstance(existing["missed_gaps_json"], str) else json.dumps(existing["missed_gaps_json"]),
-                existing["lesson_json"] if isinstance(existing["lesson_json"], str) else json.dumps(existing["lesson_json"]),
-                existing["verification_question_json"] if isinstance(existing["verification_question_json"], str) else json.dumps(existing["verification_question_json"]),
-                session_id
-            )
-        )
-    return get_active_recall_session(session_id)
+    params: list[Any] = [
+        existing["recall_submission_text"],
+        existing["retrieval_score"],
+        existing["retained_concepts_json"] if isinstance(existing["retained_concepts_json"], str) else json.dumps(existing["retained_concepts_json"]),
+        existing["missed_gaps_json"] if isinstance(existing["missed_gaps_json"], str) else json.dumps(existing["missed_gaps_json"]),
+        existing["lesson_json"] if isinstance(existing["lesson_json"], str) else json.dumps(existing["lesson_json"]),
+        existing["verification_question_json"] if isinstance(existing["verification_question_json"], str) else json.dumps(existing["verification_question_json"]),
+        session_id,
+    ]
+    where_clause = "WHERE session_id = ?"
+    if user_id is not None:
+        where_clause += " AND user_id = ?"
+        params.append(user_id)
+
+    conn.execute(
+        f"""
+        UPDATE active_recall_sessions
+        SET recall_submission_text = ?,
+            retrieval_score = ?,
+            retained_concepts_json = ?,
+            missed_gaps_json = ?,
+            lesson_json = ?,
+            verification_question_json = ?
+        {where_clause}
+        """,
+        tuple(params),
+    )
+    if user_id is not None:
+        updated_row = conn.execute(
+            "SELECT * FROM active_recall_sessions WHERE session_id = ? AND user_id = ?",
+            (session_id, user_id),
+        ).fetchone()
+    else:
+        updated_row = conn.execute(
+            "SELECT * FROM active_recall_sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+    return dict(updated_row) if updated_row else existing
+
+
+def update_active_recall_session(session_id: str, updates: dict) -> dict | None:
+    """Update an existing active recall session atomically within a single transaction."""
+    with _materials_transaction(immediate=True) as conn:
+        return _apply_active_recall_updates(conn, session_id=session_id, updates=updates, user_id=None)
+
+
+def update_active_recall_session_for_user(session_id: str, user_id: str, updates: dict) -> dict | None:
+    """Update an active recall session only when owned by ``user_id``."""
+    with _materials_transaction(immediate=True) as conn:
+        return _apply_active_recall_updates(conn, session_id=session_id, updates=updates, user_id=user_id)
 
 
 def get_active_recall_session(session_id: str) -> dict | None:
     """Fetch an active recall session by session_id."""
-    init_materials_db()
-    with get_materials_db() as conn:
+    with _materials_transaction(immediate=False) as conn:
         row = conn.execute("SELECT * FROM active_recall_sessions WHERE session_id = ?", (session_id,)).fetchone()
+        if not row:
+            return None
+        return dict(row)
+
+
+def get_active_recall_session_for_user(session_id: str, user_id: str) -> dict | None:
+    """Fetch an active recall session only when owned by ``user_id``."""
+    with _materials_transaction(immediate=False) as conn:
+        row = conn.execute(
+            "SELECT * FROM active_recall_sessions WHERE session_id = ? AND user_id = ?",
+            (session_id, user_id),
+        ).fetchone()
         if not row:
             return None
         return dict(row)
@@ -485,8 +655,7 @@ def get_active_recall_session(session_id: str) -> dict | None:
 
 def list_active_recall_sessions(user_id: str = "default", limit: int = 50) -> list[dict]:
     """Retrieve list of active recall sessions for user_id."""
-    init_materials_db()
-    with get_materials_db() as conn:
+    with _materials_transaction(immediate=False) as conn:
         rows = conn.execute(
             """
             SELECT * FROM active_recall_sessions
@@ -502,7 +671,6 @@ def list_active_recall_sessions(user_id: str = "default", limit: int = 50) -> li
 
 def save_smart_note(note_data: dict) -> dict:
     """Save or update a smart note in SQLite."""
-    init_materials_db()
     now_iso = datetime.now(timezone.utc).isoformat()
     note_id = note_data.get("note_id") or f"sn_{uuid.uuid4().hex[:12]}"
     user_id = note_data.get("user_id", "default")
@@ -530,7 +698,7 @@ def save_smart_note(note_data: dict) -> dict:
     pptx_url = note_data.get("pptx_url")
     created_at = note_data.get("created_at") or now_iso
 
-    with get_materials_db() as conn:
+    with _materials_transaction(immediate=True) as conn:
         conn.execute(
             """
             INSERT OR REPLACE INTO smart_notes
@@ -556,9 +724,9 @@ def save_smart_note(note_data: dict) -> dict:
         "custom_instructions": custom_instructions,
         "title": title,
         "markdown_content": markdown_content,
-        "key_takeaways": json.loads(key_takeaways_json),
+        "key_takeaways": _parse_json_value(key_takeaways_json, []),
         "key_takeaways_json": key_takeaways_json,
-        "citations": json.loads(citations_json),
+        "citations": _parse_json_value(citations_json, []),
         "citations_json": citations_json,
         "audio_url": audio_url,
         "pdf_url": pdf_url,
@@ -569,15 +737,14 @@ def save_smart_note(note_data: dict) -> dict:
 
 def get_smart_note(note_id: str, user_id: str = "default") -> Optional[dict]:
     """Fetch a smart note by note_id, isolating by user_id with fallback."""
-    init_materials_db()
-    with get_materials_db() as conn:
+    with _materials_transaction(immediate=False) as conn:
         row = None
-        if user_id:
+        if user_id is not None:
             row = conn.execute(
                 "SELECT * FROM smart_notes WHERE note_id = ? AND user_id = ?",
                 (note_id, user_id)
             ).fetchone()
-        if not row:
+        else:
             row = conn.execute(
                 "SELECT * FROM smart_notes WHERE note_id = ?",
                 (note_id,)
@@ -585,21 +752,14 @@ def get_smart_note(note_id: str, user_id: str = "default") -> Optional[dict]:
         if not row:
             return None
         res = dict(row)
-        try:
-            res["key_takeaways"] = json.loads(res.get("key_takeaways_json") or "[]")
-        except Exception:
-            res["key_takeaways"] = []
-        try:
-            res["citations"] = json.loads(res.get("citations_json") or "[]")
-        except Exception:
-            res["citations"] = []
+        res["key_takeaways"] = _parse_json_value(res.get("key_takeaways_json") or "[]", [])
+        res["citations"] = _parse_json_value(res.get("citations_json") or "[]", [])
         return res
 
 
 def list_smart_notes(user_id: str = "default", concept_id: Optional[str] = None) -> list[dict]:
     """Retrieve all smart notes for user_id, optionally filtered by concept_id."""
-    init_materials_db()
-    with get_materials_db() as conn:
+    with _materials_transaction(immediate=False) as conn:
         query = "SELECT * FROM smart_notes WHERE 1=1"
         params = []
         if user_id:
@@ -613,26 +773,17 @@ def list_smart_notes(user_id: str = "default", concept_id: Optional[str] = None)
         results = []
         for r in rows:
             d = dict(r)
-            try:
-                d["key_takeaways"] = json.loads(d.get("key_takeaways_json") or "[]")
-            except Exception:
-                d["key_takeaways"] = []
-            try:
-                d["citations"] = json.loads(d.get("citations_json") or "[]")
-            except Exception:
-                d["citations"] = []
+            d["key_takeaways"] = _parse_json_value(d.get("key_takeaways_json") or "[]", [])
+            d["citations"] = _parse_json_value(d.get("citations_json") or "[]", [])
             results.append(d)
         return results
 
 
 def delete_smart_note(note_id: str, user_id: str = "default") -> bool:
     """Delete a smart note by ID."""
-    init_materials_db()
-    with get_materials_db() as conn:
+    with _materials_transaction(immediate=True) as conn:
         if user_id:
             res = conn.execute("DELETE FROM smart_notes WHERE note_id = ? AND user_id = ?", (note_id, user_id))
-            if res.rowcount == 0:
-                res = conn.execute("DELETE FROM smart_notes WHERE note_id = ?", (note_id,))
         else:
             res = conn.execute("DELETE FROM smart_notes WHERE note_id = ?", (note_id,))
         return res.rowcount > 0
@@ -646,7 +797,6 @@ def update_smart_note_urls(
     pptx_url: Optional[str] = None
 ) -> bool:
     """Update artifact URLs for a smart note."""
-    init_materials_db()
     updates = []
     params = []
     if audio_url is not None:
@@ -662,13 +812,12 @@ def update_smart_note_urls(
     if not updates:
         return False
 
-    with get_materials_db() as conn:
+    with _materials_transaction(immediate=True) as conn:
         sql = f"UPDATE smart_notes SET {', '.join(updates)} WHERE note_id = ?"
         params_with_id = list(params) + [note_id]
         if user_id:
             res = conn.execute(sql + " AND user_id = ?", tuple(params_with_id + [user_id]))
-            if res.rowcount > 0:
-                return True
+            return res.rowcount > 0
         res = conn.execute(sql, tuple(params_with_id))
         return res.rowcount > 0
 
@@ -677,7 +826,6 @@ def update_smart_note_urls(
 
 def save_learning_evidence(rec: dict | Any) -> dict:
     """Save or update a student learning evidence record."""
-    init_materials_db()
     if hasattr(rec, "model_dump"):
         data = rec.model_dump()
     elif isinstance(rec, dict):
@@ -702,7 +850,7 @@ def save_learning_evidence(rec: dict | Any) -> dict:
     session_id = data.get("session_id")
     created_at = data.get("created_at") or now_iso
 
-    with get_materials_db() as conn:
+    with _materials_transaction(immediate=True) as conn:
         conn.execute(
             """
             INSERT OR REPLACE INTO learning_evidence_store
@@ -741,8 +889,7 @@ def save_learning_evidence(rec: dict | Any) -> dict:
 
 def get_learning_evidence(evidence_id: str, user_id: str = "default") -> dict | None:
     """Fetch a single learning evidence record by ID and user_id."""
-    init_materials_db()
-    with get_materials_db() as conn:
+    with _materials_transaction(immediate=False) as conn:
         row = conn.execute(
             "SELECT * FROM learning_evidence_store WHERE evidence_id = ? AND user_id = ?",
             (evidence_id, user_id)
@@ -758,8 +905,7 @@ def get_learning_evidence(evidence_id: str, user_id: str = "default") -> dict | 
 
 def list_learning_evidence(user_id: str, concept_id: str, limit: int = 50) -> list[dict]:
     """Retrieve chronologically ordered (most recent first) learning evidence records for a concept."""
-    init_materials_db()
-    with get_materials_db() as conn:
+    with _materials_transaction(immediate=False) as conn:
         rows = conn.execute(
             """
             SELECT * FROM learning_evidence_store
@@ -781,7 +927,6 @@ def list_learning_evidence(user_id: str, concept_id: str, limit: int = 50) -> li
 
 def save_specialist_finding(finding: dict | Any, decision_id: str, user_id: str = "default") -> dict:
     """Save an assessment finding produced by a specialist agent during deliberation."""
-    init_materials_db()
     if hasattr(finding, "model_dump"):
         data = finding.model_dump()
     elif isinstance(finding, dict):
@@ -803,24 +948,18 @@ def save_specialist_finding(finding: dict | Any, decision_id: str, user_id: str 
     evidence_refs = data.get("evidence_refs", [])
     if isinstance(evidence_refs, str):
         evidence_refs_json = evidence_refs
-        try:
-            evidence_refs = json.loads(evidence_refs)
-        except Exception:
-            evidence_refs = []
+        evidence_refs = _parse_json_value(evidence_refs, [])
     else:
         evidence_refs_json = json.dumps(evidence_refs or [])
 
     identified_gaps = data.get("identified_gaps", [])
     if isinstance(identified_gaps, str):
         identified_gaps_json = identified_gaps
-        try:
-            identified_gaps = json.loads(identified_gaps)
-        except Exception:
-            identified_gaps = []
+        identified_gaps = _parse_json_value(identified_gaps, [])
     else:
         identified_gaps_json = json.dumps(identified_gaps or [])
 
-    with get_materials_db() as conn:
+    with _materials_transaction(immediate=True) as conn:
         conn.execute(
             """
             INSERT OR REPLACE INTO specialist_agent_findings
@@ -856,8 +995,7 @@ def save_specialist_finding(finding: dict | Any, decision_id: str, user_id: str 
 
 def list_specialist_findings(decision_id: str, user_id: str = "default") -> list[dict]:
     """Retrieve all specialist agent findings associated with a deliberation decision."""
-    init_materials_db()
-    with get_materials_db() as conn:
+    with _materials_transaction(immediate=False) as conn:
         rows = conn.execute(
             """
             SELECT * FROM specialist_agent_findings
@@ -869,21 +1007,14 @@ def list_specialist_findings(decision_id: str, user_id: str = "default") -> list
         results = []
         for r in rows:
             d = dict(r)
-            try:
-                d["evidence_refs"] = json.loads(d.get("evidence_refs_json") or "[]")
-            except Exception:
-                d["evidence_refs"] = []
-            try:
-                d["identified_gaps"] = json.loads(d.get("identified_gaps_json") or "[]")
-            except Exception:
-                d["identified_gaps"] = []
+            d["evidence_refs"] = _parse_json_value(d.get("evidence_refs_json") or "[]", [])
+            d["identified_gaps"] = _parse_json_value(d.get("identified_gaps_json") or "[]", [])
             results.append(d)
         return results
 
 
 def save_mastery_decision(decision: dict | Any, user_id: str = "default") -> dict:
     """Save an explainable mastery decision from the Head Teacher agent."""
-    init_materials_db()
     if hasattr(decision, "model_dump"):
         data = decision.model_dump()
     elif isinstance(decision, dict):
@@ -920,7 +1051,7 @@ def save_mastery_decision(decision: dict | Any, user_id: str = "default") -> dic
     updated_at = data.get("updated_at") or now_iso
     explainable_summary = data.get("explainable_summary") or ""
 
-    with get_materials_db() as conn:
+    with _materials_transaction(immediate=True) as conn:
         conn.execute(
             """
             INSERT OR REPLACE INTO explainable_mastery_decisions
@@ -940,28 +1071,18 @@ def save_mastery_decision(decision: dict | Any, user_id: str = "default") -> dic
             )
         )
 
-    def _parse(val, default):
-        if val is None:
-            return default
-        if isinstance(val, (list, dict)):
-            return val
-        try:
-            return json.loads(val)
-        except Exception:
-            return default
-
     return {
         "decision_id": decision_id,
         "user_id": uid,
         "concept_id": concept_id,
         "outcome": outcome,
         "legacy_status": legacy_status,
-        "demonstrated_understanding": _parse(dem_under_json, []),
-        "remaining_gaps": _parse(rem_gaps_json, []),
-        "unresolved_disagreements": _parse(unres_dis_json, []),
-        "supporting_evidence_refs": _parse(supp_refs_json, []),
+        "demonstrated_understanding": _parse_json_value(dem_under_json, []),
+        "remaining_gaps": _parse_json_value(rem_gaps_json, []),
+        "unresolved_disagreements": _parse_json_value(unres_dis_json, []),
+        "supporting_evidence_refs": _parse_json_value(supp_refs_json, []),
         "recommended_next_action": rec_next,
-        "follow_up_question": _parse(fu_q_json, None) if fu_q_json else None,
+        "follow_up_question": _parse_json_value(fu_q_json, None) if fu_q_json else None,
         "evidence_version": evidence_version,
         "evaluation_pending": bool(evaluation_pending),
         "updated_at": updated_at,
@@ -971,8 +1092,7 @@ def save_mastery_decision(decision: dict | Any, user_id: str = "default") -> dic
 
 def get_latest_mastery_decision(user_id: str, concept_id: str) -> dict | None:
     """Fetch the latest explainable mastery decision for a given user and concept."""
-    init_materials_db()
-    with get_materials_db() as conn:
+    with _materials_transaction(immediate=False) as conn:
         row = conn.execute(
             """
             SELECT * FROM explainable_mastery_decisions
@@ -982,32 +1102,12 @@ def get_latest_mastery_decision(user_id: str, concept_id: str) -> dict | None:
             """,
             (user_id, concept_id)
         ).fetchone()
-        if not row:
-            return None
-        res = dict(row)
-        for key in ("demonstrated_understanding", "remaining_gaps", "unresolved_disagreements", "supporting_evidence_refs"):
-            json_key = f"{key}_json"
-            try:
-                res[key] = json.loads(res.get(json_key) or "[]")
-            except Exception:
-                res[key] = []
-        fu_key = "follow_up_question_json"
-        if res.get(fu_key):
-            try:
-                res["follow_up_question"] = json.loads(res[fu_key])
-            except Exception:
-                res["follow_up_question"] = None
-        else:
-            res["follow_up_question"] = None
-        res["evaluation_pending"] = bool(res.get("evaluation_pending", 0))
-        res["explainable_summary"] = res.get("explainable_summary", "")
-        return res
+        return _hydrate_mastery_decision_row(row) if row else None
 
 
 def list_latest_mastery_decisions(user_id: str) -> list[dict]:
     """Retrieve the latest explainable mastery decision for each concept for the user."""
-    init_materials_db()
-    with get_materials_db() as conn:
+    with _materials_transaction(immediate=False) as conn:
         query = """
             WITH Ranked AS (
                 SELECT *,
@@ -1021,28 +1121,7 @@ def list_latest_mastery_decisions(user_id: str) -> list[dict]:
             SELECT * FROM Ranked WHERE rn = 1 ORDER BY updated_at DESC
         """
         rows = conn.execute(query, (user_id,)).fetchall()
-        decisions = []
-        for r in rows:
-            res = dict(r)
-            res.pop("rn", None)
-            for key in ("demonstrated_understanding", "remaining_gaps", "unresolved_disagreements", "supporting_evidence_refs"):
-                json_key = f"{key}_json"
-                try:
-                    res[key] = json.loads(res.get(json_key) or "[]")
-                except Exception:
-                    res[key] = []
-            fu_key = "follow_up_question_json"
-            if res.get(fu_key):
-                try:
-                    res["follow_up_question"] = json.loads(res[fu_key])
-                except Exception:
-                    res["follow_up_question"] = None
-            else:
-                res["follow_up_question"] = None
-            res["evaluation_pending"] = bool(res.get("evaluation_pending", 0))
-            res["explainable_summary"] = res.get("explainable_summary", "")
-            decisions.append(res)
-        return decisions
+        return [_hydrate_mastery_decision_row(r) for r in rows]
 
 
 def verify_evidence_refs(user_id: str, concept_id: str, claimed_refs: list[str]) -> list[str]:
@@ -1051,13 +1130,12 @@ def verify_evidence_refs(user_id: str, concept_id: str, claimed_refs: list[str])
     """
     if not claimed_refs:
         return []
-    init_materials_db()
     clean_refs = [r for r in claimed_refs if r and isinstance(r, str)]
     if not clean_refs:
         return []
     unique_refs = list(dict.fromkeys(clean_refs))
     placeholders = ",".join("?" for _ in unique_refs)
-    with get_materials_db() as conn:
+    with _materials_transaction(immediate=False) as conn:
         query = f"""
             SELECT evidence_id FROM learning_evidence_store
             WHERE user_id = ? AND concept_id = ? AND evidence_id IN ({placeholders})
@@ -1091,8 +1169,9 @@ def get_kb(user_id: str = "default") -> dict:
         # If store.KB has been explicitly cleared (e.g. by _EmptyKB in test fixtures), respect it
         if not KB.get("ready"):
             return KB
-        if "default" in USER_KBS and USER_KBS["default"].get("ready"):
-            return USER_KBS["default"]
+        cached_default = USER_KBS.get("default")
+        if cached_default and cached_default.get("ready"):
+            return cached_default
         mats = list_study_materials("default")
         if mats:
             from ..pipelines.ingest import UniversalMaterialIngestor
@@ -1101,8 +1180,9 @@ def get_kb(user_id: str = "default") -> dict:
         return KB
 
     # For specific non-default user:
-    if user_id in USER_KBS and USER_KBS[user_id].get("ready"):
-        return USER_KBS[user_id]
+    cached_user = USER_KBS.get(user_id)
+    if cached_user and cached_user.get("ready"):
+        return cached_user
 
     # Check if materials exist in database for this user
     mats = list_study_materials(user_id)
@@ -1113,12 +1193,13 @@ def get_kb(user_id: str = "default") -> dict:
         return USER_KBS.get(user_id, {"ready": False, "file": None, "pages": 0, "index": None, "concepts": [], "edges": [], "user_id": user_id})
 
     # If the user has explicitly empty or reset KB (e.g. via clear_kb), respect it
-    if user_id in USER_KBS and not USER_KBS[user_id].get("ready"):
-        return USER_KBS[user_id]
+    if cached_user is not None and not cached_user.get("ready"):
+        return cached_user
 
     # Test fixture fallback: if user has no materials of their own, but test fixture loaded KB into default/store.KB
-    if USER_KBS.get("default", {}).get("ready") and KB.get("ready"):
-        return USER_KBS["default"]
+    default_kb = USER_KBS.peek("default")
+    if default_kb and default_kb.get("ready") and KB.get("ready"):
+        return default_kb
     if KB.get("ready"):
         return KB
 

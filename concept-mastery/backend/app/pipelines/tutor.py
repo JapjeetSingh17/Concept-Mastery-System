@@ -9,15 +9,14 @@ from __future__ import annotations
 
 import re
 import logging
-from typing import Optional
+from typing import Any, Optional
 from ..core import store, llm, web_search
 from ..core.concept_index import GLOBAL_INDEX
-from ..core.text import NORMALIZER, tokens, sentences
-from ..models.schemas import TutorChatResponse, Citation
+from ..core.text import NORMALIZER, tokens, sentences, build_context_window, truncate_boundary_aware
+from ..models.schemas import TutorChatResponse, TutorResponse, Citation
 from . import mastery, tools
 
 logger = logging.getLogger("concept_mastery.tutor")
-TutorResponse = TutorChatResponse
 
 SOCRATIC_GUARDRAIL_SYSTEM = """You are an expert Socratic master tutor for an adaptive concept mastery platform.
 Your mission is to guide students to deep conceptual intuition, architectural understanding, and operational mastery.
@@ -208,9 +207,19 @@ def chat(
         web_results = web_search.search(search_query, max_results=3)
 
         if web_results:
-            context_text = "\n\n".join(
-                f"[Source: {r.get('site_name') or 'Web'} · {r['title']}]\n{r['snippet']}\nURL: {r['url']}"
-                for r in web_results
+            def _format_web_result(r: dict, body: str) -> str:
+                return (
+                    f"[Source: {r.get('site_name') or 'Web'} · {r['title']}]\n"
+                    f"{body}\n"
+                    f"URL: {r['url']}"
+                )
+
+            context_text = build_context_window(
+                web_results,
+                max_chars=4500,
+                chunk_max_chars=1500,
+                body_getter=lambda r: r.get("snippet", ""),
+                formatter=_format_web_result,
             )
             user_prompt = (
                 f"Live Web Search Excerpts (TinyFish Search):\n{context_text}\n\n"
@@ -219,9 +228,10 @@ def chat(
             raw_answer = llm.complete(WEB_SOCRATIC_SYSTEM, user_prompt, max_tokens=600)
             if not raw_answer:
                 top = web_results[0]
+                top_excerpt = truncate_boundary_aware(top.get("snippet", ""), 220)
                 raw_answer = (
                     f"According to {top.get('site_name') or 'web sources'} ([Source: {top['title']}]): "
-                    f"\"{top['snippet'][:220]}...\"\n\n"
+                    f"\"{top_excerpt}\"\n\n"
                     f"How does this connect with what you are trying to understand?"
                 )
 
@@ -261,9 +271,14 @@ def chat(
     def _loc_str(c):
         return getattr(c, "locator_label", None) or f"Page {c.page_number}"
 
-    context_text = "\n\n".join(
-        f"[{_loc_str(c)} · {c.section_title}]\n{c.text}"
-        for c in retrieved_chunks
+    def _format_tutor_chunk(c: Any, body: str) -> str:
+        return f"[{_loc_str(c)} · {c.section_title}]\n{body}"
+
+    context_text = build_context_window(
+        retrieved_chunks,
+        max_chars=6000,
+        chunk_max_chars=1800,
+        formatter=_format_tutor_chunk,
     )
 
     system_prompt = REMEDIAL_SYSTEM if mode == "remedial" else SOCRATIC_GUARDRAIL_SYSTEM
@@ -285,7 +300,7 @@ def chat(
                 if 8 <= len(s.split()) <= 45:
                     all_sents.append(s.strip())
 
-        summary_sent = all_sents[0] if all_sents else top_chunk.text[:220]
+        summary_sent = all_sents[0] if all_sents else truncate_boundary_aware(top_chunk.text, 220)
         mechanism_sent = all_sents[1] if len(all_sents) > 1 else "State transformations occur through strictly bounded operational invariants."
         example_sent = all_sents[2] if len(all_sents) > 2 else f"Applying {c_title} to sample inputs guarantees structured, deterministic execution."
 

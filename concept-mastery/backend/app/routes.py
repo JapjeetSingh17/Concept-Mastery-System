@@ -15,8 +15,8 @@ import time
 from pathlib import Path
 from typing import Optional, Literal
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Request, Depends, Query, Body
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
 
 from . import config
 from .core import store, tts
@@ -56,6 +56,14 @@ from .models.schemas import (
     HeadTeacherDecision,
     SpecialistAgentAssessment,
     LearningEvidenceRecord,
+    LegacyAsk,
+    WebSearchRequest,
+    LegacyQuizReq,
+    RemedialQuizReq,
+    LegacyAnswer,
+    LegacyEvaluateReq,
+    StartSessionReq,
+    DiagnosticSubmitReq,
 )
 from .pipelines.ingest import UniversalMaterialIngestor
 
@@ -144,6 +152,12 @@ def get_auth_logs(current_user: User = Depends(get_current_user)):
 
 # ── 1. Document Ingestion & Vectorless Index ───────────────────────────────
 
+def _write_uploaded_bytes(dest: Path, content: bytes) -> None:
+    """Create parent directory if needed and write uploaded bytes synchronously (called via threadpool)."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(content)
+
+
 async def _save_uploaded_pdfs(files: list[UploadFile], file: UploadFile | None) -> list[Path]:
     all_uploads: list[UploadFile] = list(files or [])
     if file:
@@ -158,21 +172,147 @@ async def _save_uploaded_pdfs(files: list[UploadFile], file: UploadFile | None) 
         fname = Path(f.filename).name
         dest = config.UPLOAD_DIR / fname
         content = await f.read()
-        dest.write_bytes(content)
+        await run_in_threadpool(_write_uploaded_bytes, dest, content)
         saved_paths.append(dest)
     return saved_paths
+
+
+def _empty_kb(user_id: str) -> dict:
+    return {
+        "ready": False,
+        "file": None,
+        "pages": 0,
+        "index": None,
+        "concepts": [],
+        "edges": [],
+        "user_id": user_id,
+    }
+
+
+def _is_explicit_auth(request: Request) -> bool:
+    return getattr(request.state, "auth_source", "jwt") in ("jwt", "dev_header")
+
+
+def _resolve_tenant_user_id(
+    current_user: User,
+    request: Request,
+    *requested_user_ids: Optional[str],
+) -> str:
+    """Resolve active tenant user_id and block cross-tenant user_id spoofing."""
+    auth_uid = (current_user.user_id if current_user else "").strip() or "default"
+    explicit = _is_explicit_auth(request)
+    resolved_fallback: Optional[str] = None
+
+    for raw_uid in requested_user_ids:
+        if raw_uid is None:
+            continue
+        candidate = str(raw_uid).strip()
+        if not candidate or candidate == "default":
+            continue
+        if explicit:
+            if candidate != auth_uid:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Access denied: authenticated user '{auth_uid}' cannot act as user '{candidate}'.",
+                )
+        elif resolved_fallback is None:
+            resolved_fallback = candidate
+
+    if explicit:
+        return auth_uid
+    return resolved_fallback or auth_uid
+
+
+def _get_tenant_kb(uid: str, request: Request) -> dict:
+    """Fetch tenant KB without falling back to the global 'default' KB for authenticated users."""
+    if _is_explicit_auth(request) and uid != "default" and uid not in store.USER_KBS:
+        if not store.list_study_materials(uid):
+            return _empty_kb(uid)
+    return store.get_kb(uid)
+
+
+def _require_owned_material(material_id: str, uid: str, request: Request) -> dict:
+    """Ensure a study material belongs to the resolved tenant or return 403/404."""
+    mat = store.get_study_material(material_id, user_id=uid)
+    if mat:
+        return mat
+    existing = store.get_study_material(material_id, user_id=None)
+    if existing:
+        if not _is_explicit_auth(request) and uid == "default" and not request.query_params.get("user_id"):
+            return existing
+        raise HTTPException(
+            status_code=403,
+            detail=f"Access denied: study material '{material_id}' belongs to another user.",
+        )
+    raise HTTPException(status_code=404, detail=f"Study material '{material_id}' not found.")
+
+
+def _require_owned_note(note_id: str, uid: str) -> dict:
+    """Ensure a smart note belongs to the resolved tenant or return 403/404."""
+    note = store.get_smart_note(note_id, user_id=uid)
+    if note:
+        return note
+    existing = store.get_smart_note(note_id, user_id=None)
+    if existing and existing.get("user_id") != uid:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Access denied: smart note '{note_id}' belongs to another user.",
+        )
+    raise HTTPException(status_code=404, detail=f"Smart note '{note_id}' not found.")
+
+
+def _require_owned_active_recall_session(session_id: Optional[str], uid: str) -> None:
+    """Ensure a referenced active recall session belongs to the resolved tenant."""
+    if not session_id:
+        return
+    if store.get_active_recall_session_for_user(session_id, user_id=uid):
+        return
+    existing = store.get_active_recall_session(session_id)
+    if existing and existing.get("user_id") != uid:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Access denied: active recall session '{session_id}' belongs to another user.",
+        )
+    raise HTTPException(status_code=404, detail=f"Active recall session '{session_id}' not found.")
+
+
+def _require_owned_question(question_id: Optional[str], uid: str, request: Request) -> None:
+    """Ensure a submitted quiz question ID belongs to the resolved tenant."""
+    if not question_id:
+        return
+    q_data = quiz.REGISTRY.get(question_id) or quiz.RECENT_QUESTIONS.get(question_id)
+    if not q_data:
+        return
+    owner = q_data.get("user_id")
+    if not owner:
+        return
+    if _is_explicit_auth(request):
+        if owner != uid:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Access denied: quiz question '{question_id}' belongs to another user.",
+            )
+    elif owner != "default" and owner != uid:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Access denied: quiz question '{question_id}' belongs to another user.",
+        )
 
 
 @router.post("/upload", response_model=UploadResponse)
 @router.post("/upload/", response_model=UploadResponse)
 async def post_upload(
+    request: Request,
     files: list[UploadFile] = File(default=[]),
-    file: UploadFile | None = File(default=None)
+    file: UploadFile | None = File(default=None),
+    user_id: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user),
 ):
     """Upload one or multiple PDFs, run section chunking & vectorless indexing, build prerequisite DAG."""
+    uid = _resolve_tenant_user_id(current_user, request, user_id)
     saved_paths = await _save_uploaded_pdfs(files, file)
     try:
-        res = await ingest.run_ingest_async(saved_paths)
+        res = await ingest.run_ingest_async(saved_paths, user_id=uid)
         return UploadResponse(**res)
     except store.UserError as ue:
         raise HTTPException(status_code=400, detail=str(ue))
@@ -183,13 +323,17 @@ async def post_upload(
 @router.post("/ingest")
 @router.post("/ingest/")
 async def post_ingest(
+    request: Request,
     files: list[UploadFile] = File(default=[]),
-    file: UploadFile | None = File(default=None)
+    file: UploadFile | None = File(default=None),
+    user_id: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user),
 ):
     """Ingest one or multiple PDFs maintaining backward compatibility with existing SPA."""
+    uid = _resolve_tenant_user_id(current_user, request, user_id)
     saved_paths = await _save_uploaded_pdfs(files, file)
     try:
-        res = await ingest.run_ingest_async(saved_paths)
+        res = await ingest.run_ingest_async(saved_paths, user_id=uid)
         return {"jobId": res["job_id"], **res}
     except store.UserError as ue:
         raise HTTPException(status_code=400, detail=str(ue))
@@ -200,18 +344,26 @@ async def post_ingest(
 @router.post("/ingest/upload")
 @router.post("/ingest/upload/")
 async def post_ingest_upload(
+    request: Request,
     files: list[UploadFile] = File(default=[]),
-    file: UploadFile | None = File(default=None)
+    file: UploadFile | None = File(default=None),
+    user_id: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user),
 ):
-    return await post_upload(files=files, file=file)
+    return await post_upload(request=request, files=files, file=file, user_id=user_id, current_user=current_user)
 
 
 @router.get("/ingest/status", response_model=IngestStatusResponse)
 @router.get("/ingest/status/", response_model=IngestStatusResponse)
 @router.post("/ingest/status", response_model=IngestStatusResponse)
 @router.post("/ingest/status/", response_model=IngestStatusResponse)
-def ingest_status():
-    kb = store.KB
+def ingest_status(
+    request: Request,
+    user_id: str = "default",
+    current_user: User = Depends(get_current_user),
+):
+    uid = _resolve_tenant_user_id(current_user, request, user_id)
+    kb = _get_tenant_kb(uid, request)
     return IngestStatusResponse(
         ready=kb.get("ready", False),
         file=kb.get("file"),
@@ -224,7 +376,12 @@ def ingest_status():
 @router.post("/ingest/sample/")
 @router.get("/ingest/sample")
 @router.get("/ingest/sample/")
-def post_ingest_sample():
+def post_ingest_sample(
+    request: Request,
+    user_id: str = "default",
+    current_user: User = Depends(get_current_user),
+):
+    uid = _resolve_tenant_user_id(current_user, request, user_id)
     candidates = [
         config.UPLOAD_DIR / "ml-basics.pdf",
         config.BASE.parent / "sample" / "ml-basics.pdf",
@@ -241,7 +398,7 @@ def post_ingest_sample():
     dest = config.UPLOAD_DIR / sample_path.name
     if sample_path != dest:
         dest.write_bytes(sample_path.read_bytes())
-    res = ingest.run_ingest(dest)
+    res = ingest.run_ingest(dest, user_id=uid)
     return {"jobId": sample_path.name, **res}
 
 
@@ -249,10 +406,14 @@ def post_ingest_sample():
 
 @router.get("/concepts/graph")
 @router.get("/concepts/graph/")
-def get_concepts_graph(user_id: str = "default", current_user: User = Depends(get_current_user)):
+def get_concepts_graph(
+    request: Request,
+    user_id: str = "default",
+    current_user: User = Depends(get_current_user),
+):
     """Return full DAG nodes, directed edges, and user mastery states."""
-    uid = current_user.user_id if current_user and current_user.user_id != "default" and user_id == "default" else user_id
-    kb = store.get_kb(uid)
+    uid = _resolve_tenant_user_id(current_user, request, user_id)
+    kb = _get_tenant_kb(uid, request)
     mats = store.list_study_materials(uid)
     if not mats and not kb.get("ready"):
         return {"nodes": [], "edges": [], "learning_path": []}
@@ -264,13 +425,17 @@ def get_concepts_graph(user_id: str = "default", current_user: User = Depends(ge
 
 
 @router.get("/graph")
-def get_graph(user_id: str = "default", current_user: User = Depends(get_current_user)):
+def get_graph(
+    request: Request,
+    user_id: str = "default",
+    current_user: User = Depends(get_current_user),
+):
     """Legacy graph endpoint for existing frontend view."""
-    uid = current_user.user_id if current_user and current_user.user_id != "default" and user_id == "default" else user_id
+    uid = _resolve_tenant_user_id(current_user, request, user_id)
     mats = store.list_study_materials(uid)
     if not mats:
         return {"nodes": [], "edges": []}
-    kb = store.get_kb(uid)
+    kb = _get_tenant_kb(uid, request)
     if not kb.get("ready"):
         return {"nodes": [], "edges": []}
     return {
@@ -283,37 +448,43 @@ def get_graph(user_id: str = "default", current_user: User = Depends(get_current
 
 @router.post("/tutor/chat", response_model=TutorChatResponse)
 @router.post("/tutor/chat/", response_model=TutorChatResponse)
-def post_tutor_chat(req: TutorChatRequest, current_user: User = Depends(get_current_user)):
+def post_tutor_chat(
+    req: TutorChatRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
     """Grounded Socratic conversational endpoint with two-layer anti-hallucination guardrails."""
-    uid = current_user.user_id if current_user and current_user.user_id != "default" and req.user_id == "default" else req.user_id
+    uid = _resolve_tenant_user_id(current_user, request, req.user_id)
+    kb = _get_tenant_kb(uid, request)
     return tutor.chat(
         message=req.message,
         concept_id=req.concept_id,
         user_id=uid,
+        kb=kb,
     )
 
 
-class LegacyAsk(BaseModel):
-    question: str
-    docId: str | None = None
-    conceptId: str | None = None
-
 @router.post("/tutor/ask")
-def legacy_ask(body: LegacyAsk):
-    return tutor.chat(message=body.question, concept_id=body.conceptId).model_dump()
+def legacy_ask(
+    body: LegacyAsk,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    uid = _resolve_tenant_user_id(current_user, request)
+    kb = _get_tenant_kb(uid, request)
+    return tutor.chat(message=body.question, concept_id=body.conceptId, user_id=uid, kb=kb).model_dump()
 
-
-class WebSearchRequest(BaseModel):
-    query: str
-    max_results: int = 5
 
 
 @router.post("/tutor/search")
 @router.post("/web/search")
-def post_web_search(req: WebSearchRequest):
+async def post_web_search(req: WebSearchRequest):
     """Execute live web search via TinyFish Search API."""
     from .core import web_search
-    results = web_search.search(req.query, max_results=req.max_results)
+    if getattr(web_search.search, "_is_default_sync_search", False):
+        results = await web_search.search_async(req.query, max_results=req.max_results)
+    else:
+        results = await run_in_threadpool(web_search.search, req.query, max_results=req.max_results)
     return {"query": req.query, "results": results, "count": len(results)}
 
 
@@ -321,23 +492,30 @@ def post_web_search(req: WebSearchRequest):
 
 @router.post("/quiz/submit")
 @router.post("/quiz/submit/")
-def post_quiz_submit(sub: QuizSubmission, current_user: User = Depends(get_current_user)):
+def post_quiz_submit(
+    sub: QuizSubmission,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
     """Submit quiz option + reasoning, trigger LangGraph evaluation, return next adaptive action."""
-    if sub.user_id == "default" and current_user and current_user.user_id != "default":
-        sub.user_id = current_user.user_id
+    uid = _resolve_tenant_user_id(current_user, request, sub.user_id)
+    _require_owned_question(sub.question_id, uid, request)
+    sub.user_id = uid
     return loop.submit_quiz_answer(sub)
 
 
-class LegacyQuizReq(BaseModel):
-    conceptId: str | None = None
-    concept_id: str | None = None
-    user_id: str | None = None
-
 @router.post("/quiz/next")
 @router.post("/quiz/next/")
-def legacy_quiz_next(body: LegacyQuizReq = LegacyQuizReq(), current_user: User = Depends(get_current_user)):
+def legacy_quiz_next(
+    request: Request,
+    body: LegacyQuizReq = LegacyQuizReq(),
+    current_user: User = Depends(get_current_user),
+):
     """Generate fresh non-duplicate question variants for Concept Check."""
-    uid = current_user.user_id if current_user and current_user.user_id != "default" else (body.user_id if body and body.user_id else "default")
+    uid = _resolve_tenant_user_id(current_user, request, body.user_id if body else None)
+    kb = _get_tenant_kb(uid, request)
+    if not kb.get("ready") or not kb.get("concepts"):
+        raise HTTPException(status_code=400, detail="No study materials indexed yet.")
     cid = body.conceptId or body.concept_id
     try:
         return quiz.next_question(cid, user_id=uid)
@@ -345,16 +523,18 @@ def legacy_quiz_next(body: LegacyQuizReq = LegacyQuizReq(), current_user: User =
         raise HTTPException(status_code=400, detail=str(ue))
 
 
-class RemedialQuizReq(BaseModel):
-    conceptId: str | None = None
-    concept_id: str | None = None
-    user_id: str | None = "default"
-
 @router.post("/quiz/remedial")
 @router.post("/quiz/remedial/", include_in_schema=False)
-def post_quiz_remedial(body: RemedialQuizReq = RemedialQuizReq(), current_user: User = Depends(get_current_user)):
+def post_quiz_remedial(
+    request: Request,
+    body: RemedialQuizReq = RemedialQuizReq(),
+    current_user: User = Depends(get_current_user),
+):
     """Generate a targeted remedial quiz for the student's top WEAK prerequisite root cause."""
-    uid = current_user.user_id if current_user and current_user.user_id != "default" else (body.user_id if body and body.user_id else "default")
+    uid = _resolve_tenant_user_id(current_user, request, body.user_id if body else None)
+    kb = _get_tenant_kb(uid, request)
+    if not kb.get("ready") or not kb.get("concepts"):
+        raise HTTPException(status_code=400, detail="No study materials indexed yet.")
     cid = body.conceptId or body.concept_id
     try:
         res = loop.generate_remedial_quiz(user_id=uid, target_concept_id=cid)
@@ -366,21 +546,17 @@ def post_quiz_remedial(body: RemedialQuizReq = RemedialQuizReq(), current_user: 
         raise HTTPException(status_code=400, detail=str(ue))
 
 
-class LegacyAnswer(BaseModel):
-    questionId: str | None = None
-    conceptId: str
-    correct: bool | None = None
-    selectedIndex: int | None = None
-    studentReasoning: str | None = None
-    typedAnswer: str | None = None
-    numericAnswer: float | None = None
-    numeric_answer: float | None = None
-
 @router.post("/quiz/answer")
-def legacy_quiz_answer(body: LegacyAnswer):
+def legacy_quiz_answer(
+    body: LegacyAnswer,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    uid = _resolve_tenant_user_id(current_user, request)
+    _require_owned_question(body.questionId, uid, request)
     num_val = body.numericAnswer if body.numericAnswer is not None else body.numeric_answer
     sub = QuizSubmission(
-        user_id="default",
+        user_id=uid,
         question_id=body.questionId or "legacy_q",
         concept_id=body.conceptId,
         selected_option_idx=body.selectedIndex,
@@ -391,7 +567,7 @@ def legacy_quiz_answer(body: LegacyAnswer):
     res = loop.submit_quiz_answer(sub)
     q_data = quiz.REGISTRY.get(sub.question_id, quiz.RECENT_QUESTIONS.get(sub.question_id, {}))
     return {
-        "mastery": mastery.snapshot(),
+        "mastery": mastery.snapshot(uid),
         "next": res.get("next_concept_id", body.conceptId),
         "correct": res["is_correct"],
         "correctIndex": res["correct_option_idx"],
@@ -406,19 +582,19 @@ def legacy_quiz_answer(body: LegacyAnswer):
     }
 
 
-class LegacyEvaluateReq(BaseModel):
-    conceptId: str
-    questionText: str = ""
-    studentAnswer: str
-    groundTruth: str = ""
-
 @router.post("/quiz/evaluate")
-def legacy_quiz_evaluate(body: LegacyEvaluateReq):
+def legacy_quiz_evaluate(
+    body: LegacyEvaluateReq,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    uid = _resolve_tenant_user_id(current_user, request)
     return quiz.evaluate_answer(
         student_answer=body.studentAnswer,
         concept_id=body.conceptId,
         question_text=body.questionText,
-        ground_truth=body.groundTruth
+        ground_truth=body.groundTruth,
+        user_id=uid,
     )
 
 
@@ -426,9 +602,13 @@ def legacy_quiz_evaluate(body: LegacyEvaluateReq):
 
 @router.post("/active-recall/start", response_model=ActiveRecallStudyCard)
 @router.post("/active-recall/start/", response_model=ActiveRecallStudyCard)
-def post_active_recall_start(req: ActiveRecallStartRequest, current_user: User = Depends(get_current_user)):
+def post_active_recall_start(
+    req: ActiveRecallStartRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
     """Initialize an Active Recall study session with grounded Study Card & verification question."""
-    uid = current_user.user_id if current_user and current_user.user_id != "default" and req.user_id == "default" else req.user_id
+    uid = _resolve_tenant_user_id(current_user, request, req.user_id)
     try:
         return active_recall.start_session(
             user_id=uid,
@@ -444,9 +624,14 @@ def post_active_recall_start(req: ActiveRecallStartRequest, current_user: User =
 
 @router.post("/active-recall/evaluate", response_model=ActiveRecallResult)
 @router.post("/active-recall/evaluate/", response_model=ActiveRecallResult)
-def post_active_recall_evaluate(req: ActiveRecallEvaluateRequest, current_user: User = Depends(get_current_user)):
+def post_active_recall_evaluate(
+    req: ActiveRecallEvaluateRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
     """Evaluate student active recall retrieval text & verification answer using AI Mastery Judge."""
-    uid = current_user.user_id if current_user and current_user.user_id != "default" and req.user_id == "default" else req.user_id
+    uid = _resolve_tenant_user_id(current_user, request, req.user_id)
+    _require_owned_active_recall_session(req.session_id, uid)
     try:
         return active_recall.evaluate_session(
             user_id=uid,
@@ -455,6 +640,10 @@ def post_active_recall_evaluate(req: ActiveRecallEvaluateRequest, current_user: 
             recall_text=req.recall_text,
             verification_answer=req.verification_answer,
         )
+    except PermissionError as pe:
+        raise HTTPException(status_code=403, detail=str(pe))
+    except HTTPException:
+        raise
     except store.UserError as ue:
         raise HTTPException(status_code=400, detail=str(ue))
     except Exception as e:
@@ -464,9 +653,13 @@ def post_active_recall_evaluate(req: ActiveRecallEvaluateRequest, current_user: 
 
 @router.get("/active-recall/history", response_model=list[ActiveRecallHistoryItem])
 @router.get("/active-recall/history/", response_model=list[ActiveRecallHistoryItem])
-def get_active_recall_history(user_id: str = "default", current_user: User = Depends(get_current_user)):
+def get_active_recall_history(
+    request: Request,
+    user_id: str = "default",
+    current_user: User = Depends(get_current_user),
+):
     """Retrieve active recall session history for active learner."""
-    uid = current_user.user_id if current_user and current_user.user_id != "default" and user_id == "default" else user_id
+    uid = _resolve_tenant_user_id(current_user, request, user_id)
     return active_recall.get_history(user_id=uid)
 
 
@@ -474,10 +667,14 @@ def get_active_recall_history(user_id: str = "default", current_user: User = Dep
 
 @router.get("/dashboard/{user_id}", response_model=LearnerDashboard)
 @router.get("/dashboard/{user_id}/", response_model=LearnerDashboard)
-def get_user_dashboard(user_id: str, current_user: User = Depends(get_current_user)):
+def get_user_dashboard(
+    user_id: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
     """Return explainable learner dashboard with UNKNOWN, WEAK, and STRONG concept buckets."""
-    uid = user_id if user_id != "default" else (current_user.user_id if current_user else "default")
-    kb = store.get_kb(uid)
+    uid = _resolve_tenant_user_id(current_user, request, user_id)
+    kb = _get_tenant_kb(uid, request)
     if not kb.get("ready") or not kb.get("concepts"):
         return LearnerDashboard(
             user_id=uid,
@@ -493,11 +690,17 @@ def get_user_dashboard(user_id: str, current_user: User = Depends(get_current_us
 
 @router.get("/mastery")
 @router.get("/mastery/")
-def get_mastery(user_id: str = "default", current_user: User = Depends(get_current_user)):
+def get_mastery(
+    request: Request,
+    user_id: str = "default",
+    current_user: User = Depends(get_current_user),
+):
     """Return concepts mastery snapshot scoped to the authenticated student."""
-    uid = current_user.user_id if current_user and current_user.user_id != "default" and user_id == "default" else (current_user.user_id if current_user else user_id)
+    uid = _resolve_tenant_user_id(current_user, request, user_id)
     mats = store.list_study_materials(uid)
-    kb = store.get_kb(uid)
+    if uid != "default" and uid not in store.USER_KBS and not mats:
+        return {"concepts": []}
+    kb = _get_tenant_kb(uid, request)
     if not mats and not (kb and kb.get("concepts")):
         return {"concepts": []}
     return {"concepts": mastery.snapshot(uid)}
@@ -505,11 +708,15 @@ def get_mastery(user_id: str = "default", current_user: User = Depends(get_curre
 
 @router.get("/mastery/dashboard")
 @router.get("/mastery/dashboard/")
-def get_mastery_dashboard(user_id: str = "default", current_user: User = Depends(get_current_user)):
+def get_mastery_dashboard(
+    request: Request,
+    user_id: str = "default",
+    current_user: User = Depends(get_current_user),
+):
     """Return dashboard scoped to authenticated student with status_counts and overall_mastery."""
-    uid = current_user.user_id if current_user and current_user.user_id != "default" and user_id == "default" else (current_user.user_id if current_user else user_id)
+    uid = _resolve_tenant_user_id(current_user, request, user_id)
     mats = store.list_study_materials(uid)
-    kb = store.get_kb(uid)
+    kb = _empty_kb(uid) if (uid != "default" and uid not in store.USER_KBS and not mats) else _get_tenant_kb(uid, request)
     if not mats and not (kb and kb.get("concepts")):
         return {
             "overall_mastery": 0,
@@ -539,14 +746,11 @@ def get_mastery_dashboard(user_id: str = "default", current_user: User = Depends
 @router.post("/mastery/evaluate-evidence/", response_model=EvaluateEvidenceResponse)
 def post_mastery_evaluate_evidence(
     req: EvaluateEvidenceRequest,
+    request: Request,
     current_user: User = Depends(get_current_user),
 ):
     """Evaluate student learning evidence via 4 specialist agents & Head Teacher Arbiter."""
-    uid = (
-        current_user.user_id
-        if current_user and current_user.user_id != "default" and req.user_id == "default"
-        else (req.user_id if req.user_id and req.user_id != "default" else (current_user.user_id if current_user else "default"))
-    )
+    uid = _resolve_tenant_user_id(current_user, request, req.user_id)
     req.user_id = uid
     if req.student_explanation and len(req.student_explanation) > 4000:
         req.student_explanation = req.student_explanation[:4000]
@@ -560,15 +764,12 @@ def post_mastery_evaluate_evidence(
 @router.get("/mastery/{concept_id}/deliberation/", response_model=ConceptDeliberationResponse)
 def get_concept_deliberation(
     concept_id: str,
+    request: Request,
     user_id: str = "default",
     current_user: User = Depends(get_current_user),
 ):
     """Return full explainable deliberation, 4 specialist findings, and evidence items for a concept."""
-    uid = (
-        current_user.user_id
-        if current_user and current_user.user_id != "default" and user_id == "default"
-        else (current_user.user_id if current_user else user_id)
-    )
+    uid = _resolve_tenant_user_id(current_user, request, user_id)
     decision = store.get_latest_mastery_decision(uid, concept_id)
     if not decision:
         return ConceptDeliberationResponse(
@@ -602,9 +803,16 @@ def get_concept_deliberation(
 @router.get("/diagnostic/baseline/")
 @router.post("/diagnostic/baseline")
 @router.post("/diagnostic/baseline/")
-def get_or_post_diagnostic_baseline(user_id: str = "default", current_user: User = Depends(get_current_user)):
+def get_or_post_diagnostic_baseline(
+    request: Request,
+    user_id: str = "default",
+    current_user: User = Depends(get_current_user),
+):
     """Generate calibrated 6-question baseline test sampling root and foundational nodes from DAG."""
-    uid = current_user.user_id if current_user and current_user.user_id != "default" and user_id == "default" else (current_user.user_id if current_user else user_id)
+    uid = _resolve_tenant_user_id(current_user, request, user_id)
+    kb = _get_tenant_kb(uid, request)
+    if not kb.get("ready") or not kb.get("concepts"):
+        raise HTTPException(status_code=400, detail="No study materials indexed yet.")
     try:
         return loop.generate_baseline_diagnostic(user_id=uid)
     except store.UserError as ue:
@@ -617,9 +825,13 @@ def get_or_post_diagnostic_baseline(user_id: str = "default", current_user: User
 @router.post("/diagnostic/baseline/evaluate/")
 @router.post("/diagnostic/baseline/submit")
 @router.post("/diagnostic/baseline/submit/")
-def post_diagnostic_baseline_evaluate(body: BaselineSubmissionRequest, current_user: User = Depends(get_current_user)):
+def post_diagnostic_baseline_evaluate(
+    body: BaselineSubmissionRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
     """Evaluate baseline diagnostic answers and transition learner lifecycle to ACTIVE_LEARNING."""
-    uid = current_user.user_id if current_user and current_user.user_id != "default" and body.user_id == "default" else (current_user.user_id if current_user else body.user_id)
+    uid = _resolve_tenant_user_id(current_user, request, body.user_id)
     try:
         return loop.evaluate_baseline_diagnostic(user_id=uid, submissions=body.submissions)
     except store.UserError as ue:
@@ -629,54 +841,86 @@ def post_diagnostic_baseline_evaluate(body: BaselineSubmissionRequest, current_u
 
 
 @router.post("/mastery/reset")
-def post_mastery_reset():
-    kb = store.KB
+def post_mastery_reset(
+    request: Request,
+    user_id: str = "default",
+    current_user: User = Depends(get_current_user),
+):
+    uid = _resolve_tenant_user_id(current_user, request, user_id)
+    kb = _get_tenant_kb(uid, request)
     if not kb.get("ready"):
         raise HTTPException(status_code=400, detail="No active study material loaded.")
-    mastery.reset(kb["concepts"])
-    return {"ok": True, "concepts": mastery.snapshot()}
+    mastery.reset(kb["concepts"], user_id=uid)
+    return {"ok": True, "concepts": mastery.snapshot(uid)}
 
 
 # ── 6. Closed-Loop LangGraph Orchestrator ──────────────────────────────────
 
-class StartSessionReq(BaseModel):
-    user_id: str = "default"
-
 @router.post("/loop/start")
 @router.post("/loop/start/")
-def post_loop_start(body: StartSessionReq | None = None, current_user: User = Depends(get_current_user)):
+def post_loop_start(
+    request: Request,
+    body: StartSessionReq | None = None,
+    current_user: User = Depends(get_current_user),
+):
     """Initialize or advance the closed-loop learning session for a student."""
-    uid = "default"
-    if body and body.user_id != "default":
-        uid = body.user_id
-    elif current_user and current_user.user_id != "default":
-        uid = current_user.user_id
+    uid = _resolve_tenant_user_id(current_user, request, body.user_id if body else None)
+    if _is_explicit_auth(request) and not _get_tenant_kb(uid, request).get("ready"):
+        return {
+            "user_id": uid,
+            "lifecycle": loop.get_lifecycle_state(uid),
+            "action": "upload",
+            "concept_id": None,
+            "concept_name": None,
+            "status": "UNKNOWN",
+            "quiz": None,
+            "quiz_count": 0,
+            "follow_up_question": None,
+            "remedial_lesson": None,
+            "artifacts": [],
+            "external_links": [],
+            "reason": "No study materials indexed yet for this account.",
+        }
     return loop.start_session(uid)
 
 
 @router.post("/loop/next-action")
-def post_loop_next_action():
-    return loop.start_session("default")
+def post_loop_next_action(
+    request: Request,
+    user_id: str = "default",
+    current_user: User = Depends(get_current_user),
+):
+    uid = _resolve_tenant_user_id(current_user, request, user_id)
+    if _is_explicit_auth(request) and not _get_tenant_kb(uid, request).get("ready"):
+        return {"user_id": uid, "action": "upload", "quiz": None, "quiz_count": 0}
+    return loop.start_session(uid)
 
 
 @router.post("/recommend")
-def post_recommend():
-    return recommend.recommend()
+def post_recommend(
+    request: Request,
+    user_id: str = "default",
+    current_user: User = Depends(get_current_user),
+):
+    uid = _resolve_tenant_user_id(current_user, request, user_id)
+    if not _get_tenant_kb(uid, request).get("ready"):
+        return {"actions": [], "ready": False}
+    return recommend.recommend(user_id=uid)
 
 
 # ── Closed-Loop Status, Diagnostic & Active Recall ─────────────────────────
 
-class DiagnosticSubmitReq(BaseModel):
-    user_id: str = "default"
-    answers: list[dict] = []
-
 
 @router.get("/loop/status")
 @router.get("/loop/status/", include_in_schema=False)
-def get_loop_status(user_id: str = "default", current_user: User = Depends(get_current_user)):
+def get_loop_status(
+    request: Request,
+    user_id: str = "default",
+    current_user: User = Depends(get_current_user),
+):
     """Return closed-loop learning state, baseline diagnostic status, and concept count."""
-    uid = user_id if user_id != "default" else (current_user.user_id if current_user and current_user.user_id != "default" else "default")
-    kb = store.get_kb(uid)
+    uid = _resolve_tenant_user_id(current_user, request, user_id)
+    kb = _get_tenant_kb(uid, request)
     concepts_list = kb.get("concepts", []) if (kb and kb.get("ready")) else []
     if not concepts_list:
         return {
@@ -711,15 +955,16 @@ def get_loop_status(user_id: str = "default", current_user: User = Depends(get_c
 
 @router.post("/diagnostic/start")
 @router.post("/diagnostic/start/", include_in_schema=False)
-def post_diagnostic_start(body: dict | None = None, current_user: User = Depends(get_current_user)):
+def post_diagnostic_start(
+    request: Request,
+    body: dict | None = None,
+    current_user: User = Depends(get_current_user),
+):
     """Generate 6-question baseline diagnostic quiz covering the curriculum to baseline knowledge."""
-    uid = "default"
-    if body and "user_id" in body and body["user_id"] != "default":
-        uid = body["user_id"]
-    elif current_user and current_user.user_id != "default":
-        uid = current_user.user_id
+    req_uid = body.get("user_id") if isinstance(body, dict) else None
+    uid = _resolve_tenant_user_id(current_user, request, req_uid)
 
-    kb = store.get_kb(uid)
+    kb = _get_tenant_kb(uid, request)
     concepts_list = kb.get("concepts", []) if (kb and kb.get("ready")) else []
     if not concepts_list:
         raise HTTPException(status_code=400, detail="No study materials indexed yet.")
@@ -787,16 +1032,22 @@ def post_diagnostic_start(body: dict | None = None, current_user: User = Depends
 
 @router.post("/diagnostic/submit")
 @router.post("/diagnostic/submit/", include_in_schema=False)
-def post_diagnostic_submit(body: DiagnosticSubmitReq, current_user: User = Depends(get_current_user)):
+def post_diagnostic_submit(
+    body: DiagnosticSubmitReq,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
     """Grade baseline diagnostic submissions, update epistemic beliefs, and unlock active loop."""
-    uid = body.user_id if body.user_id != "default" else (current_user.user_id if current_user and current_user.user_id != "default" else "default")
+    uid = _resolve_tenant_user_id(current_user, request, body.user_id)
     results = []
     correct_count = 0
 
     for a in body.answers:
+        qid = a.get("question_id", a.get("id", "diag_sub"))
+        _require_owned_question(qid, uid, request)
         sub = QuizSubmission(
             user_id=uid,
-            question_id=a.get("question_id", a.get("id", "diag_sub")),
+            question_id=qid,
             concept_id=a.get("concept_id", a.get("conceptId", "")),
             selected_option_idx=a.get("selected_option_idx", a.get("selectedIndex")),
             typed_answer=a.get("typed_answer", a.get("typedAnswer", "")),
@@ -828,6 +1079,7 @@ def post_diagnostic_submit(body: DiagnosticSubmitReq, current_user: User = Depen
 @router.post("/materials/ingest-file")
 @router.post("/materials/ingest-file/")
 async def post_materials_ingest_file(
+    request: Request,
     files: list[UploadFile] = File(default=[]),
     file: UploadFile | None = File(default=None),
     user_id: str = Form("default"),
@@ -835,7 +1087,7 @@ async def post_materials_ingest_file(
     current_user: User = Depends(get_current_user),
 ):
     """Ingest multi-format study material (.pdf, .pptx, .md, .txt, .docx, .mp3, .wav, .m4a, .webm)."""
-    uid = user_id if user_id != "default" else (current_user.user_id if current_user and current_user.user_id != "default" else "default")
+    uid = _resolve_tenant_user_id(current_user, request, user_id)
     all_uploads: list[UploadFile] = list(files or [])
     if file:
         all_uploads.append(file)
@@ -845,6 +1097,8 @@ async def post_materials_ingest_file(
 
     allowed_exts = {".pdf", ".pptx", ".ppt", ".md", ".txt", ".docx", ".mp3", ".wav", ".m4a", ".webm"}
     ingested_materials = []
+    safe_uid_dir = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in uid).strip("_") or "default"
+    tenant_upload_dir = config.UPLOAD_DIR / safe_uid_dir
 
     for f in all_uploads:
         if not f.filename:
@@ -855,15 +1109,16 @@ async def post_materials_ingest_file(
                 status_code=400,
                 detail=f"Unsupported format '{ext}'. Supported: PDF, PPTX, MD, TXT, DOCX, MP3, WAV, M4A, WEBM."
             )
-        dest = config.UPLOAD_DIR / Path(f.filename).name
+        dest = tenant_upload_dir / Path(f.filename).name
         content = await f.read()
-        dest.write_bytes(content)
+        await run_in_threadpool(_write_uploaded_bytes, dest, content)
 
         try:
-            mat_res = UniversalMaterialIngestor.ingest_file(
+            mat_res = await run_in_threadpool(
+                UniversalMaterialIngestor.ingest_file,
                 path=dest,
                 user_id=uid,
-                title=title or Path(f.filename).stem.replace("_", " ").title()
+                title=title or Path(f.filename).stem.replace("_", " ").title(),
             )
             ingested_materials.append(mat_res)
         except store.UserError as ue:
@@ -871,7 +1126,7 @@ async def post_materials_ingest_file(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to ingest file '{f.filename}': {e}")
 
-    active_kb = store.get_kb(uid)
+    active_kb = await run_in_threadpool(_get_tenant_kb, uid, request)
     return {
         "ok": True,
         "count": len(ingested_materials),
@@ -887,26 +1142,31 @@ async def post_materials_ingest_file(
 
 @router.post("/materials/ingest-url")
 @router.post("/materials/ingest-url/")
-async def post_materials_ingest_url(req: IngestUrlRequest, current_user: User = Depends(get_current_user)):
+async def post_materials_ingest_url(
+    req: IngestUrlRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
     """Ingest educational websites (GeeksforGeeks, docs) or YouTube video lectures with timestamped transcripts."""
+    uid = _resolve_tenant_user_id(current_user, request, req.user_id)
     url = req.url.strip()
     if not (url.startswith("http://") or url.startswith("https://")):
         raise HTTPException(status_code=400, detail="URL must begin with http:// or https://")
 
-    uid = req.user_id if req.user_id != "default" else (current_user.user_id if current_user and current_user.user_id != "default" else "default")
     try:
-        mat_res = UniversalMaterialIngestor.ingest_url(
+        mat_res = await run_in_threadpool(
+            UniversalMaterialIngestor.ingest_url,
             url=url,
             source_type=req.source_type,
             user_id=uid,
-            title=req.title
+            title=req.title,
         )
     except store.UserError as ue:
         raise HTTPException(status_code=400, detail=str(ue))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to ingest URL '{url}': {e}")
 
-    active_kb = store.get_kb(uid)
+    active_kb = await run_in_threadpool(_get_tenant_kb, uid, request)
     return {
         "ok": True,
         "material": mat_res,
@@ -921,9 +1181,13 @@ async def post_materials_ingest_url(req: IngestUrlRequest, current_user: User = 
 
 @router.get("/materials", response_model=MaterialsListResponse)
 @router.get("/materials/", response_model=MaterialsListResponse)
-def get_study_materials(user_id: str = "default", current_user: User = Depends(get_current_user)):
+def get_study_materials(
+    request: Request,
+    user_id: str = "default",
+    current_user: User = Depends(get_current_user),
+):
     """List all ingested study materials for the learner with metadata badges."""
-    uid = user_id if user_id != "default" else (current_user.user_id if current_user and current_user.user_id != "default" else "default")
+    uid = _resolve_tenant_user_id(current_user, request, user_id)
     materials = store.list_study_materials(user_id=uid)
     models = [StudyMaterialMetadata(**m) for m in materials]
     return MaterialsListResponse(
@@ -936,19 +1200,29 @@ def get_study_materials(user_id: str = "default", current_user: User = Depends(g
 
 @router.get("/materials/{material_id}/preview", response_model=StudyMaterialPreview)
 @router.get("/materials/{material_id}/preview/", response_model=StudyMaterialPreview)
-def get_study_material_preview(material_id: str, current_user: User = Depends(get_current_user)):
+def get_study_material_preview(
+    material_id: str,
+    request: Request,
+    user_id: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user),
+):
     """Return structured preview payload (pages, slides, timestamps, or reader view) for interactive inspection."""
-    mat = store.get_study_material(material_id)
-    if not mat:
-        raise HTTPException(status_code=404, detail=f"Study material '{material_id}' not found.")
+    uid = _resolve_tenant_user_id(current_user, request, user_id)
+    mat = _require_owned_material(material_id, uid, request)
     return StudyMaterialPreview(**mat)
 
 
 @router.delete("/materials/{material_id}")
 @router.delete("/materials/{material_id}/")
-def delete_study_material(material_id: str, user_id: str = "default", current_user: User = Depends(get_current_user)):
+def delete_study_material(
+    material_id: str,
+    request: Request,
+    user_id: str = "default",
+    current_user: User = Depends(get_current_user),
+):
     """Delete a study material and automatically rebuild the unified index and Prerequisite DAG."""
-    uid = user_id if user_id != "default" else (current_user.user_id if current_user and current_user.user_id != "default" else "default")
+    uid = _resolve_tenant_user_id(current_user, request, user_id)
+    _require_owned_material(material_id, uid, request)
     try:
         res = UniversalMaterialIngestor.delete_material(material_id=material_id, user_id=uid)
         return {
@@ -995,27 +1269,31 @@ def get_generated_artifact(filename: str, download: Optional[bool] = None):
 
 @router.post("/materials/{material_id}/deep-audio")
 @router.post("/materials/{material_id}/deep-audio/")
-def post_material_deep_audio(
+async def post_material_deep_audio(
     material_id: str,
+    request: Request,
     req: Optional[DeepAudioRequest] = None,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     """Generate professor-style deep spoken explanation for a PDF or PPTX slide."""
-    uid = (req.user_id if req and req.user_id and req.user_id != "default" else None) or (current_user.user_id if current_user and current_user.user_id != "default" else "default")
+    uid = _resolve_tenant_user_id(current_user, request, req.user_id if req else None)
     section_index = req.section_or_slide_index if req else 0
-
-    mat = store.get_material(material_id, user_id=uid)
-    if not mat and uid != "default":
-        mat = store.get_material(material_id)
-    if not mat:
-        raise HTTPException(status_code=404, detail=f"Material '{material_id}' not found.")
+    mat = await run_in_threadpool(_require_owned_material, material_id, uid, request)
 
     try:
-        res = tts.generate_deep_material_audio(
-            material=mat,
-            user_id=uid,
-            section_or_slide_index=section_index
-        )
+        if getattr(tts.generate_deep_material_audio, "_is_default_sync_deep_audio", False):
+            res = await tts.generate_deep_material_audio_async(
+                material=mat,
+                user_id=uid,
+                section_or_slide_index=section_index,
+            )
+        else:
+            res = await run_in_threadpool(
+                tts.generate_deep_material_audio,
+                material=mat,
+                user_id=uid,
+                section_or_slide_index=section_index,
+            )
         return res
     except store.UserError as ue:
         raise HTTPException(status_code=400, detail=str(ue))
@@ -1029,11 +1307,12 @@ def post_material_deep_audio(
 @router.post("/notes/generate/", response_model=SmartNoteResponse)
 def post_notes_generate(
     req: SmartNoteRequest,
-    current_user: User = Depends(get_current_user)
+    request: Request,
+    current_user: User = Depends(get_current_user),
 ):
     """Generate smart study notes adhering strictly to task-type specifications."""
-    if (not req.user_id or req.user_id == "default") and (current_user and current_user.user_id and current_user.user_id != "default"):
-        req.user_id = current_user.user_id
+    uid = _resolve_tenant_user_id(current_user, request, req.user_id)
+    req.user_id = uid
 
     try:
         res = notes.generate_smart_note(req)
@@ -1049,15 +1328,17 @@ def post_notes_generate(
 
 @router.post("/notes/{note_id}/audio")
 @router.post("/notes/{note_id}/audio/")
-def post_note_audio(
+async def post_note_audio(
     note_id: str,
+    request: Request,
     user_id: Optional[str] = Query(None),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     """Synthesize high-yield spoken audio executive summary using ElevenLabs Flash."""
-    uid = user_id or (current_user.user_id if current_user and current_user.user_id != "default" else "default")
+    uid = _resolve_tenant_user_id(current_user, request, user_id)
+    await run_in_threadpool(_require_owned_note, note_id, uid)
     try:
-        res = notes.generate_note_audio(note_id=note_id, user_id=uid)
+        res = await run_in_threadpool(notes.generate_note_audio, note_id=note_id, user_id=uid)
         return res
     except store.UserError as ue:
         err_msg = str(ue)
@@ -1073,14 +1354,17 @@ def post_note_audio(
 @router.post("/notes/{note_id}/export/")
 def post_note_export(
     note_id: str,
+    request: Request,
     export_format: Optional[str] = Query(None),
     payload: Optional[dict] = Body(None),
     user_id: Optional[str] = Query(None),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     """Export a smart note as a PDF study handout or PPTX slide deck."""
     fmt = (export_format or (payload.get("export_format") if isinstance(payload, dict) else None) or "pdf").lower().strip()
-    uid = (payload.get("user_id") if isinstance(payload, dict) else None) or user_id or (current_user.user_id if current_user and current_user.user_id != "default" else "default")
+    body_uid = payload.get("user_id") if isinstance(payload, dict) else None
+    uid = _resolve_tenant_user_id(current_user, request, body_uid, user_id)
+    _require_owned_note(note_id, uid)
     try:
         res = notes.export_note_artifact(note_id=note_id, user_id=uid, export_format=fmt)
         return res
@@ -1097,12 +1381,13 @@ def post_note_export(
 @router.get("/notes")
 @router.get("/notes/")
 def get_notes(
+    request: Request,
     concept_id: Optional[str] = Query(None),
     user_id: Optional[str] = Query(None),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     """Retrieve saved smart study notes for the active learner."""
-    uid = user_id or (current_user.user_id if current_user and current_user.user_id != "default" else "default")
+    uid = _resolve_tenant_user_id(current_user, request, user_id)
     return store.list_smart_notes(user_id=uid, concept_id=concept_id)
 
 
@@ -1110,11 +1395,13 @@ def get_notes(
 @router.delete("/notes/{note_id}/")
 def delete_smart_note(
     note_id: str,
+    request: Request,
     user_id: Optional[str] = Query(None),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     """Delete a saved smart note from the archive."""
-    uid = user_id or (current_user.user_id if current_user and current_user.user_id != "default" else "default")
+    uid = _resolve_tenant_user_id(current_user, request, user_id)
+    _require_owned_note(note_id, uid)
     deleted = store.delete_smart_note(note_id=note_id, user_id=uid)
     return {"ok": True, "deleted": deleted, "note_id": note_id}
 
@@ -1123,10 +1410,11 @@ def delete_smart_note(
 @router.post("/tools/generate/")
 def post_tools_generate(
     req: ToolGenerateRequest,
-    current_user: User = Depends(get_current_user)
+    request: Request,
+    current_user: User = Depends(get_current_user),
 ):
     """Invoke generative study tools (visual SVG diagram, PPTX deck, PDF handout, curated resources)."""
-    uid = (req.user_id if req.user_id and req.user_id != "default" else None) or (current_user.user_id if current_user and current_user.user_id != "default" else "default")
+    uid = _resolve_tenant_user_id(current_user, request, req.user_id)
     tool_type = req.tool_type.lower().strip()
     try:
         if tool_type == "visual":

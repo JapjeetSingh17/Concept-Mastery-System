@@ -12,14 +12,17 @@ import re
 from collections import Counter
 from functools import lru_cache
 from pathlib import Path
-from typing import List, Tuple
-from pydantic import BaseModel, Field
-
 import networkx as nx
 
 from ..core import store, llm
 from ..core.text import normalize, STOP, GENERIC_NON_CONCEPTS, SYN, NORMALIZER, is_generic_term
-from ..models.schemas import ConceptNode, ConceptEdge, GraphExport
+from ..models.schemas import (
+    ConceptNode,
+    ConceptEdge,
+    GraphExport,
+    ExtractedConceptItem,
+    ExtractedConceptsResponse,
+)
 
 MAX_CONCEPTS = 24
 
@@ -38,13 +41,6 @@ ACADEMIC_CS_NOUNS = {
     "throughput", "serializability", "concurrency", "deadlock", "algorithm", "algorithms"
 }
 
-class ExtractedConceptItem(BaseModel):
-    concept: str
-    definition: str = ""
-    prerequisites: List[str] = Field(default_factory=list)
-
-class ExtractedConceptsResponse(BaseModel):
-    concepts: List[ExtractedConceptItem] = Field(default_factory=list)
 
 GENERIC_SECTION_PATTERNS = [
     re.compile(r"^(?:lecture\s+)?segment\b", re.I),

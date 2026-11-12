@@ -1,3 +1,5 @@
-# Optional: runs the answer -> estimate -> detect -> next-step loop as a LangGraph graph.
-# Without it the same steps run as plain functions (same result).
-langgraph
+# Optional dependencies extending workflow orchestration, audio transcription,
+# and LLM evaluation harnesses beyond deterministic offline fallbacks.
+langgraph>=1.0.0,<2.0.0
+groq>=1.0.0,<2.0.0
+deepeval>=4.0.0,<5.0.0

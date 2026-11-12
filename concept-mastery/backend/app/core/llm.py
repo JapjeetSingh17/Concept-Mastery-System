@@ -12,6 +12,7 @@ Execution Order:
 
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -170,6 +171,283 @@ def enabled() -> bool:
     )
 
 
+_NONFINITE_JSON_STRINGS = frozenset({"nan", "+nan", "-nan", "inf", "+inf", "-inf", "infinity", "+infinity", "-infinity"})
+
+# Schema-defined numeric bounds: (min_val, max_val, non_finite_default)
+_SCHEMA_FLOAT_BOUNDS: dict[str, tuple[Optional[float], Optional[float], float]] = {
+    "score": (0.0, 1.0, 0.0),
+    "retrieval_score": (0.0, 1.0, 0.0),
+    "semantic_comprehension_score": (0.0, 1.0, 0.0),
+    "quiz_accuracy": (0.0, 1.0, 0.0),
+    "dialogue_score": (0.0, 1.0, 0.0),
+    "prereq_health": (0.0, 1.0, 0.0),
+    "overall_score": (0.0, 1.0, 0.0),
+    "reasoning_clarity": (0.0, 1.0, 0.0),
+    "mastery_score": (0.0, 1.0, 0.0),
+    "confidence_score": (0.0, 1.0, 0.0),
+    "confidence": (0.0, 1.0, 0.0),
+    "tolerance": (0.0, None, 0.0),
+    "correct_numeric_answer": (None, None, 0.0),
+    "numeric_answer": (None, None, 0.0),
+    "numericAnswer": (None, None, 0.0),
+    "x": (None, None, 0.0),
+    "y": (None, None, 0.0),
+}
+
+_UNQUOTED_LITERAL_RE = re.compile(
+    r"(?:None|True|False|null|[+-]?(?:infinity|inf|nan))(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
+
+
+def clamp_float(
+    value: Any,
+    min_val: Optional[float] = 0.0,
+    max_val: Optional[float] = 1.0,
+    default: float = 0.0,
+) -> float:
+    """Convert ``value`` to a finite float clamped within ``[min_val, max_val]``.
+
+    Non-finite values (``NaN``, ``+inf``, ``-inf``) are mapped into ``[0.0, 1.0]``
+    (or the supplied bounds when tighter) so downstream Pydantic models and
+    FastAPI JSON encoders never reject out-of-range floats.
+    """
+    fallback = default
+    if min_val is not None:
+        fallback = max(min_val, fallback)
+    if max_val is not None:
+        fallback = min(max_val, fallback)
+
+    if isinstance(value, bool) or value is None:
+        return fallback
+
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+    if math.isnan(num):
+        return fallback
+    if math.isinf(num):
+        if num > 0:
+            upper = max_val if max_val is not None else 1.0
+            return max(min_val, upper) if min_val is not None else upper
+        lower = min_val if min_val is not None else 0.0
+        return min(max_val, lower) if max_val is not None else lower
+
+    if min_val is not None and num < min_val:
+        return min_val
+    if max_val is not None and num > max_val:
+        return max_val
+    return num
+
+
+def _parse_nonfinite_json_constant(const: str) -> float:
+    """Intercept non-standard JSON NaN/Infinity/-Infinity tokens at parse time."""
+    lower = const.strip().lower()
+    if "nan" in lower or lower.startswith("-"):
+        return 0.0
+    return 1.0
+
+
+def _try_sanitize_schema_value(
+    value: Any,
+    bounds: tuple[Optional[float], Optional[float], float],
+) -> Any:
+    """Sanitize numeric or stringified-float values for schema-bounded fields."""
+    lo, hi, default = bounds
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, float):
+        return clamp_float(value, lo, hi, default)
+    if isinstance(value, int):
+        if lo is not None and value < lo:
+            return lo
+        if hi is not None and value > hi:
+            return hi
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.lower() in _NONFINITE_JSON_STRINGS:
+            return clamp_float(stripped, lo, hi, default)
+        try:
+            parsed_num = float(stripped)
+            return clamp_float(parsed_num, lo, hi, default)
+        except ValueError:
+            return value
+    return value
+
+
+def sanitize_json_floats(
+    data: Any,
+    *,
+    field_bounds: Optional[dict[str, tuple[Optional[float], Optional[float], float]]] = None,
+    default_bounds: tuple[float, float] = (0.0, 1.0),
+    clamp_all_floats: bool = False,
+) -> Any:
+    """Recursively sanitize floats in parsed JSON structures.
+
+    - Converts any ``NaN``, ``inf``, or ``-inf`` float anywhere in dicts/lists to
+      finite values within ``default_bounds`` (``[0.0, 1.0]`` by default).
+    - Clamps known schema-bounded fields (e.g. ``retrieval_score``, ``score``,
+      ``tolerance``) using ``field_bounds`` or ``_SCHEMA_FLOAT_BOUNDS``.
+    """
+    bounds_map = field_bounds if field_bounds is not None else _SCHEMA_FLOAT_BOUNDS
+    lo_def, hi_def = default_bounds
+
+    if isinstance(data, bool) or data is None:
+        return data
+    if isinstance(data, float):
+        if math.isnan(data) or math.isinf(data) or clamp_all_floats:
+            return clamp_float(data, lo_def, hi_def, lo_def)
+        return data
+    if isinstance(data, dict):
+        sanitized: dict[Any, Any] = {}
+        for k, v in data.items():
+            if isinstance(k, str) and k in bounds_map and not isinstance(v, (dict, list, tuple)):
+                sanitized[k] = _try_sanitize_schema_value(v, bounds_map[k])
+            else:
+                sanitized[k] = sanitize_json_floats(
+                    v,
+                    field_bounds=bounds_map,
+                    default_bounds=default_bounds,
+                    clamp_all_floats=clamp_all_floats,
+                )
+        return sanitized
+    if isinstance(data, (list, tuple)):
+        return [
+            sanitize_json_floats(
+                item,
+                field_bounds=bounds_map,
+                default_bounds=default_bounds,
+                clamp_all_floats=clamp_all_floats,
+            )
+            for item in data
+        ]
+    return data
+
+
+def _strip_markdown_fences(text: str) -> str:
+    """Remove surrounding ```json / ``` markdown code fences if present."""
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
+    if fence:
+        return fence.group(1).strip()
+    stripped = re.sub(r"^\s*```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    return re.sub(r"\s*```\s*$", "", stripped).strip()
+
+
+def _replace_unquoted_json_literals(text: str, *, python_literals: bool = False) -> str:
+    """Replace Python/non-standard literals (None/True/False/NaN/Infinity) outside quotes."""
+    out: list[str] = []
+    quote_char: Optional[str] = None
+    escape = False
+    last_non_ws = ""
+    i = 0
+    n = len(text)
+
+    while i < n:
+        ch = text[i]
+        if quote_char is not None:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == quote_char:
+                quote_char = None
+                last_non_ws = ch
+            i += 1
+            continue
+
+        if ch in ('"', "'"):
+            quote_char = ch
+            out.append(ch)
+            last_non_ws = ch
+            i += 1
+            continue
+
+        if last_non_ws in ("", ":", ",", "["):
+            m = _UNQUOTED_LITERAL_RE.match(text, i)
+            if m:
+                tok = m.group(0)
+                lower = tok.lower()
+                if python_literals:
+                    if lower in ("none", "null"):
+                        repl = "None"
+                    elif lower == "true":
+                        repl = "True"
+                    elif lower == "false":
+                        repl = "False"
+                    elif lower in _NONFINITE_JSON_STRINGS:
+                        repl = "0.0" if ("nan" in lower or lower.startswith("-")) else "1.0"
+                    else:
+                        repl = None
+                else:
+                    if tok == "None" or lower == "null":
+                        repl = "null"
+                    elif tok == "True" or lower == "true":
+                        repl = "true"
+                    elif tok == "False" or lower == "false":
+                        repl = "false"
+                    elif lower in _NONFINITE_JSON_STRINGS:
+                        repl = "0.0" if ("nan" in lower or lower.startswith("-")) else "1.0"
+                    else:
+                        repl = None
+                if repl is not None:
+                    out.append(repl)
+                    last_non_ws = repl[-1]
+                    i += len(tok)
+                    continue
+
+        out.append(ch)
+        if not ch.isspace():
+            last_non_ws = ch
+        i += 1
+
+    return "".join(out)
+
+
+def _strip_trailing_commas(text: str) -> str:
+    """Remove trailing commas before '}' or ']' outside string literals."""
+    out: list[str] = []
+    quote_char: Optional[str] = None
+    escape = False
+    i = 0
+    n = len(text)
+
+    while i < n:
+        ch = text[i]
+        if quote_char is not None:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == quote_char:
+                quote_char = None
+            i += 1
+            continue
+
+        if ch in ('"', "'"):
+            quote_char = ch
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == ",":
+            j = i + 1
+            while j < n and text[j].isspace():
+                j += 1
+            if j >= n or text[j] in ("}", "]", ","):
+                i += 1
+                continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
 def sanitize_llm_response(text: str) -> str:
     """Sanitize LLM output by removing reasoning/thinking tags and extra whitespace."""
     if not text:
@@ -187,21 +465,21 @@ def repair_json_string(s: str) -> str:
     Fixes:
       1. Strips markdown fences (```json ... ```) and reasoning tags (<think>...</think>).
       2. Locates opening object '{' or array '['.
-      3. Normalizes Python literals (None -> null, True -> true, False -> false).
+      3. Normalizes Python literals (None -> null, True -> true, False -> false)
+         and non-finite float tokens (NaN/nan/-Infinity/-inf -> 0.0, Infinity/inf -> 1.0)
+         strictly outside string literals.
       4. Fixes escaped quotes immediately preceding delimiters or closures (e.g. \\"} -> "}).
       5. Fixes unescaped internal double quotes inside string values.
       6. Converts literal newlines and control characters inside strings into valid escape sequences.
       7. Balances unclosed quotes and unclosed curly/square brackets caused by token truncation.
-      8. Strips invalid trailing commas before '}' and ']'.
+      8. Strips invalid trailing commas before '}' and ']' outside strings.
     """
     if not s or not s.strip():
         return ""
     cleaned = sanitize_llm_response(s)
 
     # 1. Strip markdown fences if present
-    fence = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, re.IGNORECASE)
-    if fence:
-        cleaned = fence.group(1).strip()
+    cleaned = _strip_markdown_fences(cleaned)
 
     # 2. Slice from first opening { or [
     first_obj = cleaned.find("{")
@@ -211,15 +489,12 @@ def repair_json_string(s: str) -> str:
     elif first_arr != -1:
         cleaned = cleaned[first_arr:]
 
-    # 3. Replace common Python constants if present outside quotes
-    cleaned = re.sub(r':\s*None\b', ': null', cleaned)
-    cleaned = re.sub(r':\s*True\b', ': true', cleaned)
-    cleaned = re.sub(r':\s*False\b', ': false', cleaned)
+    # 3. Replace Python constants and non-finite float tokens outside quoted strings
+    cleaned = _replace_unquoted_json_literals(cleaned)
 
-    # 4. Pre-pass: replace \" before delimiters or closures
+    # 4. Pre-pass: replace \" before delimiters or closures and strip trailing commas
     cleaned = re.sub(r'\\\"(\s*[,\}\]])', r'"\1', cleaned)
-    # Strip trailing commas before closures
-    cleaned = re.sub(r",\s*([\]}])", r"\1", cleaned)
+    cleaned = _strip_trailing_commas(cleaned)
 
     # 5. Token scanner to balance quotes, escape inner quotes, and close brackets
     in_string = False
@@ -292,8 +567,7 @@ def repair_json_string(s: str) -> str:
         elif b == "[":
             result += "]"
 
-    result = re.sub(r",\s*([\]}])", r"\1", result)
-    return result
+    return _strip_trailing_commas(result)
 
 
 def _regex_extract_json_dict(text: str) -> Optional[dict]:
@@ -309,35 +583,55 @@ def _regex_extract_json_dict(text: str) -> Optional[dict]:
     return res if res else None
 
 
-def safe_json_loads(text: str) -> Any:
-    """Safely parse JSON from LLM output, applying tiered repair passes if standard parsing fails."""
+def parse_and_sanitize_json(
+    text: str,
+    *,
+    field_bounds: Optional[dict[str, tuple[Optional[float], Optional[float], float]]] = None,
+    default_bounds: tuple[float, float] = (0.0, 1.0),
+    clamp_all_floats: bool = False,
+) -> Any:
+    """Parse LLM JSON safely with fence stripping, syntax repair, and float sanitization."""
     if not text or not text.strip():
         return None
 
     cleaned = sanitize_llm_response(text)
-    fence = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, re.IGNORECASE)
-    candidate = fence.group(1).strip() if fence else cleaned.strip()
+    candidate = _strip_markdown_fences(cleaned)
 
-    # Pass 1: Direct strict=False json.loads (fast path for well-formed JSON)
+    def _finish(parsed_obj: Any) -> Any:
+        return sanitize_json_floats(
+            parsed_obj,
+            field_bounds=field_bounds,
+            default_bounds=default_bounds,
+            clamp_all_floats=clamp_all_floats,
+        )
+
+    # Pass 1: Direct strict=False json.loads with non-finite constant clamping
     try:
-        return json.loads(candidate, strict=False)
+        return _finish(
+            json.loads(candidate, strict=False, parse_constant=_parse_nonfinite_json_constant)
+        )
     except Exception:
         pass
 
-    # Pass 2: Syntactic repair (escaped quotes, unclosed strings, truncated braces, trailing commas)
+    # Pass 2: Syntactic repair (escaped quotes, unclosed strings, truncated braces, trailing commas, non-finite tokens)
     try:
         repaired = repair_json_string(cleaned)
         if repaired:
-            return json.loads(repaired, strict=False)
+            return _finish(
+                json.loads(repaired, strict=False, parse_constant=_parse_nonfinite_json_constant)
+            )
     except Exception:
         pass
 
     # Pass 3: Python AST literal evaluation (if LLM returned Python-formatted dict or list)
     try:
         import ast
-        data = ast.literal_eval(candidate)
+        literal_candidate = _strip_trailing_commas(
+            _replace_unquoted_json_literals(candidate, python_literals=True)
+        )
+        data = ast.literal_eval(literal_candidate)
         if isinstance(data, (dict, list)):
-            return data
+            return _finish(data)
     except Exception:
         pass
 
@@ -345,11 +639,16 @@ def safe_json_loads(text: str) -> Any:
     try:
         extracted = _regex_extract_json_dict(cleaned)
         if extracted:
-            return extracted
+            return _finish(extracted)
     except Exception:
         pass
 
     return None
+
+
+def safe_json_loads(text: str) -> Any:
+    """Safely parse JSON from LLM output, applying tiered repair passes and float sanitization."""
+    return parse_and_sanitize_json(text)
 
 
 def extract_json_payload(text: str) -> str:

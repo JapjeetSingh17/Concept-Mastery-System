@@ -457,3 +457,247 @@ def test_api_active_recall_endpoints(setup_test_kb):
     hist_data = resp_hist.json()
     assert len(hist_data) >= 1
     assert any(h["session_id"] == session_id for h in hist_data)
+
+
+def test_llm_parse_and_sanitize_json_nan_inf_fences_and_trailing_commas():
+    """Centralized JSON parser strips markdown fences, repairs trailing commas, and clamps NaN/Infinity."""
+    import json
+    import math
+    from app.core import llm
+
+    raw_payload = """Here is the evaluation payload:
+```json
+{
+  "retrieval_score": NaN,
+  "score": 1.85,
+  "semantic_comprehension_score": -0.4,
+  "quiz_accuracy": Infinity,
+  "dialogue_score": -Infinity,
+  "prereq_health": inf,
+  "overall_score": -inf,
+  "unknown_nan_metric": nan,
+  "correct_numeric_answer": 42.5,
+  "given_parameters": {
+    "alpha": 0.001,
+    "unstable_val": NaN,
+    "upper_bound": Infinity,
+  },
+  "note": "Handle NaN or Infinity cleanly",
+  "keywords": ["gradient", "descent", ],
+}
+```
+"""
+    parsed = llm.parse_and_sanitize_json(raw_payload)
+    assert isinstance(parsed, dict)
+    assert llm.safe_json_loads(raw_payload) == parsed
+
+    # Bounded mastery/recall scores are finite and clamped into [0.0, 1.0]
+    for bounded_key in (
+        "retrieval_score",
+        "score",
+        "semantic_comprehension_score",
+        "quiz_accuracy",
+        "dialogue_score",
+        "prereq_health",
+        "overall_score",
+        "unknown_nan_metric",
+    ):
+        val = parsed[bounded_key]
+        assert isinstance(val, float)
+        assert math.isfinite(val)
+        assert 0.0 <= val <= 1.0
+
+    assert parsed["score"] == 1.0
+    assert parsed["semantic_comprehension_score"] == 0.0
+
+    # Arbitrary finite numerical problem answers are preserved without [0, 1] clamping
+    assert parsed["correct_numeric_answer"] == 42.5
+    assert parsed["given_parameters"]["alpha"] == 0.001
+    assert math.isfinite(parsed["given_parameters"]["unstable_val"])
+    assert math.isfinite(parsed["given_parameters"]["upper_bound"])
+
+    # Quoted strings mentioning NaN/Infinity remain intact
+    assert parsed["note"] == "Handle NaN or Infinity cleanly"
+    assert parsed["keywords"] == ["gradient", "descent"]
+
+    # Must be strictly JSON-compliant (no NaN/Infinity emitted)
+    dumped = json.dumps(parsed, allow_nan=False)
+    assert "NaN" not in dumped or "Handle NaN or Infinity cleanly" in dumped
+
+
+def test_active_recall_evaluate_session_sanitizes_nan_inf_payload(setup_test_kb):
+    """active_recall.evaluate_session clamps NaN/Infinity retrieval scores before response serialization."""
+    import json
+    import math
+    from unittest.mock import patch
+    from fastapi.encoders import jsonable_encoder
+    from app.core import llm
+    from app.pipelines import active_recall
+
+    uid = setup_test_kb
+    card = active_recall.start_session(user_id=uid, concept_id="gradient_descent")
+
+    for bad_score_literal in ("NaN", "Infinity", "-Infinity", "1.42", "-0.25"):
+        llm_response = f"""```json
+{{
+  "retrieval_score": {bad_score_literal},
+  "reasoning_depth_level": "DEVELOPING",
+  "retained_concepts": ["learning rate", ],
+  "missed_gaps": ["Hessian", ],
+  "feedback": "Evaluated with NaN safe handling.",
+}}
+```"""
+        with (
+            patch.object(llm, "enabled", return_value=True),
+            patch.object(llm, "is_offline", return_value=False),
+            patch.object(llm, "complete", return_value=llm_response),
+        ):
+            res = active_recall.evaluate_session(
+                user_id=uid,
+                session_id=card.session_id,
+                concept_id="gradient_descent",
+                recall_text="Gradient descent steps opposite the gradient using a learning rate alpha.",
+                verification_answer="42",
+            )
+            assert math.isfinite(res.retrieval_score)
+            assert 0.0 <= res.retrieval_score <= 1.0
+            encoded = jsonable_encoder(res)
+            serialized = json.dumps(encoded, allow_nan=False)
+            assert serialized
+
+
+def test_quiz_diagnostic_numerical_sanitizes_nan_inf_payload(setup_test_kb):
+    """quiz.generate_diagnostic_quiz safely handles markdown-fenced JSON with NaN/Infinity floats."""
+    import json
+    import math
+    from unittest.mock import patch
+    from fastapi.encoders import jsonable_encoder
+    from app.core import llm
+    from app.pipelines import quiz
+
+    uid = setup_test_kb
+    fenced_quiz_json = """```json
+[
+  {
+    "question_type": "numerical",
+    "question_text": "Compute the next weight after one gradient descent update for w0=10, lr=0.1, grad=NaN.",
+    "given_parameters": {"w0": 10.0, "lr": 0.1, "grad": NaN, "cap": Infinity,},
+    "formula_hint": "w_next = w0 - lr * grad",
+    "correct_numeric_answer": 42.5,
+    "tolerance": -Infinity,
+    "unit_or_format": "2 decimal places",
+    "explanation": "Substitute values carefully.",
+    "source_page": 1,
+  },
+  {
+    "question_type": "numerical",
+    "question_text": "Fallback when answer itself came back as NaN.",
+    "given_parameters": {"theta": -Infinity,},
+    "correct_numeric_answer": NaN,
+    "tolerance": Infinity,
+    "source_page": 1,
+  },
+]
+```"""
+    with (
+        patch.object(llm, "enabled", return_value=True),
+        patch.object(llm, "is_offline", return_value=False),
+        patch.object(llm, "complete", return_value=fenced_quiz_json),
+    ):
+        questions = quiz.generate_diagnostic_quiz(
+            concept_id="gradient_descent",
+            count=2,
+            question_types=["numerical"],
+            user_id=uid,
+        )
+
+    assert len(questions) == 2
+    assert questions[0].correct_numeric_answer == 42.5
+    assert math.isfinite(questions[0].tolerance)
+    assert all(
+        math.isfinite(v)
+        for v in (questions[0].given_parameters or {}).values()
+        if isinstance(v, (int, float))
+    )
+    assert math.isfinite(questions[1].correct_numeric_answer)
+    assert math.isfinite(questions[1].tolerance)
+    encoded = jsonable_encoder(questions)
+    assert json.dumps(encoded, allow_nan=False)
+
+
+def test_pedagogical_agents_sanitize_nan_inf_and_trailing_commas(setup_test_kb):
+    """Specialist agents sanitize fenced JSON, trailing commas, NaN/Inf confidences, and non-finite hints."""
+    import json
+    from unittest.mock import patch
+    from fastapi.encoders import jsonable_encoder
+    from app.core import llm
+    from app.pipelines import pedagogical_agents
+
+    direct_parsed = pedagogical_agents.parse_agent_json_response(
+        """```json
+        {
+          "evidence_refs": ["ev_1", ],
+          "findings": "Partial mastery with edge NaN confidence.",
+          "identified_gaps": ["Stopping criterion", ],
+          "recommended_action": "Practice unassisted convergence proof.",
+          "assessment_confidence": NaN,
+          "limitations": "Single probe.",
+          "extra_score": Infinity,
+        }
+        ```"""
+    )
+    assert isinstance(direct_parsed, dict)
+    assert direct_parsed["assessment_confidence"] in {"low", "moderate", "high"}
+    assert direct_parsed["assessment_confidence"] == "low"
+    assert json.dumps(direct_parsed, allow_nan=False)
+
+    fenced_inf_response = """```json
+    {
+      "evidence_refs": ["ev_1", "ev_fake", ],
+      "findings": "Shows grasp of iterative optimization.",
+      "identified_gaps": ["Step size tuning", ],
+      "recommended_action": "Test with novel objective.",
+      "assessment_confidence": Infinity,
+      "limitations": "",
+      "confidence": -Infinity,
+      "score": NaN,
+    }
+    ```"""
+    evidence_pkg = {
+        "concept_id": "gradient_descent",
+        "concept_name": "Gradient Descent",
+        "learning_objectives": ["Understand step size"],
+        "evidence_records": [
+            {
+                "evidence_id": "ev_1",
+                "question_id": "q_1",
+                "question_text": "Explain gradient descent updates.",
+                "question_form": "typed_qa",
+                "student_answer": "Moves opposite to the gradient.",
+                "student_explanation": "Reduces loss iteratively.",
+                "problem_solving_approach": "Compute derivative and scale by alpha.",
+                "hints_used": float("nan"),
+                "solution_revealed_first": False,
+                "corrected_after_feedback": False,
+                "is_unfamiliar_example": False,
+            }
+        ],
+    }
+
+    with (
+        patch.object(llm, "enabled", return_value=True),
+        patch.object(llm, "is_offline", return_value=False),
+        patch.object(llm, "complete", return_value=fenced_inf_response),
+    ):
+        for runner in (
+            pedagogical_agents.run_teaching_agent,
+            pedagogical_agents.run_assessment_agent,
+            pedagogical_agents.run_misconception_detective,
+            pedagogical_agents.run_learning_observer,
+        ):
+            assessment = runner(evidence_pkg)
+            assert assessment.assessment_confidence in {"low", "moderate", "high"}
+            assert "ev_fake" not in assessment.evidence_refs
+            encoded = jsonable_encoder(assessment)
+            assert json.dumps(encoded, allow_nan=False)
+

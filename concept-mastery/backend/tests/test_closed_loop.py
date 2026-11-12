@@ -17,8 +17,52 @@ from app.pipelines import ingest, concepts, mastery, tutor, quiz, loop
 from app.models.schemas import MasteryStatus, QuizSubmission
 
 
+def _build_minimal_ml_basics_pdf() -> bytes:
+    """Build a tiny self-contained 1-page ML Basics PDF when no sample PDF is present on disk."""
+    lines = [
+        "Machine Learning Basics",
+        "1. Loss Functions",
+        "A loss function measures the gap between predictions and true targets. Mean squared error and cross-entropy loss are standard.",
+        "2. Gradient Descent",
+        "Gradient descent updates weights by moving against the gradient of the loss function toward a minimum.",
+        "3. Learning Rate",
+        "The learning rate controls step size. A high learning rate causes overshoot while a low learning rate slows training.",
+        "4. Backpropagation",
+        "Backpropagation computes loss gradients layer by layer using the chain rule for gradient descent.",
+        "5. Overfitting",
+        "Overfitting occurs when a model memorizes training data and fails to generalize on validation data.",
+        "6. Regularization",
+        "Regularization discourages overfitting by adding a weight penalty such as L2 regularization or dropout.",
+    ]
+    ops = ["BT /F1 10 Tf"]
+    y = 760
+    for line in lines:
+        safe = line.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        ops.append(f"1 0 0 1 36 {y} Tm ({safe}) Tj")
+        y -= 18
+    ops.append("ET")
+    stream = "\n".join(ops).encode("ascii")
+    objs = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+        b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    out, offs = bytearray(b"%PDF-1.4\n"), []
+    for idx, obj in enumerate(objs, 1):
+        offs.append(len(out))
+        out += f"{idx} 0 obj\n".encode("ascii") + obj + b"\nendobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode("ascii")
+    for off in offs:
+        out += f"{off:010d} 00000 n \n".encode("ascii")
+    out += f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode("ascii")
+    return bytes(out)
+
+
 @pytest.fixture(scope="session")
-def sample_pdf():
+def sample_pdf(tmp_path_factory):
     candidates = [
         config.UPLOAD_DIR / "ml-basics.pdf",
         config.BASE.parent / "sample" / "ml-basics.pdf",
@@ -27,7 +71,9 @@ def sample_pdf():
         Path.cwd() / "concept-mastery" / "sample" / "ml-basics.pdf",
     ]
     pdf = next((p for p in candidates if p.exists()), None)
-    assert pdf is not None, "Sample PDF ml-basics.pdf must exist for tests."
+    if pdf is None:
+        pdf = tmp_path_factory.mktemp("sample") / "ml-basics.pdf"
+        pdf.write_bytes(_build_minimal_ml_basics_pdf())
     return pdf
 
 

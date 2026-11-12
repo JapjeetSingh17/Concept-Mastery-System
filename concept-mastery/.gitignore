@@ -24,6 +24,14 @@ concept-mastery/backend/generated_artifacts/
 .deepeval/
 .DS_Store
 
-# Runtime Databases
-data/vectorstore/*.db
-data/vectorstore/*.db-journal
+# Runtime Databases & Vectorstore
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+data/vectorstore/*
+!data/vectorstore/.gitkeep
+
+# Uploaded files
+data/uploads/*
+!data/uploads/.gitkeep

@@ -27,7 +27,7 @@ from . import mastery_orchestrator
 
 logger = logging.getLogger("concept_mastery.mastery")
 
-DB_PATH = config.VECTOR_STORE_PATH / "mastery.db"
+DB_PATH = config.SQLITE_MASTERY_DB_PATH
 
 _CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS user_concept_mastery (

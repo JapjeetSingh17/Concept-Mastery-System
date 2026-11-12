@@ -208,6 +208,9 @@
       </div>
     </header>
 
+    <!-- Backend API Error Banner -->
+    <div id="api-error-banner" class="api-error-banner" role="alert" hidden></div>
+
     <!-- Main View Dynamic Container -->
     <main id="view" role="main"></main>
   </div>
@@ -364,7 +367,28 @@
 
   <!-- Application Logic Scripts -->
   <script src="js/api.js"></script>
-  <script src="js/mock.js"></script>
+  <script>
+    (function() {
+      var mockEnabled = false;
+      try {
+        var params = new URLSearchParams(window.location.search);
+        if (params.get("mock") === "true") mockEnabled = true;
+      } catch (e) {}
+      try {
+        if (!mockEnabled && localStorage.getItem("USE_MOCK") === "true") mockEnabled = true;
+      } catch (e) {}
+      if (mockEnabled) {
+        window.__MOCK_READY__ = new Promise(function(resolve) {
+          var s = document.createElement("script");
+          s.src = "js/mock.js";
+          s.async = false;
+          s.onload = resolve;
+          s.onerror = resolve;
+          document.body.appendChild(s);
+        });
+      }
+    })();
+  </script>
   <script src="js/app.js"></script>
 </body>
 </html>

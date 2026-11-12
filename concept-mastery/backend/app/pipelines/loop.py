@@ -15,15 +15,10 @@ from typing import Dict, Any, Literal
 from langgraph.graph import StateGraph, END
 
 from ..core import store
-from ..models.schemas import LoopState, MasteryStatus, QuizSubmission, TutorChatResponse
+from ..models.schemas import LoopState, MasteryStatus, QuizSubmission, TutorChatResponse, TutorResponse
 from . import concepts, mastery, quiz, tutor, tools
 
 logger = logging.getLogger("concept_mastery.loop")
-
-
-class TutorResponse(TutorChatResponse):
-    """Container for tutor responses within the closed loop, containing artifacts and external_links."""
-    pass
 
 MAX_REMEDIAL_ITERATIONS = 3
 

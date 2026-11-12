@@ -28,7 +28,9 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, TypedDict
+from typing import Any, Dict, List, Optional, Tuple
+
+from fastapi.concurrency import run_in_threadpool
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +40,7 @@ from .. import config
 from ..core import store
 from ..core.concept_index import GLOBAL_INDEX
 from ..core.text import sentences, NORMALIZER
-from ..models.schemas import ChunkMetadata
+from ..models.schemas import ChunkMetadata, IngestionState
 from . import concepts, mastery
 
 CHUNK_WORDS = 110
@@ -1132,21 +1134,6 @@ def chunk_extracted_items(
 
 # ── LangGraph Ingestion Pipeline ─────────────────────────────────────────────
 
-class IngestionState(TypedDict):
-    input_target: str               # file path string or URL
-    source_type: str                # pdf, pptx, markdown, docx, youtube, web, audio, auto
-    user_id: str
-    custom_title: Optional[str]
-    material_id: str
-    title: str
-    origin_name: str
-    raw_text: str
-    structured_preview: List[Dict[str, Any]]
-    raw_items: List[Dict[str, Any]]
-    chunks: List[Dict[str, Any]]
-    concepts: List[Dict[str, Any]]
-    edges: List[List[str]]
-    error: Optional[str]
 
 
 def detect_source_type_node(state: IngestionState) -> Dict[str, Any]:
@@ -1368,6 +1355,38 @@ class UniversalMaterialIngestor:
         }
 
     @classmethod
+    async def ingest_file_async(
+        cls,
+        path: Path,
+        user_id: str = "default",
+        title: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Run synchronous file parsing, extraction, and indexing off the async event loop."""
+        return await run_in_threadpool(
+            cls.ingest_file,
+            path=path,
+            user_id=user_id,
+            title=title,
+        )
+
+    @classmethod
+    async def ingest_url_async(
+        cls,
+        url: str,
+        source_type: str = "auto",
+        user_id: str = "default",
+        title: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Run synchronous URL fetching, parsing, extraction, and indexing off the async event loop."""
+        return await run_in_threadpool(
+            cls.ingest_url,
+            url=url,
+            source_type=source_type,
+            user_id=user_id,
+            title=title,
+        )
+
+    @classmethod
     def ingest_content(cls, content: str, source_type: str = "markdown", user_id: str = "default", title: Optional[str] = None, origin: str = "notes.md") -> Dict[str, Any]:
         """Ingest raw text or markdown content directly."""
         import tempfile
@@ -1498,12 +1517,12 @@ class UniversalMaterialIngestor:
 
 # ── Legacy Synchronous & Asynchronous Runners ───────────────────────────────
 
-def run_ingest(path: Path) -> dict:
+def run_ingest(path: Path, user_id: str = "default") -> dict:
     """Run full vectorless ingestion pipeline for a single PDF synchronously."""
-    return run_ingest_multiple([path])
+    return run_ingest_multiple([path], user_id=user_id)
 
 
-def run_ingest_multiple(paths: list[Path]) -> dict:
+def run_ingest_multiple(paths: list[Path], user_id: str = "default") -> dict:
     """Run vectorless ingestion pipeline across one or more study PDFs."""
     if not paths:
         raise store.UserError("No PDF files provided for ingestion.")
@@ -1529,12 +1548,13 @@ def run_ingest_multiple(paths: list[Path]) -> dict:
 
         all_raw_chunks.extend(raw_chunks)
 
-        # Also persist into study_materials table
+        # Also persist into study_materials table scoped to tenant
         structured_preview = [{"index": p, "label": f"Page {p}", "text": text} for p, text in pages]
         full_text = "\n\n".join(t for _, t in pages)
+        mat_id = f"mat_{path.stem}" if user_id == "default" else f"mat_{user_id}_{path.stem}"
         store.save_study_material({
-            "material_id": f"mat_{path.stem}",
-            "user_id": "default",
+            "material_id": mat_id,
+            "user_id": user_id,
             "title": path.stem.replace("_", " ").title(),
             "source_type": "pdf",
             "original_filename_or_url": path.name,
@@ -1560,8 +1580,8 @@ def run_ingest_multiple(paths: list[Path]) -> dict:
             detected.append(section_norm)
         chunk["canonical_concepts"] = detected
 
-    # 3. Populate Vectorless SQLite Inverted Index
-    GLOBAL_INDEX.clear()
+    # 3. Populate Vectorless SQLite Inverted Index scoped to tenant
+    GLOBAL_INDEX.clear(user_id=user_id)
     chunk_models = [
         ChunkMetadata(
             chunk_id=c["chunk_id"],
@@ -1578,14 +1598,14 @@ def run_ingest_multiple(paths: list[Path]) -> dict:
         )
         for c in all_raw_chunks
     ]
-    GLOBAL_INDEX.index_chunks(chunk_models)
+    GLOBAL_INDEX.index_chunks(chunk_models, user_id=user_id)
 
-    # 4. Save to KB for frontend and API compatibility
+    # 4. Save to KB for frontend and API compatibility scoped to tenant
     combined_name = ", ".join(valid_filenames)
     from ..core.vector_index import VectorIndex
     index = VectorIndex.build(all_raw_chunks)
-    store.save_kb(combined_name, total_pages, index, cs, edges)
-    mastery.reset(cs)
+    store.save_kb(combined_name, total_pages, index, cs, edges, user_id=user_id)
+    mastery.reset(cs, user_id=user_id)
 
     return {
         "job_id": combined_name,
@@ -1604,8 +1624,7 @@ def run_ingest_multiple(paths: list[Path]) -> dict:
     }
 
 
-async def run_ingest_async(path_or_paths: Path | list[Path]) -> dict:
-    """Run ingest in an executor so it never blocks the async event loop."""
+async def run_ingest_async(path_or_paths: Path | list[Path], user_id: str = "default") -> dict:
+    """Run ingest in FastAPI's threadpool so it never blocks the async event loop."""
     paths = [path_or_paths] if isinstance(path_or_paths, Path) else path_or_paths
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, run_ingest_multiple, paths)
+    return await run_in_threadpool(run_ingest_multiple, paths, user_id)

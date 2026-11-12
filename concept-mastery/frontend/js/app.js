@@ -50,36 +50,149 @@
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
 
+  function isAbortError(err) {
+    return Boolean(err && (err.name === "AbortError" || err.code === "ABORT_ERR"));
+  }
+
+  function rethrowIfAbort(err) {
+    if (isAbortError(err)) throw err;
+  }
+
+  /**
+   * Immediately disable one or more action buttons/controls while an async task runs,
+   * guaranteeing cleanup in a try/finally block to prevent double-submits.
+   */
+  async function withButtonLock(controls, taskFn, opts = {}) {
+    const list = (Array.isArray(controls) ? controls : [controls]).filter(Boolean);
+    const primary = opts.primary || list[0] || null;
+    if (primary && (primary.dataset.inFlight === "1" || (!opts.allowInitiallyDisabled && primary.disabled))) {
+      return { skipped: true, result: undefined };
+    }
+
+    const snapshots = list.map(el => ({
+      el,
+      disabled: el.disabled,
+      inFlight: el.dataset.inFlight,
+      ariaBusy: el.getAttribute("aria-busy")
+    }));
+    const origHtml = primary ? primary.innerHTML : null;
+    const origText = primary ? primary.textContent : null;
+    let succeeded = false;
+
+    try {
+      for (const { el } of snapshots) {
+        el.disabled = true;
+        el.dataset.inFlight = "1";
+        el.setAttribute("aria-busy", "true");
+      }
+      if (primary) {
+        if (opts.loadingHtml !== undefined) primary.innerHTML = opts.loadingHtml;
+        else if (opts.loadingText !== undefined) primary.textContent = opts.loadingText;
+      }
+
+      const result = await taskFn();
+      succeeded = result !== false;
+      return { skipped: false, result };
+    } finally {
+      const keepLocked = Boolean(succeeded && opts.keepLockedOnSuccess);
+      for (const snap of snapshots) {
+        const { el } = snap;
+        delete el.dataset.inFlight;
+        if (snap.ariaBusy === null) el.removeAttribute("aria-busy");
+        else el.setAttribute("aria-busy", snap.ariaBusy);
+        if (!keepLocked) {
+          el.disabled = opts.restoreOriginalDisabled ? snap.disabled : false;
+        }
+      }
+      if (primary && !(succeeded && opts.preserveLabelOnSuccess)) {
+        if (opts.loadingHtml !== undefined && origHtml !== null) {
+          primary.innerHTML = origHtml;
+        } else if (opts.loadingText !== undefined && origText !== null) {
+          primary.textContent = origText;
+        }
+      }
+    }
+  }
+
+  function detachQuizKeyNav() {
+    if (AppState._quizKeyNavHandler) {
+      window.removeEventListener("keydown", AppState._quizKeyNavHandler);
+      AppState._quizKeyNavHandler = null;
+    }
+  }
+
   // ── Multi-Agent Pedagogical Assessment ApiService Methods ──────────────────
   if (typeof ApiService !== "undefined") {
-    ApiService.evaluateEvidence = async function(evidenceData) {
+    ApiService.evaluateEvidence = async function(evidenceData, options = {}) {
       const base = typeof getEffectiveBase === "function" ? getEffectiveBase() : "";
       const authToken = typeof ApiService.getToken === "function" ? ApiService.getToken() : null;
       const headers = { "Content-Type": "application/json" };
       if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
-      const res = await fetch(`${base}/api/mastery/evaluate-evidence`, {
+      const fetchOpts = {
         method: "POST",
         headers,
         body: JSON.stringify(evidenceData)
-      });
+      };
+      if (options && options.signal) fetchOpts.signal = options.signal;
+      let res;
+      try {
+        res = await fetch(`${base}/api/mastery/evaluate-evidence`, fetchOpts);
+      } catch (netErr) {
+        if (isAbortError(netErr)) throw netErr;
+        const err = new Error(`Network error evaluating evidence: ${netErr.message}`);
+        err.status = 0;
+        err.endpoint = "evaluateEvidence";
+        if (typeof window !== "undefined" && typeof CustomEvent !== "undefined") {
+          window.dispatchEvent(new CustomEvent("cm:api-error", { detail: { endpointKey: "evaluateEvidence", status: 0, message: err.message, error: err } }));
+        }
+        throw err;
+      }
       if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.detail || `evaluateEvidence failed with status ${res.status}`);
+        const errBody = await res.json().catch(() => ({}));
+        const msg = errBody.detail || `evaluateEvidence failed with status ${res.status}`;
+        const err = new Error(msg);
+        err.status = res.status;
+        err.endpoint = "evaluateEvidence";
+        if (typeof window !== "undefined" && typeof CustomEvent !== "undefined") {
+          window.dispatchEvent(new CustomEvent("cm:api-error", { detail: { endpointKey: "evaluateEvidence", status: res.status, message: msg, error: err } }));
+        }
+        throw err;
       }
       return await res.json();
     };
 
-    ApiService.getConceptDeliberation = async function(conceptId, userId) {
+    ApiService.getConceptDeliberation = async function(conceptId, userId, options = {}) {
       const base = typeof getEffectiveBase === "function" ? getEffectiveBase() : "";
       const authToken = typeof ApiService.getToken === "function" ? ApiService.getToken() : null;
       const headers = {};
       if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
       const uid = userId || getCurrentUserId();
       const url = `${base}/api/mastery/${encodeURIComponent(conceptId)}/deliberation?user_id=${encodeURIComponent(uid)}`;
-      const res = await fetch(url, { headers });
+      const fetchOpts = { headers };
+      if (options && options.signal) fetchOpts.signal = options.signal;
+      let res;
+      try {
+        res = await fetch(url, fetchOpts);
+      } catch (netErr) {
+        if (isAbortError(netErr)) throw netErr;
+        const err = new Error(`Network error fetching deliberation: ${netErr.message}`);
+        err.status = 0;
+        err.endpoint = "getConceptDeliberation";
+        if (typeof window !== "undefined" && typeof CustomEvent !== "undefined") {
+          window.dispatchEvent(new CustomEvent("cm:api-error", { detail: { endpointKey: "getConceptDeliberation", status: 0, message: err.message, error: err } }));
+        }
+        throw err;
+      }
       if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.detail || `getConceptDeliberation failed with status ${res.status}`);
+        const errBody = await res.json().catch(() => ({}));
+        const msg = errBody.detail || `getConceptDeliberation failed with status ${res.status}`;
+        const err = new Error(msg);
+        err.status = res.status;
+        err.endpoint = "getConceptDeliberation";
+        if (typeof window !== "undefined" && typeof CustomEvent !== "undefined") {
+          window.dispatchEvent(new CustomEvent("cm:api-error", { detail: { endpointKey: "getConceptDeliberation", status: res.status, message: msg, error: err } }));
+        }
+        throw err;
       }
       return await res.json();
     };
@@ -704,7 +817,7 @@
     return out;
   }
 
-  // Toast Notification
+  // Toast Notification & Persistent API Error Banner
   function showToast(message, type = "info") {
     const container = $("#toast-container");
     if (!container) return;
@@ -717,6 +830,50 @@
       toast.style.transform = "translateY(10px)";
       setTimeout(() => toast.remove(), 250);
     }, 3200);
+  }
+
+  function clearErrorBanner() {
+    const banner = $("#api-error-banner");
+    if (banner) {
+      banner.hidden = true;
+      banner.innerHTML = "";
+    }
+  }
+
+  function showErrorBanner(message, title = "Backend API Error") {
+    const banner = $("#api-error-banner");
+    if (!banner) return;
+    banner.hidden = false;
+    banner.innerHTML = `
+      <div class="api-error-banner-body">
+        <div class="api-error-banner-title">${esc(title)}</div>
+        <div class="api-error-banner-msg">${esc(message)}</div>
+      </div>
+      <button type="button" class="api-error-dismiss" id="btn-dismiss-api-error" aria-label="Dismiss error">Dismiss</button>
+    `;
+    const dismissBtn = $("#btn-dismiss-api-error", banner);
+    if (dismissBtn) {
+      dismissBtn.onclick = () => clearErrorBanner();
+    }
+  }
+
+  let _lastReportedErrorMsg = "";
+  let _lastReportedErrorAt = 0;
+
+  function reportBackendError(contextLabel, err) {
+    if (isAbortError(err)) return;
+    const detail = (err && err.message) ? err.message : String(err || "Unknown backend error");
+    const msg = contextLabel ? `${contextLabel}: ${detail}` : detail;
+    if (err && typeof err === "object") {
+      err._uiReported = true;
+    }
+    showErrorBanner(msg);
+    const now = Date.now();
+    if (msg !== _lastReportedErrorMsg || (now - _lastReportedErrorAt) > 1000) {
+      _lastReportedErrorMsg = msg;
+      _lastReportedErrorAt = now;
+      showToast(msg, "danger");
+    }
   }
 
   // KaTeX Math Rendering Utility
@@ -995,10 +1152,11 @@
   }
 
   // Global Document / Ingest Status Poller & Synchronizer
-  async function syncActiveDocument() {
+  async function syncActiveDocument(signal = null) {
     try {
       const uid = getCurrentUserId();
-      const matsData = await ApiService.listMaterials(uid).catch(() => ({ materials: [] }));
+      const reqOpts = signal ? { signal } : {};
+      const matsData = await ApiService.listMaterials(uid, reqOpts);
       const mats = matsData.materials || [];
       if (mats.length > 0) {
         const top = mats[0];
@@ -1016,7 +1174,9 @@
         updateSidebarWidget({ ready: false, file: null });
       }
     } catch (e) {
+      rethrowIfAbort(e);
       console.warn("Could not sync active document status:", e);
+      reportBackendError("Could not load active study materials", e);
       updateSidebarWidget({ ready: false, file: null });
     }
   }
@@ -1110,6 +1270,10 @@
     const body = $("#diagnostic-modal-body");
     if (!modal || !body) return;
 
+    const controller = typeof ApiService !== "undefined" && typeof ApiService.beginAbortScope === "function"
+      ? ApiService.beginAbortScope("diagnostic")
+      : new AbortController();
+
     if (typeof modal.showModal === "function") {
       modal.showModal();
     } else {
@@ -1127,7 +1291,7 @@
     `;
 
     try {
-      const res = await ApiService.startDiagnostic(getCurrentUserId());
+      const res = await ApiService.startDiagnostic(getCurrentUserId(), { signal: controller.signal });
       const questions = (res && res.questions && res.questions.length) ? res.questions : [];
       if (!questions.length) {
         throw new Error("No diagnostic questions could be generated. Ensure study materials are uploaded.");
@@ -1234,99 +1398,102 @@
         }
 
         nextBtn.onclick = async () => {
-          let typedVal = "";
-          let numVal = null;
-          if (qType === "mcq") {
-            typedVal = letters[selectedIdx] || "";
-          } else if (qType === "numerical") {
-            const el = $("#diag-user-input", body);
-            typedVal = el ? el.value.trim() : "";
-            numVal = parseFloat(typedVal);
-          } else {
-            const el = $("#diag-user-input", body);
-            typedVal = el ? el.value.trim() : "";
-          }
+          await withButtonLock(nextBtn, async () => {
+            let typedVal = "";
+            let numVal = null;
+            if (qType === "mcq") {
+              typedVal = letters[selectedIdx] || "";
+            } else if (qType === "numerical") {
+              const el = $("#diag-user-input", body);
+              typedVal = el ? el.value.trim() : "";
+              numVal = parseFloat(typedVal);
+            } else {
+              const el = $("#diag-user-input", body);
+              typedVal = el ? el.value.trim() : "";
+            }
 
-          userAnswers.push({
-            question_id: q.question_id || q.id,
-            concept_id: q.concept_id || q.conceptId,
-            selected_option_idx: selectedIdx,
-            typed_answer: typedVal,
-            student_reasoning: typedVal,
-            numeric_answer: numVal
-          });
+            userAnswers.push({
+              question_id: q.question_id || q.id,
+              concept_id: q.concept_id || q.conceptId,
+              selected_option_idx: selectedIdx,
+              typed_answer: typedVal,
+              student_reasoning: typedVal,
+              numeric_answer: numVal
+            });
 
-          currentIndex++;
-          if (currentIndex < questions.length) {
-            renderDiagQ();
-          } else {
-            // Submit entire diagnostic
-            body.innerHTML = `
-              <div style="padding: 2.5rem; text-align: center;">
-                <div class="upload-icon-pulse" style="width: 44px; height: 44px; margin: 0 auto 1rem auto;">
-                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-                </div>
-                <h4>Scoring Baseline Knowledge Profile...</h4>
-                <p style="color: var(--ink-secondary); font-size: 0.88rem;">Conducting Multi-Agent Pedagogical Deliberation and unlocking prerequisite DAG...</p>
-              </div>
-            `;
-            try {
-              const subRes = await ApiService.submitDiagnostic(userAnswers, getCurrentUserId());
-              const scorePct = subRes.score !== undefined ? subRes.score : 50;
-              const correctCnt = subRes.correct_count !== undefined ? subRes.correct_count : 0;
-              AppState.baselineCompleted = true;
-              localStorage.setItem(`cm_baseline_${getCurrentUserId()}`, "true");
-
+            currentIndex++;
+            if (currentIndex < questions.length) {
+              renderDiagQ();
+            } else {
+              // Submit entire diagnostic
               body.innerHTML = `
-                <div style="padding: 2rem; text-align: center;">
-                  <div class="donut-chart-container" style="margin: 0 auto 1.25rem auto;">
-                    ${createDonutSvg(scorePct, 120, 10, scorePct >= 65 ? "var(--color-strong)" : "var(--primary)")}
-                    <div class="donut-chart-value">
-                      <span class="val-number">${scorePct}%</span>
-                      <span class="val-label">Baseline</span>
+                <div style="padding: 2.5rem; text-align: center;">
+                  <div class="upload-icon-pulse" style="width: 44px; height: 44px; margin: 0 auto 1rem auto;">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                  </div>
+                  <h4>Scoring Baseline Knowledge Profile...</h4>
+                  <p style="color: var(--ink-secondary); font-size: 0.88rem;">Conducting Multi-Agent Pedagogical Deliberation and unlocking prerequisite DAG...</p>
+                </div>
+              `;
+              try {
+                const subRes = await ApiService.submitDiagnostic(userAnswers, getCurrentUserId());
+                const scorePct = subRes.score !== undefined ? subRes.score : 50;
+                const correctCnt = subRes.correct_count !== undefined ? subRes.correct_count : 0;
+                AppState.baselineCompleted = true;
+                localStorage.setItem(`cm_baseline_${getCurrentUserId()}`, "true");
+
+                body.innerHTML = `
+                  <div style="padding: 2rem; text-align: center;">
+                    <div class="donut-chart-container" style="margin: 0 auto 1.25rem auto;">
+                      ${createDonutSvg(scorePct, 120, 10, scorePct >= 65 ? "var(--color-strong)" : "var(--primary)")}
+                      <div class="donut-chart-value">
+                        <span class="val-number">${scorePct}%</span>
+                        <span class="val-label">Baseline</span>
+                      </div>
+                    </div>
+                    <h3 style="margin-bottom: 0.4rem;">Baseline Diagnostic Completed!</h3>
+                    <p style="color: var(--ink-secondary); margin-bottom: 1.5rem; font-size: 0.9rem;">
+                      You demonstrated familiarity with <strong>${correctCnt} of ${questions.length}</strong> core concepts. Your personalized prerequisite roadmap has been generated.
+                    </p>
+                    <div style="display:flex; justify-content:center; gap:0.75rem;">
+                      <button id="btn-diag-done" class="btn btn-primary">Start Active Learning &rarr;</button>
                     </div>
                   </div>
-                  <h3 style="margin-bottom: 0.4rem;">Baseline Diagnostic Completed!</h3>
-                  <p style="color: var(--ink-secondary); margin-bottom: 1.5rem; font-size: 0.9rem;">
-                    You demonstrated familiarity with <strong>${correctCnt} of ${questions.length}</strong> core concepts. Your personalized prerequisite roadmap has been generated.
-                  </p>
-                  <div style="display:flex; justify-content:center; gap:0.75rem;">
-                    <button id="btn-diag-done" class="btn btn-primary">Start Active Learning &rarr;</button>
+                `;
+                const doneBtn = $("#btn-diag-done", body);
+                if (doneBtn) {
+                  doneBtn.onclick = () => {
+                    modal.close();
+                    showToast("Baseline complete! Learning path unlocked.", "success");
+                    navigateTo("dashboard");
+                  };
+                }
+              } catch (submitErr) {
+                rethrowIfAbort(submitErr);
+                reportBackendError("Baseline diagnostic submission failed", submitErr);
+                body.innerHTML = `
+                  <div style="padding: 2rem; text-align: center;">
+                    <h3 style="color: var(--color-danger);">Diagnostic Submission Failed</h3>
+                    <p style="color: var(--ink-secondary); margin-bottom: 1rem;">${esc(submitErr.message || "Could not submit diagnostic answers to the backend.")}</p>
+                    <button id="btn-diag-done" class="btn btn-secondary">Close</button>
                   </div>
-                </div>
-              `;
-              const doneBtn = $("#btn-diag-done", body);
-              if (doneBtn) {
-                doneBtn.onclick = () => {
-                  modal.close();
-                  showToast("Baseline complete! Learning path unlocked.", "success");
-                  navigateTo("dashboard");
-                };
-              }
-            } catch (submitErr) {
-              AppState.baselineCompleted = true;
-              localStorage.setItem(`cm_baseline_${getCurrentUserId()}`, "true");
-              body.innerHTML = `
-                <div style="padding: 2rem; text-align: center;">
-                  <h3>Baseline Complete</h3>
-                  <p style="color: var(--ink-secondary); margin-bottom: 1rem;">${esc(submitErr.message || "Learning path unlocked.")}</p>
-                  <button id="btn-diag-done" class="btn btn-primary">Return to Dashboard</button>
-                </div>
-              `;
-              const doneBtn = $("#btn-diag-done", body);
-              if (doneBtn) {
-                doneBtn.onclick = () => {
-                  modal.close();
-                  navigateTo("dashboard");
-                };
+                `;
+                const doneBtn = $("#btn-diag-done", body);
+                if (doneBtn) {
+                  doneBtn.onclick = () => {
+                    modal.close();
+                  };
+                }
               }
             }
-          }
+          });
         };
       }
 
       renderDiagQ();
     } catch (err) {
+      rethrowIfAbort(err);
+      reportBackendError("Baseline diagnostic unavailable", err);
       body.innerHTML = `
         <div style="padding: 2rem; text-align: center;">
           <h4 style="color: var(--color-danger); margin-bottom: 0.5rem;">Diagnostic Error</h4>
@@ -1343,6 +1510,16 @@
   function renderRecallStageContent(session, statusPill) {
     let card = session.card;
     if (!card) {
+      const mockEnabled = typeof ApiService !== "undefined" && typeof ApiService.isMockMode === "function" && ApiService.isMockMode();
+      if (!mockEnabled) {
+        return `
+          <div class="empty-state-card">
+            <h3 class="empty-state-title" style="color:var(--color-danger);">Active Recall Card Unavailable</h3>
+            <p class="empty-state-desc">Could not load this concept's study card from the backend. Retry once the server is available.</p>
+            <button type="button" class="btn btn-primary" onclick="location.reload()">Retry</button>
+          </div>
+        `;
+      }
       const cObj = (AppState.masteryList || []).find(c => c.id === session.conceptId) || { name: session.conceptId, id: session.conceptId };
       const cName = (cObj && cObj.name) || session.conceptId || "Key Concept";
       card = {
@@ -1727,19 +1904,24 @@
     // -----------------------------------------------------------------------
     // A. DASHBOARD VIEW
     // -----------------------------------------------------------------------
-    async dashboard() {
-      await syncActiveDocument();
+    async dashboard(signal = null) {
+      await syncActiveDocument(signal);
       let masteryData = [];
       let recData = { actions: [] };
       let loopStatus = { loop_state: "UNINITIALIZED", material_ready: false, baseline_completed: false };
+      let dashboardError = null;
 
       try {
+        const reqOpts = signal ? { signal } : {};
         const [mRes, rRes, lRes] = await Promise.all([
-          ApiService.getMastery().catch(() => ({ concepts: [] })),
-          ApiService.getRecommendations().catch(() => ({ actions: [] })),
-          ApiService.getLoopStatus(getCurrentUserId()).catch(() => null)
+          ApiService.getMastery(reqOpts).catch(e => { rethrowIfAbort(e); dashboardError = dashboardError || e; return null; }),
+          ApiService.getRecommendations(reqOpts).catch(e => { rethrowIfAbort(e); dashboardError = dashboardError || e; return null; }),
+          ApiService.getLoopStatus(getCurrentUserId(), reqOpts).catch(e => { rethrowIfAbort(e); dashboardError = dashboardError || e; return null; })
         ]);
-        masteryData = mRes.concepts || [];
+        if (dashboardError) {
+          reportBackendError("Failed fetching dashboard data", dashboardError);
+        }
+        masteryData = (mRes && mRes.concepts) ? mRes.concepts : [];
         recData = rRes || { actions: [] };
         AppState.masteryList = masteryData;
         AppState.recommendations = recData.actions || [];
@@ -1747,7 +1929,7 @@
           loopStatus = lRes;
           AppState.loopStatus = lRes;
           AppState.baselineCompleted = Boolean(lRes.baseline_completed);
-        } else {
+        } else if (!dashboardError) {
           const totalAttempts = masteryData.reduce((acc, c) => acc + (c.attempts || 0), 0);
           const localDone = (localStorage.getItem(`cm_baseline_${getCurrentUserId()}`) === "true");
           const isDone = localDone || totalAttempts >= 3;
@@ -1759,7 +1941,25 @@
           };
         }
       } catch (err) {
-        console.warn("Failed fetching dashboard data", err);
+        rethrowIfAbort(err);
+        dashboardError = err;
+        reportBackendError("Failed fetching dashboard data", err);
+      }
+
+      if (dashboardError && masteryData.length === 0) {
+        return `
+          <div class="page-header">
+            <div class="page-header-text">
+              <h1>Welcome back, ${esc(AppState.studentName)}!</h1>
+              <p>Your closed-loop epistemic learning platform.</p>
+            </div>
+          </div>
+          <div class="empty-state-card">
+            <h3 class="empty-state-title" style="color:var(--color-danger);">Backend Unavailable</h3>
+            <p class="empty-state-desc">${esc(dashboardError.message || "Could not load dashboard metrics from the backend.")}</p>
+            <button type="button" class="btn btn-primary" onclick="location.reload()">Retry Connection</button>
+          </div>
+        `;
       }
 
       const totalConcepts = masteryData.length;
@@ -2014,10 +2214,17 @@
     // -----------------------------------------------------------------------
     // B. STUDY MATERIAL / UPLOAD VIEW
     // -----------------------------------------------------------------------
-    async upload() {
-      await syncActiveDocument();
+    async upload(signal = null) {
+      await syncActiveDocument(signal);
       const doc = AppState.activeDoc;
-      const matsData = await ApiService.listMaterials(getCurrentUserId()).catch(() => ({ materials: [] }));
+      const reqOpts = signal ? { signal } : {};
+      let matsData = { materials: [] };
+      try {
+        matsData = await ApiService.listMaterials(getCurrentUserId(), reqOpts);
+      } catch (e) {
+        rethrowIfAbort(e);
+        reportBackendError("Could not load uploaded materials", e);
+      }
       const materials = matsData.materials || [];
 
       return `
@@ -2272,8 +2479,8 @@
     // -----------------------------------------------------------------------
     // C. AI TUTOR VIEW
     // -----------------------------------------------------------------------
-    async tutor() {
-      await syncActiveDocument();
+    async tutor(signal = null) {
+      await syncActiveDocument(signal);
       const doc = AppState.activeDoc;
       const docTitle = doc && doc.ready ? doc.file : "Calculus / ML Notes";
 
@@ -2335,19 +2542,38 @@
     // -----------------------------------------------------------------------
     // ACTIVE RECALL INTERACTIVE ENGINE (4-STAGE EPISTEMIC CYCLE)
     // -----------------------------------------------------------------------
-    async activeRecall() {
-      await syncActiveDocument();
+    async activeRecall(signal = null) {
+      await syncActiveDocument(signal);
+      const reqOpts = signal ? { signal } : {};
+      let masteryError = null;
       if (!AppState.masteryList || !AppState.masteryList.length) {
         try {
-          const mRes = await ApiService.getMastery();
+          const mRes = await ApiService.getMastery(reqOpts);
           AppState.masteryList = mRes.concepts || [];
         } catch (e) {
-          console.warn("Could not load mastery list for active recall", e);
+          rethrowIfAbort(e);
+          masteryError = e;
+          reportBackendError("Could not load mastery list for Active Recall", e);
         }
       }
 
       const concepts = AppState.masteryList || [];
       if (concepts.length === 0) {
+        if (masteryError) {
+          return `
+            <div class="page-header">
+              <div class="page-header-text">
+                <h1>Active Recall</h1>
+                <p>Epistemic retrieval practice: Study &rarr; Focus Under Timer &rarr; Blind Retrieval &rarr; Gap Audit.</p>
+              </div>
+            </div>
+            <div class="empty-state-card">
+              <h3 class="empty-state-title" style="color:var(--color-danger);">Could Not Load Concepts</h3>
+              <p class="empty-state-desc">${esc(masteryError.message || "Backend request failed.")}</p>
+              <button type="button" class="btn btn-primary" onclick="location.reload()">Retry</button>
+            </div>
+          `;
+        }
         return `
           <div class="page-header">
             <div class="page-header-text">
@@ -2396,9 +2622,10 @@
       }
 
       // Load card if needed
+      let cardLoadError = null;
       if (!session.card || session.card.concept_id !== session.conceptId) {
         try {
-          const cardRes = await ApiService.startActiveRecall(session.conceptId, getCurrentUserId());
+          const cardRes = await ApiService.startActiveRecall(session.conceptId, getCurrentUserId(), reqOpts);
           if (cardRes) {
             const rawCard = cardRes.card || cardRes;
             session.card = {
@@ -2418,10 +2645,13 @@
             };
           }
         } catch (e) {
-          console.warn("Could not load active recall card from backend, generating local card", e);
+          rethrowIfAbort(e);
+          cardLoadError = e;
+          reportBackendError("Could not load Active Recall card", e);
         }
 
-        if (!session.card || session.card.concept_id !== session.conceptId) {
+        const mockEnabled = typeof ApiService !== "undefined" && typeof ApiService.isMockMode === "function" && ApiService.isMockMode();
+        if ((!session.card || session.card.concept_id !== session.conceptId) && mockEnabled) {
           const cObj = concepts.find(c => c.id === session.conceptId) || { name: session.conceptId, id: session.conceptId };
           const cName = cObj.name || session.conceptId;
           session.card = {
@@ -2438,6 +2668,24 @@
             exact_source_citation: "Verified Course Materials · Section / Page 1",
             verification_question: `In your own words, what is the core role and function of ${cName}?`
           };
+        } else if (!session.card || session.card.concept_id !== session.conceptId) {
+          const errMsg = (cardLoadError && cardLoadError.message) || "Backend returned no Active Recall study card.";
+          if (!cardLoadError) {
+            reportBackendError("Could not load Active Recall card", new Error(errMsg));
+          }
+          return `
+            <div class="page-header">
+              <div class="page-header-text">
+                <h1>Active Recall Interactive Engine</h1>
+                <p>4-Stage Epistemic Cycle: Study &rarr; Focus Under Timer &rarr; Blind Retrieval &rarr; Gap Audit.</p>
+              </div>
+            </div>
+            <div class="empty-state-card">
+              <h3 class="empty-state-title" style="color:var(--color-danger);">Failed to Load Study Card</h3>
+              <p class="empty-state-desc">${esc(errMsg)}</p>
+              <button type="button" class="btn btn-primary" onclick="location.reload()">Retry</button>
+            </div>
+          `;
         }
       }
 
@@ -2504,17 +2752,22 @@
     // -----------------------------------------------------------------------
     // C2. SMART STUDY NOTES & MULTIMODAL ARTIFACTS
     // -----------------------------------------------------------------------
-    async smartNotes() {
-      await syncActiveDocument();
+    async smartNotes(signal = null) {
+      await syncActiveDocument(signal);
       const userId = getCurrentUserId();
+      const reqOpts = signal ? { signal } : {};
 
       // Fetch concepts list from mastery or graph
       let conceptsList = [];
+      let notesFetchError = null;
       try {
         const [mRes, gRes] = await Promise.all([
-          ApiService.getMastery().catch(() => ({ concepts: [] })),
-          ApiService.getConceptsGraph().catch(() => ({ nodes: [] }))
+          ApiService.getMastery(reqOpts).catch(e => { rethrowIfAbort(e); notesFetchError = notesFetchError || e; return { concepts: [] }; }),
+          ApiService.getConceptsGraph(reqOpts).catch(e => { rethrowIfAbort(e); notesFetchError = notesFetchError || e; return { nodes: [] }; })
         ]);
+        if (notesFetchError) {
+          reportBackendError("Could not load concepts for Smart Study Notes", notesFetchError);
+        }
         if (mRes && mRes.concepts && mRes.concepts.length) {
           conceptsList = mRes.concepts.map(c => ({
             id: c.id,
@@ -2528,7 +2781,27 @@
           }));
         }
       } catch (e) {
-        console.warn("Could not fetch concepts for smart notes", e);
+        rethrowIfAbort(e);
+        notesFetchError = e;
+        reportBackendError("Could not load concepts for Smart Study Notes", e);
+      }
+
+      if (!conceptsList.length && notesFetchError) {
+        return `
+          <div class="page-header">
+            <div class="page-header-text">
+              <h1 class="page-title">Smart Study Notes</h1>
+              <p class="page-subtitle">
+                Elicit targeted study formats grounded in primary material chunks with ElevenLabs voice notes, PDF handouts, and PPTX slide decks.
+              </p>
+            </div>
+          </div>
+          <div class="empty-state-card">
+            <h3 class="empty-state-title" style="color:var(--color-danger);">Backend Unavailable</h3>
+            <p class="empty-state-desc">${esc(notesFetchError.message || "Could not load concepts from backend.")}</p>
+            <button type="button" class="btn btn-primary" onclick="location.reload()">Retry</button>
+          </div>
+        `;
       }
 
       if (!conceptsList.length) {
@@ -2567,10 +2840,11 @@
       // Fetch saved notes archive
       let savedNotes = [];
       try {
-        savedNotes = await ApiService.getNotes(null, userId);
+        savedNotes = await ApiService.getNotes(null, userId, reqOpts);
         AppState.smartNotes.savedNotes = savedNotes;
       } catch (e) {
-        console.warn("Could not fetch saved notes archive", e);
+        rethrowIfAbort(e);
+        reportBackendError("Could not load saved notes archive", e);
       }
 
       const selectedTask = AppState.smartNotes.selectedTask;
@@ -2826,14 +3100,16 @@
     // -----------------------------------------------------------------------
     // D. CONCEPT CHECK / QUIZ VIEW
     // -----------------------------------------------------------------------
-    async practice() {
-      await syncActiveDocument();
+    async practice(signal = null) {
+      await syncActiveDocument(signal);
       if (!AppState.masteryList || !AppState.masteryList.length) {
         try {
-          const mRes = await ApiService.getMastery();
+          const reqOpts = signal ? { signal } : {};
+          const mRes = await ApiService.getMastery(reqOpts);
           AppState.masteryList = mRes.concepts || [];
         } catch (e) {
-          console.warn("Could not load mastery list for practice view", e);
+          rethrowIfAbort(e);
+          reportBackendError("Could not load mastery list for practice view", e);
         }
       }
 
@@ -2905,22 +3181,42 @@
     // -----------------------------------------------------------------------
     // E. LEARNING PATH VIEW
     // -----------------------------------------------------------------------
-    async learningPath() {
-      await syncActiveDocument();
+    async learningPath(signal = null) {
+      await syncActiveDocument(signal);
       let masteryData = [];
       let graphData = { nodes: [], edges: [] };
+      let pathError = null;
 
       try {
+        const reqOpts = signal ? { signal } : {};
         const [mRes, gRes] = await Promise.all([
-          ApiService.getMastery(),
-          ApiService.getGraph()
+          ApiService.getMastery(reqOpts),
+          ApiService.getGraph(reqOpts)
         ]);
         masteryData = mRes.concepts || [];
         graphData = gRes || { nodes: [], edges: [] };
         AppState.masteryList = masteryData;
         AppState.graphData = graphData;
       } catch (e) {
-        console.warn("Could not fetch learning path", e);
+        rethrowIfAbort(e);
+        pathError = e;
+        reportBackendError("Could not load learning path", e);
+      }
+
+      if (!masteryData.length && pathError) {
+        return `
+          <div class="page-header">
+            <div class="page-header-text">
+              <h1>Your Learning Path</h1>
+              <p>A personalized roadmap based on prerequisite concepts and current mastery.</p>
+            </div>
+          </div>
+          <div class="empty-state-card">
+            <h3 class="empty-state-title" style="color:var(--color-danger);">Backend Unavailable</h3>
+            <p class="empty-state-desc">${esc(pathError.message || "Could not load learning path.")}</p>
+            <button type="button" class="btn btn-primary" onclick="location.reload()">Retry</button>
+          </div>
+        `;
       }
 
       if (!masteryData.length) {
@@ -3046,15 +3342,35 @@
     // -----------------------------------------------------------------------
     // F. PROGRESS & MASTERY ANALYTICS VIEW
     // -----------------------------------------------------------------------
-    async progress() {
-      await syncActiveDocument();
+    async progress(signal = null) {
+      await syncActiveDocument(signal);
       let masteryData = [];
+      let progressError = null;
       try {
-        const res = await ApiService.getMastery();
+        const reqOpts = signal ? { signal } : {};
+        const res = await ApiService.getMastery(reqOpts);
         masteryData = res.concepts || [];
         AppState.masteryList = masteryData;
       } catch (e) {
-        console.warn("Could not fetch mastery snapshot", e);
+        rethrowIfAbort(e);
+        progressError = e;
+        reportBackendError("Could not load mastery analytics", e);
+      }
+
+      if (!masteryData.length && progressError) {
+        return `
+          <div class="page-header">
+            <div class="page-header-text">
+              <h1>Progress &amp; Mastery Analytics</h1>
+              <p>Multi-Agent Pedagogical Assessment (4 Specialist Teachers + Head Teacher Arbiter).</p>
+            </div>
+          </div>
+          <div class="empty-state-card">
+            <h3 class="empty-state-title" style="color:var(--color-danger);">Backend Unavailable</h3>
+            <p class="empty-state-desc">${esc(progressError.message || "Could not load mastery snapshot.")}</p>
+            <button type="button" class="btn btn-primary" onclick="location.reload()">Retry</button>
+          </div>
+        `;
       }
 
       const total = masteryData.length;
@@ -3204,7 +3520,7 @@
       const conf = ApiService.getConfig();
       let healthOk = false;
       try {
-        const h = await ApiService.getHealth();
+        const h = await ApiService.getHealth({ silentError: true });
         healthOk = Boolean(h && h.ok);
       } catch (e) {
         healthOk = false;
@@ -3258,7 +3574,7 @@
 
               <div style="display:flex; align-items:center; gap:0.6rem;">
                 <input type="checkbox" id="setting-mock-mode" ${conf.mock ? 'checked' : ''} style="width:18px; height:18px;">
-                <label for="setting-mock-mode" style="font-size:0.88rem; font-weight:600;">Enable offline demo dataset (Mock mode)</label>
+                <label for="setting-mock-mode" style="font-size:0.88rem; font-weight:600;">Enable offline demo dataset (sets <code>USE_MOCK=true</code>; also activated via <code>?mock=true</code>)</label>
               </div>
 
               <div style="padding-top:0.75rem; border-top:1px solid var(--border-subtle); display:flex; justify-content:space-between; align-items:center;">
@@ -3429,7 +3745,7 @@
     dashboard() {
       const diagBtn = $("#btn-start-baseline-diagnostic");
       if (diagBtn) {
-        diagBtn.onclick = () => startBaselineDiagnostic();
+        diagBtn.onclick = () => withButtonLock(diagBtn, () => startBaselineDiagnostic());
       }
 
       $$(".start-remedial-review").forEach(btn => {
@@ -3533,17 +3849,14 @@
 
       // Process Ingestion for Uploaded Files
       if (processBtn) {
-        processBtn.onclick = async () => {
+        processBtn.onclick = () => withButtonLock(processBtn, async () => {
           if (!selectedFiles.length) return;
-          processBtn.disabled = true;
-          processBtn.textContent = `Ingesting ${selectedFiles.length > 1 ? selectedFiles.length + " materials" : "material"}...`;
-
           const stages = [$("#stage-1"), $("#stage-2"), $("#stage-3"), $("#stage-4")];
           stages.forEach(s => s && (s.className = "stage-item running"));
 
           try {
             // If strictly PDFs, call uploadPdf for backward compatibility; otherwise ingestMaterialFile
-            let result = await ApiService.ingestMaterialFile(selectedFiles, getCurrentUserId());
+            await ApiService.ingestMaterialFile(selectedFiles, getCurrentUserId());
 
             stages.forEach(s => s && (s.className = "stage-item done"));
             showToast("Material ingested successfully into vectorless index!", "success");
@@ -3554,10 +3867,13 @@
           } catch (err) {
             stages.forEach(s => s && (s.className = "stage-item"));
             showToast(`Ingestion error: ${err.message}`, "danger");
-            processBtn.disabled = false;
-            processBtn.textContent = "Retry Processing";
+            return false;
           }
-        };
+        }, {
+          loadingText: `Ingesting ${selectedFiles.length > 1 ? selectedFiles.length + " materials" : "material"}...`,
+          keepLockedOnSuccess: true,
+          preserveLabelOnSuccess: true
+        });
       }
 
       // 3. YouTube / Web URL Ingestion Handler
@@ -3567,36 +3883,38 @@
       const urlTitleInput = $("#input-url-title");
 
       if (ingestUrlBtn && urlInput) {
-        ingestUrlBtn.onclick = async () => {
+        ingestUrlBtn.onclick = () => {
           const rawUrl = (urlInput.value || "").trim();
           if (!rawUrl || !(rawUrl.startsWith("http://") || rawUrl.startsWith("https://"))) {
             showToast("Please enter a valid URL starting with http:// or https://", "warning");
             return;
           }
 
-          ingestUrlBtn.disabled = true;
-          ingestUrlBtn.textContent = "Ingesting URL Content...";
+          return withButtonLock(ingestUrlBtn, async () => {
+            const stages = [$("#stage-1"), $("#stage-2"), $("#stage-3"), $("#stage-4")];
+            stages.forEach(s => s && (s.className = "stage-item running"));
 
-          const stages = [$("#stage-1"), $("#stage-2"), $("#stage-3"), $("#stage-4")];
-          stages.forEach(s => s && (s.className = "stage-item running"));
+            try {
+              const sourceType = urlTypeSelect ? urlTypeSelect.value : "auto";
+              const customTitle = urlTitleInput ? urlTitleInput.value.trim() : "";
+              await ApiService.ingestMaterialUrl(rawUrl, sourceType, getCurrentUserId(), customTitle);
 
-          try {
-            const sourceType = urlTypeSelect ? urlTypeSelect.value : "auto";
-            const customTitle = urlTitleInput ? urlTitleInput.value.trim() : "";
-            await ApiService.ingestMaterialUrl(rawUrl, sourceType, getCurrentUserId(), customTitle);
-
-            stages.forEach(s => s && (s.className = "stage-item done"));
-            showToast("URL material successfully parsed and indexed!", "success");
-            await syncActiveDocument();
-            setTimeout(() => {
-              navigateTo("upload");
-            }, 800);
-          } catch (err) {
-            stages.forEach(s => s && (s.className = "stage-item"));
-            showToast(`Ingest URL error: ${err.message}`, "danger");
-            ingestUrlBtn.disabled = false;
-            ingestUrlBtn.textContent = "Ingest URL Source";
-          }
+              stages.forEach(s => s && (s.className = "stage-item done"));
+              showToast("URL material successfully parsed and indexed!", "success");
+              await syncActiveDocument();
+              setTimeout(() => {
+                navigateTo("upload");
+              }, 800);
+            } catch (err) {
+              stages.forEach(s => s && (s.className = "stage-item"));
+              showToast(`Ingest URL error: ${err.message}`, "danger");
+              return false;
+            }
+          }, {
+            loadingText: "Ingesting URL Content...",
+            keepLockedOnSuccess: true,
+            preserveLabelOnSuccess: true
+          });
         };
       }
 
@@ -3663,39 +3981,39 @@
       }
 
       if (ingestVoiceBtn) {
-        ingestVoiceBtn.onclick = async () => {
+        ingestVoiceBtn.onclick = () => {
           if (!recordedAudioBlob) return;
-          ingestVoiceBtn.disabled = true;
-          ingestVoiceBtn.textContent = "Transcribing & Ingesting...";
+          return withButtonLock(ingestVoiceBtn, async () => {
+            const stages = [$("#stage-1"), $("#stage-2"), $("#stage-3"), $("#stage-4")];
+            stages.forEach(s => s && (s.className = "stage-item running"));
 
-          const stages = [$("#stage-1"), $("#stage-2"), $("#stage-3"), $("#stage-4")];
-          stages.forEach(s => s && (s.className = "stage-item running"));
+            try {
+              const fileName = `voice_note_${Date.now()}.webm`;
+              const audioFile = new File([recordedAudioBlob], fileName, { type: "audio/webm" });
+              await ApiService.ingestMaterialFile([audioFile], getCurrentUserId(), "Spoken Lecture Voice Note");
 
-          try {
-            const fileName = `voice_note_${Date.now()}.webm`;
-            const audioFile = new File([recordedAudioBlob], fileName, { type: "audio/webm" });
-            await ApiService.ingestMaterialFile([audioFile], getCurrentUserId(), "Spoken Lecture Voice Note");
-
-            stages.forEach(s => s && (s.className = "stage-item done"));
-            showToast("Voice note transcribed & indexed successfully!", "success");
-            await syncActiveDocument();
-            setTimeout(() => {
-              navigateTo("upload");
-            }, 800);
-          } catch (err) {
-            stages.forEach(s => s && (s.className = "stage-item"));
-            showToast(`Voice note ingestion error: ${err.message}`, "danger");
-            ingestVoiceBtn.disabled = false;
-            ingestVoiceBtn.textContent = "Transcribe & Ingest Spoken Note";
-          }
+              stages.forEach(s => s && (s.className = "stage-item done"));
+              showToast("Voice note transcribed & indexed successfully!", "success");
+              await syncActiveDocument();
+              setTimeout(() => {
+                navigateTo("upload");
+              }, 800);
+            } catch (err) {
+              stages.forEach(s => s && (s.className = "stage-item"));
+              showToast(`Voice note ingestion error: ${err.message}`, "danger");
+              return false;
+            }
+          }, {
+            loadingText: "Transcribing & Ingesting...",
+            keepLockedOnSuccess: true,
+            preserveLabelOnSuccess: true
+          });
         };
       }
 
       // 5. Sample 1-Click Loader
       if (sampleBtn) {
-        sampleBtn.onclick = async () => {
-          sampleBtn.disabled = true;
-          sampleBtn.textContent = "Loading sample...";
+        sampleBtn.onclick = () => withButtonLock(sampleBtn, async () => {
           const stages = [$("#stage-1"), $("#stage-2"), $("#stage-3"), $("#stage-4")];
           stages.forEach(s => s && (s.className = "stage-item running"));
 
@@ -3710,31 +4028,35 @@
           } catch (e) {
             stages.forEach(s => s && (s.className = "stage-item"));
             showToast(`Could not load sample: ${e.message}`, "danger");
-            sampleBtn.disabled = false;
-            sampleBtn.textContent = "Try Sample: ML Basics";
+            return false;
           }
-        };
+        }, {
+          loadingText: "Loading sample...",
+          keepLockedOnSuccess: true,
+          preserveLabelOnSuccess: true
+        });
       }
 
       // 6. Delete Material Action
       $$(".btn-delete-mat").forEach(btn => {
-        btn.onclick = async e => {
+        btn.onclick = e => {
           e.stopPropagation();
           const matId = btn.getAttribute("data-id");
           if (!matId) return;
           if (!confirm("Are you sure you want to remove this study material? The knowledge base and concept graph will be updated.")) {
             return;
           }
-          btn.disabled = true;
-          try {
-            await ApiService.deleteMaterial(matId, getCurrentUserId());
-            showToast("Material removed and knowledge base updated.", "success");
-            await syncActiveDocument();
-            navigateTo("upload");
-          } catch (err) {
-            showToast(`Delete failed: ${err.message}`, "danger");
-            btn.disabled = false;
-          }
+          return withButtonLock(btn, async () => {
+            try {
+              await ApiService.deleteMaterial(matId, getCurrentUserId());
+              showToast("Material removed and knowledge base updated.", "success");
+              await syncActiveDocument();
+              navigateTo("upload");
+            } catch (err) {
+              showToast(`Delete failed: ${err.message}`, "danger");
+              return false;
+            }
+          }, { keepLockedOnSuccess: true });
         };
       });
 
@@ -3750,18 +4072,13 @@
       }
 
       $$(".btn-preview-mat").forEach(btn => {
-        btn.onclick = async () => {
+        btn.onclick = () => {
           const matId = btn.getAttribute("data-id");
           if (!matId || !previewModal) return;
 
-          btn.disabled = true;
-          const origText = btn.innerHTML;
-          btn.textContent = "Loading...";
-
-          try {
-            const preview = await ApiService.getMaterialPreview(matId);
-            btn.disabled = false;
-            btn.innerHTML = origText;
+          return withButtonLock(btn, async () => {
+            try {
+              const preview = await ApiService.getMaterialPreview(matId);
 
             if (previewModalTitle) previewModalTitle.textContent = preview.title || "Material Preview";
             if (previewModalBadge) {
@@ -3885,12 +4202,9 @@
               if (stype === "pdf" || stype === "pptx") {
                 const daBtns = previewModalBody.querySelectorAll(".btn-generate-deep-audio");
                 daBtns.forEach(daBtn => {
-                  daBtn.onclick = async () => {
+                  daBtn.onclick = () => withButtonLock(daBtn, async () => {
                     const targetMatId = daBtn.getAttribute("data-mat-id") || matId;
                     const targetIndex = parseInt(daBtn.getAttribute("data-index") || "0", 10);
-                    const origBtnText = daBtn.innerHTML;
-                    daBtn.disabled = true;
-                    daBtn.textContent = "Synthesizing deep audio...";
 
                     try {
                       const audioRes = await ApiService.generateDeepAudio(targetMatId, targetIndex, getCurrentUserId());
@@ -3909,11 +4223,8 @@
                       showToast("Deep audio explanation generated!", "success");
                     } catch (audioErr) {
                       showToast(`Deep audio synthesis failed: ${audioErr.message}`, "danger");
-                    } finally {
-                      daBtn.disabled = false;
-                      daBtn.innerHTML = origBtnText;
                     }
-                  };
+                  }, { loadingText: "Synthesizing deep audio..." });
                 });
               }
               if (stype === "youtube") {
@@ -3931,10 +4242,9 @@
 
             previewModal.showModal();
           } catch (err) {
-            btn.disabled = false;
-            btn.innerHTML = origText;
             showToast(`Could not load preview: ${err.message}`, "danger");
           }
+          }, { loadingText: "Loading..." });
         };
       });
     },
@@ -3989,55 +4299,60 @@
 
       // Submit question
       if (form) {
+        const sendBtn = $("#btn-tutor-send");
         form.onsubmit = async e => {
           e.preventDefault();
+          if (sendBtn && (sendBtn.disabled || sendBtn.dataset.inFlight === "1")) return;
           const question = input.value.trim();
           if (!question) return;
-          input.value = "";
 
-          // Append student message
-          const userMsg = { sender: "user", text: esc(question) };
-          AppState.chatMessages.push(userMsg);
-          stream.insertAdjacentHTML("beforeend", renderChatMessage(userMsg));
-          renderMath(stream);
-          stream.scrollTop = stream.scrollHeight;
+          await withButtonLock(sendBtn ? [sendBtn, input] : [input], async () => {
+            input.value = "";
 
-          // Placeholder thinking bubble
-          const tempId = `thinking-${Date.now()}`;
-          stream.insertAdjacentHTML("beforeend", `
-            <div class="chat-row assistant" id="${tempId}">
-              <div class="chat-avatar bot-avatar">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 10v6M2 10l10-5 10 5-10 5z"/></svg>
-              </div>
-              <div class="message-bubble" style="color:var(--ink-muted);">
-                Analyzing material &amp; verifying citations...
-              </div>
-            </div>
-          `);
-          stream.scrollTop = stream.scrollHeight;
-
-          try {
-            const resp = await ApiService.askTutor(question);
-            const thinkingEl = $(`#${tempId}`);
-            if (thinkingEl) thinkingEl.remove();
-
-            const tutorMsg = {
-              sender: "assistant",
-              text: esc(resp.answer),
-              citations: resp.citations || [],
-              artifacts: resp.artifacts || [],
-              external_links: resp.external_links || []
-            };
-            AppState.chatMessages.push(tutorMsg);
-            stream.insertAdjacentHTML("beforeend", renderChatMessage(tutorMsg));
+            // Append student message
+            const userMsg = { sender: "user", text: esc(question) };
+            AppState.chatMessages.push(userMsg);
+            stream.insertAdjacentHTML("beforeend", renderChatMessage(userMsg));
             renderMath(stream);
             stream.scrollTop = stream.scrollHeight;
-          } catch (err) {
-            const thinkingEl = $(`#${tempId}`);
-            if (thinkingEl) {
-              thinkingEl.querySelector(".message-bubble").textContent = `Error: ${err.message}`;
+
+            // Placeholder thinking bubble
+            const tempId = `thinking-${Date.now()}`;
+            stream.insertAdjacentHTML("beforeend", `
+              <div class="chat-row assistant" id="${tempId}">
+                <div class="chat-avatar bot-avatar">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 10v6M2 10l10-5 10 5-10 5z"/></svg>
+                </div>
+                <div class="message-bubble" style="color:var(--ink-muted);">
+                  Analyzing material &amp; verifying citations...
+                </div>
+              </div>
+            `);
+            stream.scrollTop = stream.scrollHeight;
+
+            try {
+              const resp = await ApiService.askTutor(question);
+              const thinkingEl = $(`#${tempId}`);
+              if (thinkingEl) thinkingEl.remove();
+
+              const tutorMsg = {
+                sender: "assistant",
+                text: esc(resp.answer),
+                citations: resp.citations || [],
+                artifacts: resp.artifacts || [],
+                external_links: resp.external_links || []
+              };
+              AppState.chatMessages.push(tutorMsg);
+              stream.insertAdjacentHTML("beforeend", renderChatMessage(tutorMsg));
+              renderMath(stream);
+              stream.scrollTop = stream.scrollHeight;
+            } catch (err) {
+              const thinkingEl = $(`#${tempId}`);
+              if (thinkingEl) {
+                thinkingEl.querySelector(".message-bubble").textContent = `Error: ${err.message}`;
+              }
             }
-          }
+          });
         };
       }
     },
@@ -4174,9 +4489,7 @@
         }
 
         if (submitBtn) {
-          submitBtn.onclick = async () => {
-            submitBtn.disabled = true;
-            submitBtn.innerHTML = "Evaluating Retrieval...";
+          submitBtn.onclick = () => withButtonLock(submitBtn, async () => {
             const duration = session.timerSec - session.timeLeft;
             try {
               const evalRes = await ApiService.evaluateActiveRecall(
@@ -4192,10 +4505,12 @@
               navigateTo("active-recall");
             } catch (evalErr) {
               showToast(`Evaluation failed: ${evalErr.message}`, "danger");
-              submitBtn.disabled = false;
-              submitBtn.innerHTML = "Submit Active Recall &rarr;";
+              return false;
             }
-          };
+          }, {
+            loadingHtml: "Evaluating Retrieval...",
+            keepLockedOnSuccess: true
+          });
         }
       }
 
@@ -4297,39 +4612,36 @@
           const customInstructions = (customInput && customInput.value.trim()) || AppState.smartNotes.customInstructions || "";
           const userId = getCurrentUserId();
 
-          generateBtn.disabled = true;
-          const origText = generateBtn.innerHTML;
-          generateBtn.innerHTML = `
-            <span class="upload-icon-pulse" style="width:16px; height:16px; border:2px solid #fff; border-top-color:transparent; border-radius:50%; display:inline-block; animation:spin 1s linear infinite;"></span>
-            <span>Synthesizing ${taskType.toUpperCase()} Notes...</span>
-          `;
+          await withButtonLock(generateBtn, async () => {
+            try {
+              const noteRes = await ApiService.generateNote({
+                concept_id: conceptId,
+                task_type: taskType,
+                custom_instructions: customInstructions || undefined,
+                user_id: userId
+              });
 
-          try {
-            const noteRes = await ApiService.generateNote({
-              concept_id: conceptId,
-              task_type: taskType,
-              custom_instructions: customInstructions || undefined,
-              user_id: userId
-            });
+              AppState.smartNotes.activeNote = noteRes;
+              AppState.smartNotes.diagramSvg = null;
+              AppState.smartNotes.activeAudioUrl = noteRes.audio_url || null;
 
-            AppState.smartNotes.activeNote = noteRes;
-            AppState.smartNotes.diagramSvg = null;
-            AppState.smartNotes.activeAudioUrl = noteRes.audio_url || null;
+              showToast(`Generated ${taskType.toUpperCase()} notes for ${conceptId.replace(/_/g, ' ')}!`, "success");
+              await navigateTo("smart-notes");
 
-            showToast(`Generated ${taskType.toUpperCase()} notes for ${conceptId.replace(/_/g, ' ')}!`, "success");
-            await navigateTo("smart-notes");
-
-            // Scroll to active note view
-            const activeNoteView = $("#active-note-view");
-            if (activeNoteView) {
-              activeNoteView.scrollIntoView({ behavior: "smooth", block: "start" });
+              // Scroll to active note view
+              const activeNoteView = $("#active-note-view");
+              if (activeNoteView) {
+                activeNoteView.scrollIntoView({ behavior: "smooth", block: "start" });
+              }
+            } catch (err) {
+              showToast(`Note generation failed: ${err.message}`, "danger");
             }
-          } catch (err) {
-            showToast(`Note generation failed: ${err.message}`, "danger");
-          } finally {
-            generateBtn.disabled = false;
-            generateBtn.innerHTML = origText;
-          }
+          }, {
+            loadingHtml: `
+              <span class="upload-icon-pulse" style="width:16px; height:16px; border:2px solid #fff; border-top-color:transparent; border-radius:50%; display:inline-block; animation:spin 1s linear infinite;"></span>
+              <span>Synthesizing ${taskType.toUpperCase()} Notes...</span>
+            `
+          });
         };
       }
 
@@ -4342,11 +4654,7 @@
         const audioElement = $("#note-audio-element");
 
         if (audioBtn) {
-          audioBtn.onclick = async () => {
-            audioBtn.disabled = true;
-            const origAudioText = audioBtn.innerHTML;
-            audioBtn.innerHTML = "🎧 Synthesizing Flash Audio...";
-
+          audioBtn.onclick = () => withButtonLock(audioBtn, async () => {
             try {
               const res = await ApiService.generateNoteAudio(activeNote.note_id, getCurrentUserId());
               const audioUrl = ApiService.getArtifactUrl(res.audio_url || (activeNote.note_id ? `/api/artifacts/audio_${activeNote.note_id}.mp3` : ""));
@@ -4361,21 +4669,18 @@
               audioBtn.innerHTML = "🎧 Audio Ready";
             } catch (err) {
               showToast(`Audio generation failed: ${err.message}`, "danger");
-              audioBtn.innerHTML = origAudioText;
-            } finally {
-              audioBtn.disabled = false;
+              return false;
             }
-          };
+          }, {
+            loadingHtml: "🎧 Synthesizing Flash Audio...",
+            preserveLabelOnSuccess: true
+          });
         }
 
         // B. Download PDF
         const pdfBtn = $("#btn-note-pdf");
         if (pdfBtn) {
-          pdfBtn.onclick = async () => {
-            pdfBtn.disabled = true;
-            const origPdfText = pdfBtn.innerHTML;
-            pdfBtn.innerHTML = "📄 Building PDF...";
-
+          pdfBtn.onclick = () => withButtonLock(pdfBtn, async () => {
             try {
               const res = await ApiService.exportNoteArtifact(activeNote.note_id, "pdf", getCurrentUserId());
               const pdfUrl = ApiService.getArtifactUrl(res.pdf_url || res.url || res.download_url || "");
@@ -4383,21 +4688,14 @@
               showToast("PDF handout downloaded!", "success");
             } catch (err) {
               showToast(`PDF export failed: ${err.message}`, "danger");
-            } finally {
-              pdfBtn.disabled = false;
-              pdfBtn.innerHTML = origPdfText;
             }
-          };
+          }, { loadingHtml: "📄 Building PDF..." });
         }
 
         // C. Export PPTX
         const pptxBtn = $("#btn-note-pptx");
         if (pptxBtn) {
-          pptxBtn.onclick = async () => {
-            pptxBtn.disabled = true;
-            const origPptxText = pptxBtn.innerHTML;
-            pptxBtn.innerHTML = "📊 Building Deck...";
-
+          pptxBtn.onclick = () => withButtonLock(pptxBtn, async () => {
             try {
               const res = await ApiService.exportNoteArtifact(activeNote.note_id, "pptx", getCurrentUserId());
               const pptxUrl = ApiService.getArtifactUrl(res.pptx_url || res.url || res.download_url || "");
@@ -4405,11 +4703,8 @@
               showToast("PPTX slide deck downloaded!", "success");
             } catch (err) {
               showToast(`PPTX export failed: ${err.message}`, "danger");
-            } finally {
-              pptxBtn.disabled = false;
-              pptxBtn.innerHTML = origPptxText;
             }
-          };
+          }, { loadingHtml: "📊 Building Deck..." });
         }
 
         // D. Generate Diagram
@@ -4418,11 +4713,7 @@
         const diagramInner = $("#note-diagram-inner");
 
         if (diagramBtn) {
-          diagramBtn.onclick = async () => {
-            diagramBtn.disabled = true;
-            const origDiagText = diagramBtn.innerHTML;
-            diagramBtn.innerHTML = "🖼️ Rendering Diagram...";
-
+          diagramBtn.onclick = () => withButtonLock(diagramBtn, async () => {
             try {
               const res = await ApiService.generateToolArtifact("visual", activeNote.concept_id, "", 5, getCurrentUserId());
               const svgContent = res.svg || res.code || (res.download_url ? `<img src="${esc(ApiService.getArtifactUrl(res.download_url))}" style="max-width:100%;" />` : "");
@@ -4433,11 +4724,8 @@
               showToast("SVG Architecture diagram embedded!", "success");
             } catch (err) {
               showToast(`Diagram generation failed: ${err.message}`, "danger");
-            } finally {
-              diagramBtn.disabled = false;
-              diagramBtn.innerHTML = origDiagText;
             }
-          };
+          }, { loadingHtml: "🖼️ Rendering Diagram..." });
         }
 
         // Clickable citation chips inside note
@@ -4487,26 +4775,23 @@
             }
             showToast("Playing saved audio executive summary!", "info");
           } else {
-            btn.disabled = true;
-            btn.textContent = "Synthesizing...";
-            try {
-              const res = await ApiService.generateNoteAudio(noteId, getCurrentUserId());
-              const url = ApiService.getArtifactUrl(res.audio_url || "");
-              btn.setAttribute("data-url", url);
-              const playerBox = $("#note-audio-player-box");
-              const audioElement = $("#note-audio-element");
-              if (playerBox) playerBox.classList.add("visible");
-              if (audioElement) {
-                audioElement.src = url;
-                audioElement.play().catch(() => {});
+            await withButtonLock(btn, async () => {
+              try {
+                const res = await ApiService.generateNoteAudio(noteId, getCurrentUserId());
+                const url = ApiService.getArtifactUrl(res.audio_url || "");
+                btn.setAttribute("data-url", url);
+                const playerBox = $("#note-audio-player-box");
+                const audioElement = $("#note-audio-element");
+                if (playerBox) playerBox.classList.add("visible");
+                if (audioElement) {
+                  audioElement.src = url;
+                  audioElement.play().catch(() => {});
+                }
+                showToast("ElevenLabs audio summary ready!", "success");
+              } catch (err) {
+                showToast(`Audio synthesis failed: ${err.message}`, "danger");
               }
-              showToast("ElevenLabs audio summary ready!", "success");
-            } catch (err) {
-              showToast(`Audio synthesis failed: ${err.message}`, "danger");
-            } finally {
-              btn.disabled = false;
-              btn.textContent = "🎧 Audio";
-            }
+            }, { loadingText: "Synthesizing..." });
           }
         };
       });
@@ -4518,20 +4803,17 @@
           if (existingUrl) {
             triggerBrowserDownload(ApiService.getArtifactUrl(existingUrl), `Note_${noteId}.pdf`);
           } else {
-            btn.disabled = true;
-            btn.textContent = "Exporting...";
-            try {
-              const res = await ApiService.exportNoteArtifact(noteId, "pdf", getCurrentUserId());
-              const url = ApiService.getArtifactUrl(res.pdf_url || res.url || "");
-              btn.setAttribute("data-url", url);
-              triggerBrowserDownload(url, `Note_${noteId}.pdf`);
-              showToast("PDF handout downloaded!", "success");
-            } catch (err) {
-              showToast(`PDF export failed: ${err.message}`, "danger");
-            } finally {
-              btn.disabled = false;
-              btn.textContent = "📄 PDF";
-            }
+            await withButtonLock(btn, async () => {
+              try {
+                const res = await ApiService.exportNoteArtifact(noteId, "pdf", getCurrentUserId());
+                const url = ApiService.getArtifactUrl(res.pdf_url || res.url || "");
+                btn.setAttribute("data-url", url);
+                triggerBrowserDownload(url, `Note_${noteId}.pdf`);
+                showToast("PDF handout downloaded!", "success");
+              } catch (err) {
+                showToast(`PDF export failed: ${err.message}`, "danger");
+              }
+            }, { loadingText: "Exporting..." });
           }
         };
       });
@@ -4543,38 +4825,37 @@
           if (existingUrl) {
             triggerBrowserDownload(ApiService.getArtifactUrl(existingUrl), `Deck_${noteId}.pptx`);
           } else {
-            btn.disabled = true;
-            btn.textContent = "Exporting...";
-            try {
-              const res = await ApiService.exportNoteArtifact(noteId, "pptx", getCurrentUserId());
-              const url = ApiService.getArtifactUrl(res.pptx_url || res.url || "");
-              btn.setAttribute("data-url", url);
-              triggerBrowserDownload(url, `Deck_${noteId}.pptx`);
-              showToast("PPTX deck downloaded!", "success");
-            } catch (err) {
-              showToast(`PPTX export failed: ${err.message}`, "danger");
-            } finally {
-              btn.disabled = false;
-              btn.textContent = "📊 PPTX";
-            }
+            await withButtonLock(btn, async () => {
+              try {
+                const res = await ApiService.exportNoteArtifact(noteId, "pptx", getCurrentUserId());
+                const url = ApiService.getArtifactUrl(res.pptx_url || res.url || "");
+                btn.setAttribute("data-url", url);
+                triggerBrowserDownload(url, `Deck_${noteId}.pptx`);
+                showToast("PPTX deck downloaded!", "success");
+              } catch (err) {
+                showToast(`PPTX export failed: ${err.message}`, "danger");
+              }
+            }, { loadingText: "Exporting..." });
           }
         };
       });
 
       $$(".btn-delete-saved-note").forEach(btn => {
-        btn.onclick = async () => {
+        btn.onclick = () => {
           const noteId = btn.getAttribute("data-id");
           if (!confirm("Are you sure you want to delete this smart study note?")) return;
-          try {
-            await ApiService.deleteNote(noteId, getCurrentUserId());
-            showToast("Smart note deleted.", "info");
-            if (AppState.smartNotes.activeNote && AppState.smartNotes.activeNote.note_id === noteId) {
-              AppState.smartNotes.activeNote = null;
+          return withButtonLock(btn, async () => {
+            try {
+              await ApiService.deleteNote(noteId, getCurrentUserId());
+              showToast("Smart note deleted.", "info");
+              if (AppState.smartNotes.activeNote && AppState.smartNotes.activeNote.note_id === noteId) {
+                AppState.smartNotes.activeNote = null;
+              }
+              navigateTo("smart-notes");
+            } catch (err) {
+              showToast(`Delete failed: ${err.message}`, "danger");
             }
-            navigateTo("smart-notes");
-          } catch (err) {
-            showToast(`Delete failed: ${err.message}`, "danger");
-          }
+          });
         };
       });
     },
@@ -4732,13 +5013,23 @@
             if (topName) topName.textContent = newName;
             if (topAvatar) topAvatar.textContent = newName[0] || "A";
           }
+          const prevMock = ApiService.isMockMode();
           if (baseInput && mockCheck) {
             ApiService.saveConfig({
               base: baseInput.value.trim().replace(/\/$/, ""),
               mock: mockCheck.checked
             });
           }
-          showToast("Settings successfully saved!", "success");
+          if (mockCheck && mockCheck.checked !== prevMock) {
+            showToast("Settings saved! Reloading to apply mode change...", "success");
+            setTimeout(() => {
+              if (typeof window !== "undefined" && window.location && typeof window.location.reload === "function") {
+                window.location.reload();
+              }
+            }, 300);
+          } else {
+            showToast("Settings successfully saved!", "success");
+          }
         };
       }
 
@@ -4747,7 +5038,7 @@
           diagOut.textContent = "Pinging health endpoint...";
           try {
             const start = performance.now();
-            const res = await ApiService.getHealth();
+            const res = await ApiService.getHealth({ silentError: true });
             const latency = Math.round(performance.now() - start);
             diagOut.textContent = `Server responded in ${latency}ms: ${JSON.stringify(res)}`;
           } catch (e) {
@@ -4776,6 +5067,7 @@
   // =========================================================================
 
   function startNewQuizSession(conceptId = null) {
+    detachQuizKeyNav();
     AppState.quizSession.active = true;
     AppState.quizSession.currentConceptId = conceptId || null;
     AppState.quizSession.targetConceptId = null;
@@ -4789,12 +5081,20 @@
     updateQuizDonut();
 
     // Load first question for the fresh session
-    loadQuizQuestion(conceptId);
+    return loadQuizQuestion(conceptId);
   }
 
   async function loadQuizQuestion(conceptId = null) {
     const box = $("#quiz-card-box");
     if (!box) return;
+
+    detachQuizKeyNav();
+    AppState._quizLoadSeq = (AppState._quizLoadSeq || 0) + 1;
+    const loadSeq = AppState._quizLoadSeq;
+    const controller = typeof ApiService !== "undefined" && typeof ApiService.beginAbortScope === "function"
+      ? ApiService.beginAbortScope("quizQuestion")
+      : new AbortController();
+    const reqOpts = { signal: controller.signal };
 
     const targetCid = conceptId !== undefined && conceptId !== null ? conceptId : (AppState.quizSession.currentConceptId || null);
 
@@ -4812,18 +5112,23 @@
       if (AppState.quizSession.remedialMode) {
         AppState.quizSession.remedialMode = false;
         try {
-          const remRes = await ApiService.getRemedialQuiz(targetCid, getCurrentUserId());
+          const remRes = await ApiService.getRemedialQuiz(targetCid, getCurrentUserId(), reqOpts);
           if (remRes && remRes.question) {
             q = remRes.question;
             if (remRes.concept_name) q.conceptName = remRes.concept_name;
           }
         } catch (remErr) {
+          rethrowIfAbort(remErr);
           console.warn("Remedial quiz routing fallback:", remErr);
         }
       }
 
       if (!q) {
-        q = await ApiService.getNextQuestion(targetCid);
+        q = await ApiService.getNextQuestion(targetCid, reqOpts);
+      }
+
+      if (controller.signal.aborted || loadSeq !== AppState._quizLoadSeq || AppState.currentRoute !== "practice") {
+        return;
       }
 
       if (!AppState.quizSession.seenQuestionIds) {
@@ -4833,15 +5138,25 @@
       // Fresh question deduplication
       if (AppState.quizSession.seenQuestionIds.has(q.id)) {
         try {
-          const fresh = await ApiService.getNextQuestion(targetCid);
+          const fresh = await ApiService.getNextQuestion(targetCid, reqOpts);
           if (fresh && fresh.id !== q.id) q = fresh;
-        } catch (_) {}
+        } catch (dupErr) {
+          rethrowIfAbort(dupErr);
+        }
       }
+
+      if (controller.signal.aborted || loadSeq !== AppState._quizLoadSeq || AppState.currentRoute !== "practice") {
+        return;
+      }
+
       AppState.quizSession.seenQuestionIds.add(q.id);
 
       AppState.quizSession.currentQuestion = q;
       renderActiveQuestion(q);
     } catch (err) {
+      if (isAbortError(err) || controller.signal.aborted || loadSeq !== AppState._quizLoadSeq) {
+        return;
+      }
       box.innerHTML = `
         <div style="padding:2rem; text-align:center;">
           <h3 style="margin-bottom:0.5rem;">Could not load question</h3>
@@ -4856,9 +5171,13 @@
     const box = $("#quiz-card-box");
     if (!box) return;
 
+    detachQuizKeyNav();
+
     const letters = ["A", "B", "C", "D"];
     const completedCount = AppState.quizSession.history.length;
     const totalQuestions = AppState.quizSession.totalQuestions || 6;
+    const displayIndex = Math.min(Math.max(1, AppState.quizSession.currentIndex || 1), totalQuestions);
+    AppState.quizSession.currentIndex = displayIndex;
     const progressPercent = Math.round((completedCount / totalQuestions) * 100);
     const qType = (q.questionType || q.question_type || (q.options && q.options.length ? "mcq" : "typed_qa")).toLowerCase();
 
@@ -5069,15 +5388,16 @@
         const keyMap = { "1": 0, "2": 1, "3": 2, "4": 3, "A": 0, "B": 1, "C": 2, "D": 3 };
         if (k in keyMap && optionBtns[keyMap[k]] && !optionBtns[keyMap[k]].disabled) {
           optionBtns[keyMap[k]].click();
-        } else if (e.key === "Enter" && submitBtn && !submitBtn.disabled) {
+        } else if (e.key === "Enter" && submitBtn && !submitBtn.disabled && submitBtn.dataset.inFlight !== "1") {
           submitBtn.click();
         }
       };
+      AppState._quizKeyNavHandler = handleKeyNav;
       window.addEventListener("keydown", handleKeyNav);
     }
 
     if (skipBtn) {
-      skipBtn.onclick = () => {
+      skipBtn.onclick = () => withButtonLock([skipBtn, submitBtn], async () => {
         AppState.quizSession.history.push({
           question: q.question,
           concept: q.conceptName,
@@ -5086,13 +5406,13 @@
           isCorrect: false
         });
         updateQuizDonut();
-        if (AppState.quizSession.currentIndex >= AppState.quizSession.totalQuestions) {
+        if (AppState.quizSession.currentIndex >= totalQuestions) {
           renderQuizResults();
         } else {
-          AppState.quizSession.currentIndex++;
-          loadQuizQuestion(AppState.quizSession.currentConceptId);
+          AppState.quizSession.currentIndex = Math.min(totalQuestions, AppState.quizSession.currentIndex + 1);
+          await loadQuizQuestion(AppState.quizSession.currentConceptId);
         }
-      };
+      }, { keepLockedOnSuccess: true });
     }
 
     if (submitBtn) {
@@ -5113,127 +5433,143 @@
           if (selectedIdx === null) return;
         }
 
-        submitBtn.disabled = true;
-        skipBtn.disabled = true;
-        if (fitbInput) fitbInput.disabled = true;
-        if (typedQaInput) typedQaInput.disabled = true;
-        if (numericalInput) numericalInput.disabled = true;
-        if (scratchpadArea) scratchpadArea.disabled = true;
-        optionBtns.forEach(b => (b.disabled = true));
+        const inputControls = [
+          fitbInput,
+          typedQaInput,
+          numericalInput,
+          scratchpadArea,
+          ...Array.from(optionBtns)
+        ].filter(Boolean);
 
-        try {
-          const scratchpadNote = scratchpadArea ? scratchpadArea.value.trim() : "";
-          // Authoritative submission to backend supporting mixed question formats
-          const result = await ApiService.submitAnswer(
-            q.id,
-            q.conceptId,
-            selectedIdx,
-            null,
-            scratchpadNote || typedVal,
-            typedVal,
-            numVal
-          );
-          const isCorrect = Boolean(result.correct);
-          const correctIdx = result.correctIndex !== undefined ? result.correctIndex : q.correct;
-          const explanation = result.explanation || q.explanation || "Evaluation recorded in learner belief model.";
-          const reasoningDepth = result.reasoning_depth_level || result.reasoningDepth || "EVALUATED";
-          const correctDisplay = result.correct_answer_display || result.correctAnswerDisplay || q.targetBlankAnswer || q.target_blank_answer || "";
-          const stepSolution = result.step_by_step_solution || result.stepByStepSolution || q.stepByStepSolution || q.step_by_step_solution || "";
+        let submittedSuccessfully = false;
+        await withButtonLock([submitBtn, skipBtn, ...inputControls], async () => {
+          try {
+            const scratchpadNote = scratchpadArea ? scratchpadArea.value.trim() : "";
+            // Authoritative submission to backend supporting mixed question formats
+            const result = await ApiService.submitAnswer(
+              q.id,
+              q.conceptId,
+              selectedIdx,
+              null,
+              scratchpadNote || typedVal,
+              typedVal,
+              numVal
+            );
+            submittedSuccessfully = true;
+            const isCorrect = Boolean(result.correct);
+            const correctIdx = result.correctIndex !== undefined ? result.correctIndex : q.correct;
+            const explanation = result.explanation || q.explanation || "Evaluation recorded in learner belief model.";
+            const reasoningDepth = result.reasoning_depth_level || result.reasoningDepth || "EVALUATED";
+            const correctDisplay = result.correct_answer_display || result.correctAnswerDisplay || q.targetBlankAnswer || q.target_blank_answer || "";
+            const stepSolution = result.step_by_step_solution || result.stepByStepSolution || q.stepByStepSolution || q.step_by_step_solution || "";
 
-          if (isCorrect) {
-            AppState.quizSession.score++;
-          }
-          AppState.quizSession.history.push({
-            question: q.question,
-            concept: q.conceptName,
-            questionType: qType,
-            userAnswer: typedVal || (optionBtns[selectedIdx]?.innerText || `Option ${selectedIdx}`),
-            isCorrect
-          });
-
-          // Style option buttons for MCQ
-          if (qType === "mcq") {
-            optionBtns.forEach((b, idx) => {
-              if (idx === correctIdx) {
-                b.classList.add("correct");
-              } else if (idx === selectedIdx && !isCorrect) {
-                b.classList.add("incorrect");
-              }
-            });
-          }
-
-          // Update session donut accuracy
-          updateQuizDonut();
-
-          // Render comprehensive feedback box
-          const feedbackBox = $("#quiz-feedback-container");
-          let reviewSnippet = "";
-
-          if (qType === "fill_in_the_blanks") {
-            reviewSnippet = `
-              <div class="quiz-answer-review">
-                <div>Your answer: <strong>${esc(typedVal)}</strong></div>
-                ${!isCorrect ? `<div>Target keyword: <strong style="color:var(--color-strong);">${esc(correctDisplay)}</strong></div>` : ''}
-              </div>
-            `;
-          } else if (qType === "typed_qa") {
-            reviewSnippet = `
-              <div class="quiz-answer-review">
-                <div>AI Judge Assessment: <strong>${isCorrect ? 'Conceptual Comprehension Verified' : 'Needs Conceptual Clarification'}</strong> (Depth: <em>${esc(reasoningDepth)}</em>)</div>
-                ${correctDisplay ? `<div style="margin-top:0.25rem; font-size:0.83rem;">Expected Concepts: ${esc(correctDisplay)}</div>` : ''}
-              </div>
-            `;
-          } else if (qType === "numerical") {
-            reviewSnippet = `
-              <div class="quiz-answer-review">
-                <div>Your calculated value: <strong>${esc(typedVal)}</strong></div>
-                ${!isCorrect ? `<div>Target value: <strong style="color:var(--color-strong);">${esc(correctDisplay)}</strong></div>` : ''}
-              </div>
-              ${stepSolution ? `
-                <div class="step-by-step-box">
-                  <div class="step-by-step-header">
-                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 14 14"/></svg>
-                    <span>Step-by-Step Solution</span>
-                  </div>
-                  <div class="step-by-step-content">${esc(stepSolution)}</div>
-                </div>
-              ` : ''}
-            `;
-          }
-
-          feedbackBox.innerHTML = `
-            <div class="quiz-explanation-box ${isCorrect ? 'correct' : 'incorrect'}">
-              <div style="display:flex; align-items:center; gap:0.5rem; margin-bottom:0.35rem; font-weight:700;">
-                ${isCorrect ? `
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
-                  <span>${qType === 'typed_qa' ? 'Concept Well Explained!' : (qType === 'numerical' ? 'Calculation Verified Correct!' : 'Correct!')}</span>
-                ` : `
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-                  <span>${qType === 'typed_qa' ? 'Review Recommended.' : (qType === 'numerical' ? 'Calculation Variance Detected.' : 'Not quite.')}</span>
-                `}
-              </div>
-              ${reviewSnippet}
-              <p style="margin:0; font-size:0.9rem; margin-top:0.4rem;">${esc(explanation)}</p>
-            </div>
-          `;
-          renderMath(feedbackBox);
-
-          // Change submit button to next question
-          submitBtn.disabled = false;
-          submitBtn.textContent = AppState.quizSession.currentIndex >= AppState.quizSession.totalQuestions
-            ? "View Quiz Results →"
-            : "Next Question →";
-
-          submitBtn.onclick = () => {
-            if (AppState.quizSession.currentIndex >= AppState.quizSession.totalQuestions) {
-              renderQuizResults();
-            } else {
-              AppState.quizSession.currentIndex++;
-              loadQuizQuestion(AppState.quizSession.currentConceptId || result.next);
+            if (isCorrect) {
+              AppState.quizSession.score++;
             }
-          };
-        } catch (e) {
-          showToast(`Submission error: ${e.message}`, "danger");
+            AppState.quizSession.history.push({
+              question: q.question,
+              concept: q.conceptName,
+              questionType: qType,
+              userAnswer: typedVal || (optionBtns[selectedIdx]?.innerText || `Option ${selectedIdx}`),
+              isCorrect
+            });
+
+            // Style option buttons for MCQ
+            if (qType === "mcq") {
+              optionBtns.forEach((b, idx) => {
+                if (idx === correctIdx) {
+                  b.classList.add("correct");
+                } else if (idx === selectedIdx && !isCorrect) {
+                  b.classList.add("incorrect");
+                }
+              });
+            }
+
+            // Update session donut accuracy
+            updateQuizDonut();
+
+            // Render comprehensive feedback box
+            const feedbackBox = $("#quiz-feedback-container");
+            let reviewSnippet = "";
+
+            if (qType === "fill_in_the_blanks") {
+              reviewSnippet = `
+                <div class="quiz-answer-review">
+                  <div>Your answer: <strong>${esc(typedVal)}</strong></div>
+                  ${!isCorrect ? `<div>Target keyword: <strong style="color:var(--color-strong);">${esc(correctDisplay)}</strong></div>` : ''}
+                </div>
+              `;
+            } else if (qType === "typed_qa") {
+              reviewSnippet = `
+                <div class="quiz-answer-review">
+                  <div>AI Judge Assessment: <strong>${isCorrect ? 'Conceptual Comprehension Verified' : 'Needs Conceptual Clarification'}</strong> (Depth: <em>${esc(reasoningDepth)}</em>)</div>
+                  ${correctDisplay ? `<div style="margin-top:0.25rem; font-size:0.83rem;">Expected Concepts: ${esc(correctDisplay)}</div>` : ''}
+                </div>
+              `;
+            } else if (qType === "numerical") {
+              reviewSnippet = `
+                <div class="quiz-answer-review">
+                  <div>Your calculated value: <strong>${esc(typedVal)}</strong></div>
+                  ${!isCorrect ? `<div>Target value: <strong style="color:var(--color-strong);">${esc(correctDisplay)}</strong></div>` : ''}
+                </div>
+                ${stepSolution ? `
+                  <div class="step-by-step-box">
+                    <div class="step-by-step-header">
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 14 14"/></svg>
+                      <span>Step-by-Step Solution</span>
+                    </div>
+                    <div class="step-by-step-content">${esc(stepSolution)}</div>
+                  </div>
+                ` : ''}
+              `;
+            }
+
+            feedbackBox.innerHTML = `
+              <div class="quiz-explanation-box ${isCorrect ? 'correct' : 'incorrect'}">
+                <div style="display:flex; align-items:center; gap:0.5rem; margin-bottom:0.35rem; font-weight:700;">
+                  ${isCorrect ? `
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                    <span>${qType === 'typed_qa' ? 'Concept Well Explained!' : (qType === 'numerical' ? 'Calculation Verified Correct!' : 'Correct!')}</span>
+                  ` : `
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                    <span>${qType === 'typed_qa' ? 'Review Recommended.' : (qType === 'numerical' ? 'Calculation Variance Detected.' : 'Not quite.')}</span>
+                  `}
+                </div>
+                ${reviewSnippet}
+                <p style="margin:0; font-size:0.9rem; margin-top:0.4rem;">${esc(explanation)}</p>
+              </div>
+            `;
+            renderMath(feedbackBox);
+
+            // Change submit button to next question
+            submitBtn.textContent = AppState.quizSession.currentIndex >= totalQuestions
+              ? "View Quiz Results →"
+              : "Next Question →";
+
+            submitBtn.onclick = () => withButtonLock([submitBtn, skipBtn], async () => {
+              if (AppState.quizSession.currentIndex >= totalQuestions) {
+                renderQuizResults();
+              } else {
+                AppState.quizSession.currentIndex = Math.min(totalQuestions, AppState.quizSession.currentIndex + 1);
+                await loadQuizQuestion(AppState.quizSession.currentConceptId || result.next);
+              }
+            }, {
+              loadingText: AppState.quizSession.currentIndex >= totalQuestions ? "Loading Results..." : "Loading Next Question...",
+              keepLockedOnSuccess: true
+            });
+          } catch (e) {
+            showToast(`Submission error: ${e.message}`, "danger");
+          }
+        }, {
+          primary: submitBtn,
+          loadingText: "Evaluating Answer...",
+          preserveLabelOnSuccess: true
+        });
+
+        // After a successful submission, keep inputs and Skip locked while Next Question stays enabled.
+        if (submittedSuccessfully) {
+          if (skipBtn) skipBtn.disabled = true;
+          inputControls.forEach(el => (el.disabled = true));
           submitBtn.disabled = false;
         }
       };
@@ -5268,6 +5604,7 @@
   }
 
   function renderQuizResults() {
+    detachQuizKeyNav();
     const box = $("#quiz-card-box");
     if (!box) return;
 
@@ -5345,6 +5682,21 @@
     const validRoutes = ["dashboard", "upload", "tutor", "active-recall", "smart-notes", "practice", "learning-path", "progress", "settings"];
     const activeRoute = validRoutes.includes(routeId) ? routeId : "dashboard";
     AppState.currentRoute = activeRoute;
+    AppState._navigationSeq = (AppState._navigationSeq || 0) + 1;
+    const navSeq = AppState._navigationSeq;
+    clearErrorBanner();
+
+    if (activeRoute !== "practice") {
+      detachQuizKeyNav();
+      if (typeof ApiService !== "undefined" && typeof ApiService.abortScope === "function") {
+        ApiService.abortScope("quizQuestion");
+      }
+    }
+
+    const controller = typeof ApiService !== "undefined" && typeof ApiService.beginAbortScope === "function"
+      ? ApiService.beginAbortScope("navigation")
+      : new AbortController();
+
     updateNavigation(activeRoute);
 
     const view = $("#view");
@@ -5360,13 +5712,17 @@
     `;
 
     try {
-      const html = await Views[toCamelCase(activeRoute)]();
+      const html = await Views[toCamelCase(activeRoute)](controller.signal);
+      if (controller.signal.aborted || navSeq !== AppState._navigationSeq) return;
       view.innerHTML = html;
       renderMath(view);
       if (AfterRender[toCamelCase(activeRoute)]) {
         AfterRender[toCamelCase(activeRoute)]();
       }
     } catch (err) {
+      if (isAbortError(err) || controller.signal.aborted || navSeq !== AppState._navigationSeq) {
+        return;
+      }
       view.innerHTML = `
         <div class="card" style="padding:3rem; text-align:center;">
           <h2 style="color:var(--color-danger); margin-bottom:0.75rem;">Something went wrong</h2>
@@ -5394,6 +5750,18 @@
     initAuth();
 
     window.addEventListener("hashchange", handleHashChange);
+    window.addEventListener("cm:api-error", evt => {
+      const detail = evt && evt.detail ? evt.detail : {};
+      if (detail.status === 401) return;
+      const errObj = detail.error;
+      Promise.resolve().then(() => {
+        if (errObj && errObj._uiReported) return;
+        reportBackendError(
+          detail.endpointKey ? `Backend Error (${detail.endpointKey})` : "Backend Error",
+          errObj || new Error(detail.message || "Backend request failed")
+        );
+      });
+    });
     
     // Global navigation listener for practice links, teacher deliberation modal, and timestamp chips
     document.addEventListener("click", (e) => {

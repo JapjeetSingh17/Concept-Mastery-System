@@ -521,3 +521,130 @@ class ConceptDeliberationResponse(BaseModel):
     evidence_records: list[LearningEvidenceRecord] = Field(default_factory=list)
 
 
+# ---------------------------------------------------------------------------
+# Ingestion & Concept Extraction Schemas
+# ---------------------------------------------------------------------------
+
+class IngestResponse(BaseModel):
+    """Legacy response model for document ingestion jobs."""
+
+    job_id: str = Field(..., description="Identifier for this ingest job (filename)")
+    file: str = Field(..., description="Uploaded PDF filename")
+    pages: int = Field(..., ge=0, description="Total pages extracted")
+    chunk_count: int = Field(..., ge=0, description="Number of chunks produced")
+    concepts: list[str] = Field(default_factory=list, description="Canonical concept names discovered")
+
+
+class ExtractedConceptItem(BaseModel):
+    """Structured concept item emitted by LLM concept extraction."""
+
+    concept: str
+    definition: str = ""
+    prerequisites: list[str] = Field(default_factory=list)
+
+
+class ExtractedConceptsResponse(BaseModel):
+    """Container of extracted concepts emitted by LLM concept extraction."""
+
+    concepts: list[ExtractedConceptItem] = Field(default_factory=list)
+
+
+class IngestionState(TypedDict):
+    """LangGraph workflow state for the unified ingestion pipeline."""
+
+    input_target: str               # file path string or URL
+    source_type: str                # pdf, pptx, markdown, docx, youtube, web, audio, auto
+    user_id: str
+    custom_title: Optional[str]
+    material_id: str
+    title: str
+    origin_name: str
+    raw_text: str
+    structured_preview: list[dict[str, Any]]
+    raw_items: list[dict[str, Any]]
+    chunks: list[dict[str, Any]]
+    concepts: list[dict[str, Any]]
+    edges: list[list[str]]
+    error: Optional[str]
+
+
+# ---------------------------------------------------------------------------
+# Route Request Schemas
+# ---------------------------------------------------------------------------
+
+class LegacyAsk(BaseModel):
+    """Request payload for the legacy /ask tutor endpoint."""
+
+    question: str
+    docId: str | None = None
+    conceptId: str | None = None
+
+
+class WebSearchRequest(BaseModel):
+    """Request payload for grounded educational web search."""
+
+    query: str
+    max_results: int = 5
+
+
+class LegacyQuizReq(BaseModel):
+    """Request payload for generating a concept quiz."""
+
+    conceptId: str | None = None
+    concept_id: str | None = None
+    user_id: str | None = None
+
+
+class RemedialQuizReq(BaseModel):
+    """Request payload for generating a targeted remedial quiz."""
+
+    conceptId: str | None = None
+    concept_id: str | None = None
+    user_id: str | None = "default"
+
+
+class LegacyAnswer(BaseModel):
+    """Request payload for submitting a quiz answer."""
+
+    questionId: str | None = None
+    conceptId: str
+    correct: bool | None = None
+    selectedIndex: int | None = None
+    studentReasoning: str | None = None
+    typedAnswer: str | None = None
+    numericAnswer: float | None = None
+    numeric_answer: float | None = None
+
+
+class LegacyEvaluateReq(BaseModel):
+    """Request payload for evaluating a student response against ground truth."""
+
+    conceptId: str
+    questionText: str = ""
+    studentAnswer: str
+    groundTruth: str = ""
+
+
+class StartSessionReq(BaseModel):
+    """Request payload for starting a diagnostic or adaptive session."""
+
+    user_id: str = "default"
+
+
+class DiagnosticSubmitReq(BaseModel):
+    """Request payload for submitting baseline diagnostic answers."""
+
+    user_id: str = "default"
+    answers: list[dict[str, Any]] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Backward-Compatibility Aliases
+# ---------------------------------------------------------------------------
+
+ChunkSchema = ChunkMetadata
+ConceptMastery = MasteryRecord
+MasteryDashboard = LearnerDashboard
+TutorResponse = TutorChatResponse
+
+

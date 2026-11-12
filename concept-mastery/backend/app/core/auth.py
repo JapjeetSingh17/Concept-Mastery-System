@@ -37,6 +37,10 @@ def verify_access_token(token: str) -> dict:
     """Verify and decode session JWT."""
     try:
         payload = jwt.decode(token, config.JWT_SECRET, algorithms=[config.JWT_ALGORITHM])
+        sub = payload.get("sub")
+        if not isinstance(sub, str) or not sub.strip():
+            raise jwt.InvalidTokenError("Missing or empty subject ('sub') claim")
+        payload["sub"] = sub.strip()
         return payload
     except jwt.ExpiredSignatureError:
         raise HTTPException(
@@ -120,15 +124,35 @@ def get_current_user(
     """
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    # 1. Extract Bearer token from header if available
+    is_dev_or_test = (
+        config.ENVIRONMENT in ("test", "development")
+        or bool(os.environ.get("PYTEST_CURRENT_TEST"))
+    )
+
+    # 1. Extract Bearer token from header if available (case-insensitive scheme)
     auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer "):
-        token = auth_header[7:].strip()
+    stripped_auth = auth_header.strip()
+    if stripped_auth:
+        parts = stripped_auth.split(None, 1)
+        if parts[0].lower() != "bearer" or len(parts) != 2 or not parts[1].strip():
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid Authorization header format",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        token = parts[1].strip()
 
     if token:
         payload = verify_access_token(token)
-        user_id = payload.get("sub")
+        user_id = str(payload.get("sub") or "").strip()
+        if not user_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token: missing subject claim",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         email = payload.get("email", "")
+        request.state.auth_source = "jwt"
 
         user_dict = store.get_user(user_id)
         if not user_dict:
@@ -140,9 +164,16 @@ def get_current_user(
             )
         return User(**user_dict)
 
-    # 2. Explicit Development User ID Header
-    dev_uid = request.headers.get("X-Dev-User-Id")
+    # 2. Explicit Development User ID Header (restricted to dev/test environments only)
+    dev_uid = (request.headers.get("X-Dev-User-Id") or "").strip()
     if dev_uid:
+        if not is_dev_or_test:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Development identity header is disabled outside development/test environments",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        request.state.auth_source = "dev_header"
         user_dict = store.get_user(dev_uid)
         if not user_dict:
             user_dict = store.upsert_user(
@@ -154,8 +185,9 @@ def get_current_user(
         return User(**user_dict)
 
     # 3. Route / Query Param Fallback for Test Harnesses & Offline Development
-    if config.ENVIRONMENT in ("test", "development") or os.environ.get("PYTEST_CURRENT_TEST"):
-        fallback_uid = request.query_params.get("user_id") or "default"
+    if is_dev_or_test:
+        request.state.auth_source = "fallback"
+        fallback_uid = (request.query_params.get("user_id") or "").strip() or "default"
         user_dict = store.get_user(fallback_uid)
         if not user_dict:
             user_dict = {

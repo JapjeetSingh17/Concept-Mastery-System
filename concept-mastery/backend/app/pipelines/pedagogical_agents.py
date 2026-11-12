@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -118,7 +119,7 @@ def _normalize_record(item: Any) -> Optional[dict]:
         "student_answer": str(data.get("student_answer") or "")[:4000].strip(),
         "student_explanation": str(data.get("student_explanation") or "")[:4000].strip(),
         "problem_solving_approach": str(data.get("problem_solving_approach") or "")[:4000].strip(),
-        "hints_used": int(data.get("hints_used") or 0),
+        "hints_used": int(llm.clamp_float(data.get("hints_used"), min_val=0.0, max_val=10_000.0, default=0.0)),
         "solution_revealed_first": bool(data.get("solution_revealed_first", False)),
         "corrected_after_feedback": bool(data.get("corrected_after_feedback", False)),
         "is_unfamiliar_example": bool(data.get("is_unfamiliar_example", False)),
@@ -177,6 +178,100 @@ def _filter_evidence_refs(claimed_refs: List[str], valid_ids: List[str]) -> List
     return list(dict.fromkeys(clean))
 
 
+def _sanitize_assessment_confidence(raw_conf: Any) -> str:
+    """Normalize confidence labels or numeric/non-finite floats into low|moderate|high."""
+    if isinstance(raw_conf, bool) or raw_conf is None:
+        return "moderate"
+    if isinstance(raw_conf, (int, float)):
+        if math.isnan(raw_conf):
+            return "low"
+        if math.isinf(raw_conf):
+            return "low" if raw_conf < 0 else "high"
+        score = llm.clamp_float(raw_conf, min_val=0.0, max_val=1.0, default=0.5)
+        if score < 0.4:
+            return "low"
+        if score < 0.75:
+            return "moderate"
+        return "high"
+
+    text = str(raw_conf).strip().lower()
+    if text in ("low", "moderate", "high"):
+        return text
+    if text in ("nan", "+nan", "-nan", "-inf", "-infinity"):
+        return "low"
+    if text in ("inf", "+inf", "infinity", "+infinity"):
+        return "high"
+    try:
+        numeric = float(text)
+    except (TypeError, ValueError):
+        return "moderate"
+    return _sanitize_assessment_confidence(numeric)
+
+
+def sanitize_agent_payload(payload: Any) -> dict:
+    """Sanitize floats and normalize schema fields in a specialist agent LLM dictionary."""
+    if not isinstance(payload, dict):
+        return {}
+    confidence = _sanitize_assessment_confidence(payload.get("assessment_confidence"))
+    cleaned = llm.sanitize_json_floats(payload)
+    if not isinstance(cleaned, dict):
+        return {}
+    cleaned["assessment_confidence"] = confidence
+    if not isinstance(cleaned.get("evidence_refs"), list):
+        cleaned["evidence_refs"] = []
+    if not isinstance(cleaned.get("identified_gaps"), list):
+        cleaned["identified_gaps"] = []
+    else:
+        cleaned["identified_gaps"] = [str(g) for g in cleaned["identified_gaps"] if g]
+    return cleaned
+
+
+def parse_agent_json_response(raw: str) -> Optional[dict]:
+    """Parse and sanitize specialist agent JSON output (fences, trailing commas, non-finite floats)."""
+    if not raw or not isinstance(raw, str):
+        return None
+    parser = getattr(llm, "parse_and_sanitize_json", llm.safe_json_loads)
+    parsed = parser(raw)
+    if isinstance(parsed, dict):
+        return sanitize_agent_payload(parsed)
+    clean = llm.extract_json_payload(raw)
+    if clean:
+        parsed = parser(clean)
+        if isinstance(parsed, dict):
+            return sanitize_agent_payload(parsed)
+    return None
+
+
+def _format_agent_user_prompt(prefix: str, user_payload: dict) -> str:
+    """Serialize sanitized evidence payload to strict JSON for specialist agent prompts."""
+    safe_payload = llm.sanitize_json_floats(user_payload)
+    return f"{prefix}\n{json.dumps(safe_payload, indent=2, allow_nan=False)}"
+
+
+def _build_llm_assessment(
+    *,
+    agent_role: str,
+    concept_id: str,
+    parsed_llm: dict,
+    valid_ids: Set[str],
+    default_findings: str,
+) -> SpecialistAgentAssessment:
+    """Validate and construct a SpecialistAgentAssessment from sanitized LLM JSON output."""
+    sanitized = sanitize_agent_payload(parsed_llm)
+    refs = _filter_evidence_refs(sanitized.get("evidence_refs", []), valid_ids)
+    confidence = _sanitize_assessment_confidence(sanitized.get("assessment_confidence"))
+    return SpecialistAgentAssessment(
+        agent_role=agent_role,
+        concept_id=concept_id,
+        evidence_refs=refs,
+        findings=str(sanitized.get("findings") or default_findings),
+        identified_gaps=[str(g) for g in sanitized.get("identified_gaps", []) if g],
+        recommended_action=str(sanitized.get("recommended_action") or ""),
+        assessment_confidence=confidence,
+        limitations=str(sanitized.get("limitations") or ""),
+    )
+
+
 def _call_llm_json(system_prompt: str, user_prompt: str, max_tokens: int = 1000) -> Optional[dict]:
     """Execute LLM call via OpenRouter/configured LLM with fallback."""
     try:
@@ -194,14 +289,7 @@ def _call_llm_json(system_prompt: str, user_prompt: str, max_tokens: int = 1000)
         if not raw:
             return None
 
-        parsed = llm.safe_json_loads(raw)
-        if isinstance(parsed, dict):
-            return parsed
-        clean = llm.extract_json_payload(raw)
-        if clean:
-            parsed = json.loads(clean, strict=False)
-            if isinstance(parsed, dict):
-                return parsed
+        return parse_agent_json_response(raw)
     except Exception as exc:
         logger.debug(f"LLM call fell back to heuristic: {exc}")
     return None
@@ -248,23 +336,19 @@ def run_teaching_agent(evidence_pkg: dict) -> SpecialistAgentAssessment:
         "course_material_chunks": course_chunks,
         "evidence_records": records,
     }
-    user_prompt = f"Evaluate student conceptual understanding based on this evidence package:\n{json.dumps(user_payload, indent=2)}"
+    user_prompt = _format_agent_user_prompt(
+        "Evaluate student conceptual understanding based on this evidence package:",
+        user_payload,
+    )
 
     parsed_llm = _call_llm_json(system_prompt, user_prompt, max_tokens=1000)
     if parsed_llm and isinstance(parsed_llm, dict):
-        refs = _filter_evidence_refs(parsed_llm.get("evidence_refs", []), valid_ids)
-        confidence = str(parsed_llm.get("assessment_confidence", "moderate")).lower()
-        if confidence not in ("low", "moderate", "high"):
-            confidence = "moderate"
-        return SpecialistAgentAssessment(
+        return _build_llm_assessment(
             agent_role="teaching_agent",
             concept_id=concept_id,
-            evidence_refs=refs,
-            findings=str(parsed_llm.get("findings") or "Student demonstrates partial conceptual understanding."),
-            identified_gaps=[str(g) for g in parsed_llm.get("identified_gaps", []) if g],
-            recommended_action=str(parsed_llm.get("recommended_action") or ""),
-            assessment_confidence=confidence,
-            limitations=str(parsed_llm.get("limitations") or ""),
+            parsed_llm=parsed_llm,
+            valid_ids=valid_ids,
+            default_findings="Student demonstrates partial conceptual understanding.",
         )
 
     # ── High-Fidelity Heuristic Fallback ──────────────────────────────────────
@@ -431,18 +515,17 @@ def run_assessment_agent(evidence_pkg: dict) -> SpecialistAgentAssessment:
         "concept_name": concept_name,
         "evidence_records": records,
     }
-    user_prompt = f"Evaluate independent assessment readiness for this evidence package:\n{json.dumps(user_payload, indent=2)}"
+    user_prompt = _format_agent_user_prompt(
+        "Evaluate independent assessment readiness for this evidence package:",
+        user_payload,
+    )
 
     parsed_llm = _call_llm_json(system_prompt, user_prompt, max_tokens=1000)
     if parsed_llm and isinstance(parsed_llm, dict):
-        refs = _filter_evidence_refs(parsed_llm.get("evidence_refs", []), valid_ids)
-        confidence = str(parsed_llm.get("assessment_confidence", "moderate")).lower()
-        if confidence not in ("low", "moderate", "high"):
-            confidence = "moderate"
-
-        findings = str(parsed_llm.get("findings") or "Independent understanding requires further testing.")
-        gaps = [str(g) for g in parsed_llm.get("identified_gaps", []) if g]
-        action = str(parsed_llm.get("recommended_action") or "")
+        sanitized = sanitize_agent_payload(parsed_llm)
+        findings = str(sanitized.get("findings") or "Independent understanding requires further testing.")
+        gaps = [str(g) for g in sanitized.get("identified_gaps", []) if g]
+        action = str(sanitized.get("recommended_action") or "")
 
         # Enforce requirement: if assistance was used, ensure 'independent understanding is not yet proven' is highlighted
         if has_assistance:
@@ -453,15 +536,15 @@ def run_assessment_agent(evidence_pkg: dict) -> SpecialistAgentAssessment:
             if "follow-up" not in action.lower():
                 action = f"Administer targeted unassisted follow-up question: 'Apply {concept_name} to a novel scenario without hints.'"
 
-        return SpecialistAgentAssessment(
+        sanitized["findings"] = findings
+        sanitized["identified_gaps"] = gaps
+        sanitized["recommended_action"] = action
+        return _build_llm_assessment(
             agent_role="assessment_agent",
             concept_id=concept_id,
-            evidence_refs=refs,
-            findings=findings,
-            identified_gaps=gaps,
-            recommended_action=action,
-            assessment_confidence=confidence,
-            limitations=str(parsed_llm.get("limitations") or ""),
+            parsed_llm=sanitized,
+            valid_ids=valid_ids,
+            default_findings="Independent understanding requires further testing.",
         )
 
     # ── High-Fidelity Heuristic Fallback ──────────────────────────────────────
@@ -595,23 +678,19 @@ def run_misconception_detective(evidence_pkg: dict) -> SpecialistAgentAssessment
         "concept_name": concept_name,
         "evidence_records": records,
     }
-    user_prompt = f"Detect potential misconceptions and contradictions in this evidence:\n{json.dumps(user_payload, indent=2)}"
+    user_prompt = _format_agent_user_prompt(
+        "Detect potential misconceptions and contradictions in this evidence:",
+        user_payload,
+    )
 
     parsed_llm = _call_llm_json(system_prompt, user_prompt, max_tokens=1000)
     if parsed_llm and isinstance(parsed_llm, dict):
-        refs = _filter_evidence_refs(parsed_llm.get("evidence_refs", []), valid_ids)
-        confidence = str(parsed_llm.get("assessment_confidence", "moderate")).lower()
-        if confidence not in ("low", "moderate", "high"):
-            confidence = "moderate"
-        return SpecialistAgentAssessment(
+        return _build_llm_assessment(
             agent_role="misconception_detective",
             concept_id=concept_id,
-            evidence_refs=refs,
-            findings=str(parsed_llm.get("findings") or "No definitive misconceptions detected."),
-            identified_gaps=[str(g) for g in parsed_llm.get("identified_gaps", []) if g],
-            recommended_action=str(parsed_llm.get("recommended_action") or ""),
-            assessment_confidence=confidence,
-            limitations=str(parsed_llm.get("limitations") or ""),
+            parsed_llm=parsed_llm,
+            valid_ids=valid_ids,
+            default_findings="No definitive misconceptions detected.",
         )
 
     # ── High-Fidelity Heuristic Fallback ──────────────────────────────────────
@@ -804,35 +883,33 @@ def run_learning_observer(evidence_pkg: dict) -> SpecialistAgentAssessment:
         "concept_name": concept_name,
         "evidence_records": records,
     }
-    user_prompt = f"Analyze longitudinal learning trajectory for this evidence history:\n{json.dumps(user_payload, indent=2)}"
+    user_prompt = _format_agent_user_prompt(
+        "Analyze longitudinal learning trajectory for this evidence history:",
+        user_payload,
+    )
 
     parsed_llm = _call_llm_json(system_prompt, user_prompt, max_tokens=1000)
     if parsed_llm and isinstance(parsed_llm, dict):
-        refs = _filter_evidence_refs(parsed_llm.get("evidence_refs", []), valid_ids)
-        confidence = str(parsed_llm.get("assessment_confidence", "moderate")).lower()
-        if confidence not in ("low", "moderate", "high"):
-            confidence = "moderate"
-
-        findings = str(parsed_llm.get("findings") or "Longitudinal trajectory analyzed.")
-        gaps = [str(g) for g in parsed_llm.get("identified_gaps", []) if g]
+        sanitized = sanitize_agent_payload(parsed_llm)
+        findings = str(sanitized.get("findings") or "Longitudinal trajectory analyzed.")
+        gaps = [str(g) for g in sanitized.get("identified_gaps", []) if g]
 
         # Enforce Rule A in LLM response if single record
         if len(records) <= 1:
             if "rule a" not in findings.lower():
                 findings += " Rule A enforced: Never assume MASTERED just because the single latest answer is correct if foundational objectives are untested."
-            confidence = "low"
+            sanitized["assessment_confidence"] = "low"
             if not any("longitudinal" in g.lower() for g in gaps):
                 gaps.append("Longitudinal persistence across sessions is unverified.")
 
-        return SpecialistAgentAssessment(
+        sanitized["findings"] = findings
+        sanitized["identified_gaps"] = gaps
+        return _build_llm_assessment(
             agent_role="learning_observer",
             concept_id=concept_id,
-            evidence_refs=refs,
-            findings=findings,
-            identified_gaps=gaps,
-            recommended_action=str(parsed_llm.get("recommended_action") or ""),
-            assessment_confidence=confidence,
-            limitations=str(parsed_llm.get("limitations") or ""),
+            parsed_llm=sanitized,
+            valid_ids=valid_ids,
+            default_findings="Longitudinal trajectory analyzed.",
         )
 
     # ── High-Fidelity Heuristic Fallback ──────────────────────────────────────

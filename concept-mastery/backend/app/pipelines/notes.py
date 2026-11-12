@@ -11,7 +11,7 @@ from typing import Literal, Optional, List, Dict, Any
 
 from ..models.schemas import SmartNoteRequest, SmartNoteResponse
 from ..core import store, llm
-from ..core.text import sentences
+from ..core.text import sentences, build_context_window, truncate_boundary_aware
 
 try:
     from app.pipelines.concept_index import GLOBAL_INDEX
@@ -51,6 +51,10 @@ def _build_deterministic_note(
     s_mech = sents[1] if len(sents) > 1 else f"Operations and state transformations execute according to deterministic structural invariants."
     s_prop = sents[2] if len(sents) > 2 else f"Boundary constraints and validation checks ensure correctness across iterative transformations."
     s_work = sents[3] if len(sents) > 3 else f"Applying {concept_name} to domain inputs yields structured, verifiable outcomes."
+
+    def _table_cell(text: str) -> str:
+        excerpt = truncate_boundary_aware(text, max_chars=60)
+        return re.sub(r"\s*\n+\s*", " ", excerpt).replace("|", "\\|")
 
     if task_type == "exam":
         title = f"High-Yield Exam Revision: {concept_name}"
@@ -182,9 +186,9 @@ Think of {concept_name} like an **air-traffic coordination matrix**: Rather than
 | Component / Parameter | Role & Operational Meaning | Grounding Citation |
 |---|---|---|
 | Primary Entity | Foundational concept: {concept_name} | {c1} |
-| Operational Rule | {s_mech[:60]}... | {c2} |
-| Invariant Boundary | {s_prop[:60]}... | {c3} |
-| Expected Output | {s_work[:60]}... | {c1} |
+| Operational Rule | {_table_cell(s_mech)} | {c2} |
+| Invariant Boundary | {_table_cell(s_prop)} | {c3} |
+| Expected Output | {_table_cell(s_work)} | {c1} |
 
 ## 3. Cloze Keywords
 1. The execution of {concept_name} relies fundamentally on **[deterministic state progression]** {c1}.
@@ -282,19 +286,6 @@ def generate_smart_note(req: SmartNoteRequest) -> SmartNoteResponse:
             except Exception as e:
                 logger.debug(f"BM25 chunk search failed: {e}")
 
-        # Fallback to 'default' user chunks if test fixture ingested into default
-        if not chunks and user_id != "default":
-            try:
-                chunks = GLOBAL_INDEX.retrieve_chunks(concept_id, max_chunks=4, user_id="default")
-            except Exception:
-                pass
-            if not chunks:
-                try:
-                    bm25_hits = GLOBAL_INDEX.search_bm25(concept_id, max_chunks=4, user_id="default")
-                    chunks = [hit[1] for hit in bm25_hits]
-                except Exception:
-                    pass
-
     # Build grounded citations list
     citations: list[str] = []
     for c in chunks:
@@ -362,10 +353,16 @@ Respond with valid JSON containing:
   "citations": ["{citations[0]}"]
 }}
 """
-        chunks_text = "\n\n".join([
-            f"--- Chunk ({getattr(c, 'locator_label', f'Page {getattr(c, 'page_number', 1)}')}) ---\n{getattr(c, 'text', '')}"
-            for c in chunks
-        ])
+        def _format_note_chunk(chunk_obj: Any, body: str) -> str:
+            loc = getattr(chunk_obj, "locator_label", None) or f"Page {getattr(chunk_obj, 'page_number', 1)}"
+            return f"--- Chunk ({loc}) ---\n{body}"
+
+        chunks_text = build_context_window(
+            chunks,
+            max_chars=6000,
+            chunk_max_chars=1800,
+            formatter=_format_note_chunk,
+        )
         user_prompt = f"""Task Type: {task_type}
 Concept: {concept_name} (ID: {concept_id})
 Custom Instructions: {custom_instructions or "None"}
@@ -494,7 +491,7 @@ def generate_note_audio(note_id: str, user_id: str = "default") -> dict:
         script_lines.append("Here are the high-yield takeaways:")
         for t in takeaways[:4]:
             script_lines.append(f"Point: {t}")
-    script_lines.append(clean_text[:1200] if len(clean_text) > 1200 else clean_text)
+    script_lines.append(truncate_boundary_aware(clean_text, max_chars=1200, suffix=""))
     script = "\n\n".join(script_lines)
 
     # Synthesize audio using app.core.tts
@@ -592,20 +589,32 @@ def export_note_artifact(
             note_sections = []
             cur_title = ""
             cur_bullets = []
+            in_code_fence = False
+            in_display_math = False
             for line in note.get("markdown_content", "").split("\n"):
+                stripped_l = line.strip()
+                if stripped_l.startswith("```"):
+                    in_code_fence = not in_code_fence
+                    continue
+                if stripped_l.startswith("$$"):
+                    if stripped_l == "$$" or not stripped_l.endswith("$$"):
+                        in_display_math = not in_display_math
+                    continue
+                if in_code_fence or in_display_math:
+                    continue
                 if line.startswith("## "):
                     if cur_title and cur_bullets:
                         note_sections.append((cur_title, cur_bullets[:4]))
                         cur_bullets = []
                     cur_title = line.replace("## ", "").strip()
-                elif line.strip().startswith(("- ", "* ", "1. ", "2. ", "3. ", "4. ")):
-                    clean_b = re.sub(r"^[-*\d.]+\s*", "", line.strip())
+                elif stripped_l.startswith(("- ", "* ", "1. ", "2. ", "3. ", "4. ")):
+                    clean_b = re.sub(r"^[-*\d.]+\s*", "", stripped_l)
                     clean_b = re.sub(r"\[(Page|Slide|\d+:\d+)\s*.*?\]", "", clean_b).strip()
                     if len(clean_b) > 8:
-                        cur_bullets.append(clean_b[:120])
-                elif line.strip() and not line.startswith("#") and not line.startswith("|") and not line.startswith("$$"):
-                    if len(cur_bullets) < 4 and len(line.strip()) > 15:
-                        cur_bullets.append(line.strip()[:120])
+                        cur_bullets.append(truncate_boundary_aware(clean_b, 120, suffix=""))
+                elif stripped_l and not line.startswith("#") and not line.startswith("|"):
+                    if len(cur_bullets) < 4 and len(stripped_l) > 15:
+                        cur_bullets.append(truncate_boundary_aware(stripped_l, 120, suffix=""))
 
             if cur_title and cur_bullets:
                 note_sections.append((cur_title, cur_bullets[:4]))

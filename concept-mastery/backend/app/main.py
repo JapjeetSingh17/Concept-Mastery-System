@@ -1,5 +1,6 @@
 """Main FastAPI Application Entrypoint."""
 
+from contextlib import asynccontextmanager
 import re
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,10 +12,18 @@ from .core import store
 from .pipelines import mastery
 from .routes import router
 
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    config.validate_startup_config()
+    yield
+
+
 app = FastAPI(
     title="Closed-Loop Concept Mastery Platform",
     description="Vectorless RAG, Prerequisite Concept Graph (DAG), Socratic Guardrails, and LangGraph Engine.",
-    version="2.0.0"
+    version="2.0.0",
+    lifespan=lifespan,
 )
 
 # CORS middleware for development and deployment

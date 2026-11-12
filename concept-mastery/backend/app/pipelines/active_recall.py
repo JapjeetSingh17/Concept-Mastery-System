@@ -518,7 +518,9 @@ def generate_micro_lesson(
             explanation=card_data["core_intuition"],
             source_page=expanded_chunks[0].page_number if expanded_chunks else 1,
         )
-        quiz.REGISTRY[fallback_qid] = vq_fallback.model_dump()
+        reg_entry = vq_fallback.model_dump()
+        reg_entry["user_id"] = user_id
+        quiz.REGISTRY[fallback_qid] = reg_entry
         verification_q = vq_fallback.model_dump()
 
     return {
@@ -622,6 +624,8 @@ def evaluate_session(
     session = store.get_active_recall_session(session_id) if session_id else None
     if session_id and not session:
         raise store.UserError(f"Active recall session '{session_id}' not found.")
+    if session and session.get("user_id") != user_id:
+        raise PermissionError(f"Active recall session '{session_id}' does not belong to user '{user_id}'.")
     if not session:
         sessions = store.list_active_recall_sessions(user_id=user_id, limit=20)
         matching = [s for s in sessions if s.get("concept_id") == concept_id]
@@ -630,7 +634,7 @@ def evaluate_session(
             session_id = session.get("session_id", session_id)
         else:
             study_card = start_session(user_id=user_id, concept_id=concept_id)
-            session = store.get_active_recall_session(study_card.session_id)
+            session = store.get_active_recall_session_for_user(study_card.session_id, user_id=user_id)
             session_id = study_card.session_id
     if not session:
         raise store.UserError(f"Active recall session '{session_id}' not found.")
@@ -791,9 +795,10 @@ def evaluate_session(
     )
     mastery_status = mastery_record.get("state", "UNKNOWN")
 
-    # 4. Save/Update Session in SQLite
-    store.update_active_recall_session(
+    # 4. Save/Update Session in SQLite (tenant-scoped)
+    store.update_active_recall_session_for_user(
         session_id=session_id,
+        user_id=user_id,
         updates={
             "recall_submission_text": clean_recall,
             "retrieval_score": retrieval_score,

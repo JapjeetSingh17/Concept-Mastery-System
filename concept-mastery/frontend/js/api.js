@@ -3,11 +3,32 @@
  * Centralized communication layer connecting the frontend to FastAPI backend endpoints.
  */
 
+function isMockModeEnabled() {
+  try {
+    if (typeof window !== "undefined" && window.location && typeof window.location.search === "string") {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get("mock") === "true") return true;
+    }
+  } catch {}
+  try {
+    if (typeof localStorage !== "undefined" && localStorage.getItem("USE_MOCK") === "true") {
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
 const API_CONFIG = {
-  mock: false,
   base: "",
   storageKey: "concept_mastery_config_v1"
 };
+Object.defineProperty(API_CONFIG, "mock", {
+  enumerable: true,
+  configurable: true,
+  get() {
+    return isMockModeEnabled();
+  }
+});
 
 /**
  * Automatically determine the backend base URL.
@@ -31,12 +52,11 @@ function getEffectiveBase() {
   return getAutoBackendBase();
 }
 
-// Load persisted configuration if available
+// Load persisted base URL if available (mock mode is never auto-enabled from saved config)
 try {
   const saved = localStorage.getItem(API_CONFIG.storageKey);
   if (saved) {
     const parsed = JSON.parse(saved);
-    if (typeof parsed.mock === "boolean") API_CONFIG.mock = parsed.mock;
     if (typeof parsed.base === "string" && parsed.base.trim()) API_CONFIG.base = parsed.base.trim();
   }
 } catch (e) {
@@ -87,18 +107,58 @@ const ENDPOINTS = {
   artifactFile:        { method: "GET",    path: "/api/artifacts/{filename}" }
 };
 
+const IN_FLIGHT_REQUESTS = new Map();
+const ABORT_SCOPES = new Map();
+
+function createAbortError(message = "Request aborted") {
+  if (typeof DOMException !== "undefined") {
+    return new DOMException(message, "AbortError");
+  }
+  const err = new Error(message);
+  err.name = "AbortError";
+  return err;
+}
+
+function buildFormDataSignature(formData) {
+  const parts = [];
+  if (typeof formData.entries === "function") {
+    for (const [k, v] of formData.entries()) {
+      if (typeof File !== "undefined" && v instanceof File) {
+        parts.push(`${k}:file:${v.name}:${v.size}:${v.lastModified}`);
+      } else {
+        parts.push(`${k}:${String(v)}`);
+      }
+    }
+  }
+  return parts.join("|");
+}
+
+function buildDedupeKey(endpointKey, method, url, payload, options) {
+  if (options && options.dedupe === false) return null;
+  if (options && options.dedupeKey) return `${endpointKey}:${options.dedupeKey}`;
+  let bodySig = "";
+  if (typeof FormData !== "undefined" && payload instanceof FormData) {
+    bodySig = buildFormDataSignature(payload);
+  } else if (payload && method !== "GET") {
+    try {
+      bodySig = JSON.stringify(payload);
+    } catch {
+      return null;
+    }
+  }
+  return `${endpointKey}:${method}:${url}:${bodySig}`;
+}
+
 /**
- * Core API caller with error parsing and mock support
+ * Core API caller with error parsing, in-flight deduplication, AbortController support, and mock support
  */
 async function callApi(endpointKey, payload = null, options = {}) {
   const ep = ENDPOINTS[endpointKey];
   if (!ep) throw new Error(`Unknown endpoint: ${endpointKey}`);
 
-  if (API_CONFIG.mock) {
-    if (typeof MOCK !== "undefined" && typeof MOCK[endpointKey] === "function") {
-      return await MOCK[endpointKey](payload);
-    }
-    throw new Error(`Mock implementation missing for ${endpointKey}`);
+  const externalSignal = options && options.signal ? options.signal : null;
+  if (externalSignal && externalSignal.aborted) {
+    throw createAbortError();
   }
 
   const base = getEffectiveBase();
@@ -113,73 +173,194 @@ async function callApi(endpointKey, payload = null, options = {}) {
     const qs = new URLSearchParams(options.params).toString();
     if (qs) url += (url.includes("?") ? "&" : "?") + qs;
   }
-  const fetchOpts = {
-    method: ep.method,
-    headers: {}
-  };
 
-  const authToken = ApiService.getToken();
-  if (authToken) {
-    fetchOpts.headers["Authorization"] = `Bearer ${authToken}`;
-  }
+  const dedupeKey = buildDedupeKey(endpointKey, ep.method, url, payload, options);
+  let entry = dedupeKey ? IN_FLIGHT_REQUESTS.get(dedupeKey) : null;
 
-  if (payload instanceof FormData) {
-    fetchOpts.body = payload;
-  } else if (payload && ep.method !== "GET") {
-    fetchOpts.headers["Content-Type"] = "application/json";
-    fetchOpts.body = JSON.stringify(payload);
-  }
+  if (!entry || entry.controller.signal.aborted) {
+    const controller = typeof AbortController !== "undefined" ? new AbortController() : { signal: { aborted: false }, abort() {} };
+    const execPromise = (async () => {
+      if (isMockModeEnabled()) {
+        if (typeof MOCK === "undefined" && typeof window !== "undefined" && window.__MOCK_READY__) {
+          await window.__MOCK_READY__.catch(() => {});
+        }
+        if (typeof MOCK !== "undefined" && typeof MOCK[endpointKey] === "function") {
+          return await MOCK[endpointKey](payload, { signal: controller.signal });
+        }
+        throw new Error(`Mock implementation missing for ${endpointKey}`);
+      }
 
-  let response;
-  try {
-    response = await fetch(url, fetchOpts);
-  } catch (netErr) {
-    throw new Error(`Network error connecting to backend: ${netErr.message}`);
-  }
+      const fetchOpts = {
+        method: ep.method,
+        headers: {},
+        signal: controller.signal
+      };
 
-  if (response.status === 401) {
-    ApiService.clearAuth();
-    if (typeof window !== "undefined") {
-      window.dispatchEvent(new CustomEvent("cm:unauthorized"));
+      const authToken = ApiService.getToken();
+      if (authToken) {
+        fetchOpts.headers["Authorization"] = `Bearer ${authToken}`;
+      }
+
+      if (typeof FormData !== "undefined" && payload instanceof FormData) {
+        fetchOpts.body = payload;
+      } else if (payload && ep.method !== "GET") {
+        fetchOpts.headers["Content-Type"] = "application/json";
+        fetchOpts.body = JSON.stringify(payload);
+      }
+
+      let response;
+      try {
+        response = await fetch(url, fetchOpts);
+      } catch (netErr) {
+        if ((netErr && netErr.name === "AbortError") || controller.signal.aborted) {
+          throw createAbortError(netErr && netErr.message ? netErr.message : "Request aborted");
+        }
+        const err = new Error(`Network error connecting to backend: ${netErr.message}`);
+        err.status = 0;
+        err.endpoint = endpointKey;
+        if (typeof window !== "undefined" && !(options && options.silentError)) {
+          window.dispatchEvent(new CustomEvent("cm:api-error", {
+            detail: { endpointKey, status: 0, message: err.message, method: ep.method, path: cleanPath, error: err }
+          }));
+        }
+        throw err;
+      }
+
+      if (response.status === 401) {
+        ApiService.clearAuth();
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(new CustomEvent("cm:unauthorized"));
+        }
+      }
+
+      let data;
+      const contentType = response.headers.get("content-type") || "";
+      if (contentType.includes("application/json")) {
+        try {
+          data = await response.json();
+        } catch (e) {
+          data = null;
+        }
+      } else {
+        data = await response.text();
+      }
+
+      if (!response.ok) {
+        let message = "";
+        if (data && typeof data === "object") {
+          message = data.detail || data.message || data.error;
+        } else if (typeof data === "string") {
+          message = data;
+        }
+        const finalMsg = message || `${endpointKey} failed with HTTP ${response.status}`;
+        const err = new Error(finalMsg);
+        err.status = response.status;
+        err.endpoint = endpointKey;
+        if (typeof window !== "undefined" && !(options && options.silentError)) {
+          window.dispatchEvent(new CustomEvent("cm:api-error", {
+            detail: { endpointKey, status: response.status, message: finalMsg, method: ep.method, path: cleanPath, error: err }
+          }));
+        }
+        throw err;
+      }
+
+      return data;
+    })().finally(() => {
+      if (dedupeKey && IN_FLIGHT_REQUESTS.get(dedupeKey) === entry) {
+        IN_FLIGHT_REQUESTS.delete(dedupeKey);
+      }
+    });
+
+    entry = { controller, promise: execPromise, subscribers: 0 };
+    if (dedupeKey) {
+      IN_FLIGHT_REQUESTS.set(dedupeKey, entry);
     }
   }
 
-  let data;
-  const contentType = response.headers.get("content-type") || "";
-  if (contentType.includes("application/json")) {
+  if (!externalSignal) {
+    entry.subscribers += 1;
     try {
-      data = await response.json();
-    } catch (e) {
-      data = null;
+      return await entry.promise;
+    } finally {
+      entry.subscribers = Math.max(0, entry.subscribers - 1);
     }
-  } else {
-    data = await response.text();
   }
 
-  if (!response.ok) {
-    let message = "";
-    if (data && typeof data === "object") {
-      message = data.detail || data.message || data.error;
-    } else if (typeof data === "string") {
-      message = data;
-    }
-    throw new Error(message || `${endpointKey} failed with HTTP ${response.status}`);
-  }
+  entry.subscribers += 1;
+  return await new Promise((resolve, reject) => {
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      externalSignal.removeEventListener("abort", onAbort);
+      entry.subscribers = Math.max(0, entry.subscribers - 1);
+      if (entry.subscribers === 0) {
+        entry.controller.abort();
+        if (dedupeKey && IN_FLIGHT_REQUESTS.get(dedupeKey) === entry) {
+          IN_FLIGHT_REQUESTS.delete(dedupeKey);
+        }
+      }
+      reject(createAbortError());
+    };
 
-  return data;
+    if (externalSignal.aborted) {
+      onAbort();
+      return;
+    }
+
+    externalSignal.addEventListener("abort", onAbort, { once: true });
+    entry.promise.then(
+      val => {
+        if (settled) return;
+        settled = true;
+        externalSignal.removeEventListener("abort", onAbort);
+        entry.subscribers = Math.max(0, entry.subscribers - 1);
+        resolve(val);
+      },
+      err => {
+        if (settled) return;
+        settled = true;
+        externalSignal.removeEventListener("abort", onAbort);
+        entry.subscribers = Math.max(0, entry.subscribers - 1);
+        reject(err);
+      }
+    );
+  });
 }
 
 // Convenience API services
 const ApiService = {
-  async getHealth() {
-    return callApi("health");
+  beginAbortScope(scopeKey = "navigation") {
+    const prev = ABORT_SCOPES.get(scopeKey);
+    if (prev && typeof prev.abort === "function") {
+      prev.abort();
+    }
+    const next = typeof AbortController !== "undefined" ? new AbortController() : { signal: { aborted: false }, abort() {} };
+    ABORT_SCOPES.set(scopeKey, next);
+    return next;
   },
 
-  async getIngestStatus() {
-    return callApi("ingestStatus");
+  abortScope(scopeKey = "navigation") {
+    const active = ABORT_SCOPES.get(scopeKey);
+    if (active && typeof active.abort === "function") {
+      active.abort();
+    }
+    ABORT_SCOPES.delete(scopeKey);
   },
 
-  async uploadPdf(files) {
+  getInFlightCount() {
+    return IN_FLIGHT_REQUESTS.size;
+  },
+
+  async getHealth(options = {}) {
+    return callApi("health", null, options);
+  },
+
+  async getIngestStatus(options = {}) {
+    return callApi("ingestStatus", null, options);
+  },
+
+  async uploadPdf(files, options = {}) {
     const formData = new FormData();
     if (files instanceof FileList || Array.isArray(files)) {
       for (let i = 0; i < files.length; i++) {
@@ -188,54 +369,54 @@ const ApiService = {
     } else if (files instanceof File) {
       formData.append("files", files);
     }
-    return callApi("ingest", formData);
+    return callApi("ingest", formData, options);
   },
 
-  async searchWeb(query, maxResults = 5) {
-    return callApi("webSearch", { query, max_results: maxResults });
+  async searchWeb(query, maxResults = 5, options = {}) {
+    return callApi("webSearch", { query, max_results: maxResults }, options);
   },
 
-  async loadSamplePdf() {
-    return callApi("ingestSample");
+  async loadSamplePdf(options = {}) {
+    return callApi("ingestSample", null, options);
   },
 
-  async askTutor(question, docId = null) {
-    return callApi("ask", { question, docId });
+  async askTutor(question, docId = null, options = {}) {
+    return callApi("ask", { question, docId }, options);
   },
 
-  async getGraph() {
-    return callApi("graph");
+  async getGraph(options = {}) {
+    return callApi("graph", null, options);
   },
 
-  async getConceptsGraph() {
-    return callApi("conceptsGraph");
+  async getConceptsGraph(options = {}) {
+    return callApi("conceptsGraph", null, options);
   },
 
-  async getMasteryDashboard() {
-    return callApi("masteryDashboard");
+  async getMasteryDashboard(options = {}) {
+    return callApi("masteryDashboard", null, options);
   },
 
-  async getLoopNextAction() {
-    return callApi("loopNextAction");
+  async getLoopNextAction(options = {}) {
+    return callApi("loopNextAction", null, options);
   },
 
-  async evaluateAnswer(conceptId, questionText, studentAnswer, groundTruth = "") {
+  async evaluateAnswer(conceptId, questionText, studentAnswer, groundTruth = "", options = {}) {
     return callApi("quizEvaluate", {
       conceptId,
       questionText,
       studentAnswer,
       groundTruth
-    });
+    }, options);
   },
 
-  async getNextQuestion(conceptId = null) {
-    return callApi("quizNext", { conceptId });
+  async getNextQuestion(conceptId = null, options = {}) {
+    return callApi("quizNext", { conceptId }, options);
   },
 
   /**
    * Submit quiz answer for authoritative backend evaluation (supports MCQ, FITB, Typed Q&A, and Numerical)
    */
-  async submitAnswer(questionId, conceptId, selectedIndex = null, correct = null, studentReasoning = "", typedAnswer = "", numericAnswer = null) {
+  async submitAnswer(questionId, conceptId, selectedIndex = null, correct = null, studentReasoning = "", typedAnswer = "", numericAnswer = null, options = {}) {
     const payload = {
       questionId,
       conceptId,
@@ -246,30 +427,30 @@ const ApiService = {
       numericAnswer: numericAnswer !== null && numericAnswer !== undefined ? numericAnswer : undefined,
       numeric_answer: numericAnswer !== null && numericAnswer !== undefined ? numericAnswer : undefined
     };
-    return callApi("quizAnswer", payload);
+    return callApi("quizAnswer", payload, options);
   },
 
-  async getLoopStatus(userId = "default") {
-    return callApi("loopStatus", null, { params: { user_id: userId } });
+  async getLoopStatus(userId = "default", options = {}) {
+    return callApi("loopStatus", null, { ...options, params: { user_id: userId } });
   },
 
-  async startDiagnostic(userId = "default") {
-    return callApi("diagnosticStart", { user_id: userId });
+  async startDiagnostic(userId = "default", options = {}) {
+    return callApi("diagnosticStart", { user_id: userId }, options);
   },
 
-  async submitDiagnostic(answers, userId = "default") {
-    return callApi("diagnosticSubmit", { user_id: userId, answers });
+  async submitDiagnostic(answers, userId = "default", options = {}) {
+    return callApi("diagnosticSubmit", { user_id: userId, answers }, options);
   },
 
-  async getRemedialQuiz(conceptId = null, userId = "default") {
-    return callApi("quizRemedial", { concept_id: conceptId, conceptId, user_id: userId });
+  async getRemedialQuiz(conceptId = null, userId = "default", options = {}) {
+    return callApi("quizRemedial", { concept_id: conceptId, conceptId, user_id: userId }, options);
   },
 
-  async startActiveRecall(conceptId, userId = "default") {
-    return callApi("activeRecallStart", { concept_id: conceptId, user_id: userId });
+  async startActiveRecall(conceptId, userId = "default", options = {}) {
+    return callApi("activeRecallStart", { concept_id: conceptId, user_id: userId }, options);
   },
 
-  async evaluateActiveRecall(conceptId, recallText, verificationAnswer = "", studyDurationSeconds = 0, userId = "default", sessionId = "") {
+  async evaluateActiveRecall(conceptId, recallText, verificationAnswer = "", studyDurationSeconds = 0, userId = "default", sessionId = "", options = {}) {
     return callApi("activeRecallEvaluate", {
       concept_id: conceptId,
       recall_text: recallText,
@@ -277,55 +458,56 @@ const ApiService = {
       study_duration_seconds: studyDurationSeconds,
       user_id: userId,
       session_id: sessionId
-    });
+    }, options);
   },
 
-  async getActiveRecallHistory(conceptId = null, userId = "default") {
+  async getActiveRecallHistory(conceptId = null, userId = "default", options = {}) {
     const params = { user_id: userId };
     if (conceptId) params.concept_id = conceptId;
-    return callApi("activeRecallHistory", null, { params });
+    return callApi("activeRecallHistory", null, { ...options, params });
   },
 
-  async getMastery() {
-    return callApi("mastery");
+  async getMastery(options = {}) {
+    return callApi("mastery", null, options);
   },
 
-  async resetMastery() {
-    return callApi("masteryReset");
+  async resetMastery(options = {}) {
+    return callApi("masteryReset", null, options);
   },
 
-  async getRecommendations() {
-    return callApi("recommend");
+  async getRecommendations(options = {}) {
+    return callApi("recommend", null, options);
   },
 
-  async listMaterials(userId = "default") {
-    return callApi("materialsList", null, { params: { user_id: userId } });
+  async listMaterials(userId = "default", options = {}) {
+    return callApi("materialsList", null, { ...options, params: { user_id: userId } });
   },
 
-  async ingestMaterialFile(files, userId = "default", title = "") {
+  async ingestMaterialFile(files, userId = "default", title = "", options = {}) {
     const formData = new FormData();
     const fileList = Array.isArray(files) ? files : [files];
     fileList.forEach(f => formData.append("files", f));
     if (userId) formData.append("user_id", userId);
     if (title) formData.append("title", title);
-    return callApi("materialsIngestFile", formData);
+    return callApi("materialsIngestFile", formData, options);
   },
 
-  async ingestMaterialUrl(url, sourceType = "auto", userId = "default", title = "") {
+  async ingestMaterialUrl(url, sourceType = "auto", userId = "default", title = "", options = {}) {
     return callApi("materialsIngestUrl", {
       url: url.trim(),
       source_type: sourceType,
       user_id: userId,
       title: title || undefined
-    });
+    }, options);
   },
 
-  async getMaterialPreview(materialId) {
-    return callApi("materialsPreview", null, { pathParams: { material_id: materialId } });
+  async getMaterialPreview(materialId, options = {}) {
+    return callApi("materialsPreview", null, { ...options, pathParams: { material_id: materialId } });
   },
 
-  async deleteMaterial(materialId, userId = "default") {
+  async deleteMaterial(materialId, userId = "default", options = {}) {
     return callApi("materialsDelete", null, {
+      ...options,
       pathParams: { material_id: materialId },
       params: { user_id: userId }
     });
@@ -333,63 +515,67 @@ const ApiService = {
 
   // ── Smart Study Notes & Multimodal Artifacts ───────────────────────────────
 
-  async generateNote(req) {
-    return callApi("notesGenerate", req);
+  async generateNote(req, options = {}) {
+    return callApi("notesGenerate", req, options);
   },
 
-  async getNotes(conceptId = null, userId = null) {
+  async getNotes(conceptId = null, userId = null, options = {}) {
     const params = {};
     if (conceptId) params.concept_id = conceptId;
     if (userId) params.user_id = userId;
-    const res = await callApi("notesList", null, { params });
+    const res = await callApi("notesList", null, { ...options, params });
     return Array.isArray(res) ? res : (res && Array.isArray(res.notes) ? res.notes : []);
   },
 
-  async deleteNote(noteId, userId = null) {
+  async deleteNote(noteId, userId = null, options = {}) {
     const params = {};
     if (userId) params.user_id = userId;
     return callApi("notesDelete", null, {
+      ...options,
       pathParams: { note_id: noteId },
       params
     });
   },
 
-  async generateNoteAudio(noteId, userId = null) {
+  async generateNoteAudio(noteId, userId = null, options = {}) {
     const params = {};
     if (userId) params.user_id = userId;
     return callApi("notesAudio", null, {
+      ...options,
       pathParams: { note_id: noteId },
       params
     });
   },
 
-  async exportNoteArtifact(noteId, exportFormat = "pdf", userId = null) {
+  async exportNoteArtifact(noteId, exportFormat = "pdf", userId = null, options = {}) {
     const fmt = exportFormat.toLowerCase().trim();
     const params = { export_format: fmt };
     if (userId) params.user_id = userId;
     return callApi("notesExport", { export_format: fmt }, {
+      ...options,
       pathParams: { note_id: noteId },
       params
     });
   },
 
-  async generateDeepAudio(materialId, sectionOrSlideIndex = 0, userId = null) {
+  async generateDeepAudio(materialId, sectionOrSlideIndex = 0, userId = null, options = {}) {
     return callApi("materialDeepAudio", {
       section_or_slide_index: sectionOrSlideIndex,
       user_id: userId || "default"
     }, {
+      ...options,
       pathParams: { material_id: materialId }
     });
   },
 
-  async generateToolArtifact(toolType, conceptId, prompt = "", slideCount = 5, userId = null) {
+  async generateToolArtifact(toolType, conceptId, prompt = "", slideCount = 5, userId = null, options = {}) {
     return callApi("toolsGenerate", {
       tool_type: toolType,
       concept_id: conceptId,
       prompt: prompt || "",
       slide_count: slideCount,
       user_id: userId || "default"
-    });
+    }, options);
   },
 
   getArtifactUrl(pathOrFilename) {
@@ -462,16 +648,16 @@ const ApiService = {
     return res;
   },
 
-  async getCurrentUser() {
-    return callApi("authMe");
+  async getCurrentUser(options = {}) {
+    return callApi("authMe", null, options);
   },
 
-  async getLoginLogs(limit = 10) {
-    return callApi("authLogs", null, { params: { limit } });
+  async getLoginLogs(limit = 10, options = {}) {
+    return callApi("authLogs", null, { ...options, params: { limit } });
   },
 
-  async getAuthConfig() {
-    return callApi("authConfig");
+  async getAuthConfig(options = {}) {
+    return callApi("authConfig", null, options);
   },
 
   logout() {
@@ -479,11 +665,23 @@ const ApiService = {
     return true;
   },
 
+  isMockMode() {
+    return isMockModeEnabled();
+  },
+
   saveConfig(newConfig) {
-    Object.assign(API_CONFIG, newConfig);
+    if (newConfig && typeof newConfig.base === "string") {
+      API_CONFIG.base = newConfig.base;
+    }
     try {
+      if (newConfig && typeof newConfig.mock === "boolean") {
+        if (newConfig.mock) {
+          localStorage.setItem("USE_MOCK", "true");
+        } else {
+          localStorage.removeItem("USE_MOCK");
+        }
+      }
       localStorage.setItem(API_CONFIG.storageKey, JSON.stringify({
-        mock: API_CONFIG.mock,
         base: API_CONFIG.base
       }));
     } catch (e) {
@@ -494,6 +692,7 @@ const ApiService = {
   getConfig() {
     return {
       ...API_CONFIG,
+      mock: isMockModeEnabled(),
       effectiveBase: getEffectiveBase()
     };
   }
@@ -507,5 +706,10 @@ function getConceptStatus(concept) {
   return concept.score >= 0.7 ? "strong" : "weak";
 }
 
-window.ApiService = ApiService;
-window.getConceptStatus = getConceptStatus;
+if (typeof window !== "undefined") {
+  window.ApiService = ApiService;
+  window.getConceptStatus = getConceptStatus;
+}
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = { ApiService, getConceptStatus, callApi, ENDPOINTS };
+}
