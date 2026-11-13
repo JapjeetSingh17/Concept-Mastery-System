@@ -375,6 +375,7 @@ async function createAppHarness(routeHandlers) {
     },
     set(val) {
       quizRawHtml = String(val);
+      registerIdsFromHtml(quizRawHtml);
       if (quizRawHtml.includes('id="btn-quiz-submit"')) {
         const submitBtn = makeStubContainer("btn-quiz-submit", "BUTTON");
         submitBtn.textContent = "Submit Answer";
@@ -394,6 +395,10 @@ async function createAppHarness(routeHandlers) {
     }
   });
   quizBox.querySelectorAll = sel => (sel === ".quiz-opt-btn" ? quizOptButtons : []);
+  quizBox.querySelector = sel => {
+    if (sel.startsWith("#")) return byId.get(sel.slice(1)) || null;
+    return null;
+  };
 
   let viewRawHtml = "";
   Object.defineProperty(viewEl, "innerHTML", {
@@ -584,7 +589,7 @@ async function testQuizDoubleClickPreventsCounterOverflow() {
 
   const harness = await createAppHarness(async ({ pathname, opts }) => {
     if (pathname === "/api/materials") return jsonResponse({ materials: [{ id: "m1", title: "ML Notes", chunk_count: 3, concept_count: 2 }] });
-    if (pathname === "/api/mastery") return jsonResponse({ concepts: [{ id: "c1", name: "Gradient Descent", score: 0.5, attempts: 1 }] });
+    if (pathname === "/api/mastery") return jsonResponse({ concepts: [{ id: "c1", name: "Gradient Descent", score: 0.95, attempts: 5, status: "strong", state: "strong", brier_score: 0.1 }] });
     if (pathname === "/api/quiz/next") {
       nextQuestionCalls += 1;
       const d = createDeferred();
@@ -1622,6 +1627,129 @@ async function testBaselineDiagnosticGatingAndStudyGuideReport() {
   assert.ok(css.includes(".study-guide-section"), "styles.css must include .study-guide-section");
 }
 
+async function testTeachBeforeTestMicroLessonAndRemediation() {
+  const { ApiService } = createApiSandbox(() => Promise.resolve({ ok: true, json: async () => ({}) }));
+  assert.equal(typeof ApiService.teachConcept, "function", "ApiService.teachConcept must be defined");
+
+  // Verify CSS styles include micro-lesson and remediation classes
+  const css = fs.readFileSync(path.join(__dirname, "../css/styles.css"), "utf8");
+  assert.ok(css.includes(".micro-lesson-container"), "styles.css must include .micro-lesson-container");
+  assert.ok(css.includes(".micro-lesson-section"), "styles.css must include .micro-lesson-section");
+  assert.ok(css.includes(".micro-lesson-checkpoint-bar"), "styles.css must include .micro-lesson-checkpoint-bar");
+  assert.ok(css.includes(".remediation-card"), "styles.css must include .remediation-card");
+  assert.ok(css.includes(".remediation-verif-box"), "styles.css must include .remediation-verif-box");
+  assert.ok(css.includes(".remediation-opt-btn"), "styles.css must include .remediation-opt-btn");
+
+  let teachConceptCalls = 0;
+  let nextQuestionCalls = 0;
+  let submitAnswerCalls = 0;
+
+  const harness = await createAppHarness(async ({ pathname, opts }) => {
+    if (pathname === "/api/materials") {
+      return jsonResponse({ materials: [{ id: "m1", title: "ML Lecture", chunk_count: 5, concept_count: 1 }] });
+    }
+    if (pathname === "/api/mastery") {
+      // Weak / unassessed concept => requires Teach Before Test
+      return jsonResponse({ concepts: [{ id: "attention", name: "Attention Mechanism", score: 0.2, attempts: 1, status: "weak" }] });
+    }
+    if (pathname === "/api/mastery/teach-concept") {
+      teachConceptCalls++;
+      return jsonResponse({
+        ok: true,
+        lesson: {
+          concept_id: "attention",
+          concept_name: "Attention Mechanism",
+          prerequisites: ["Softmax", "Dot Product"],
+          citations: ["Page 4", "12:30"],
+          big_picture_intuition: "Attention dynamically routes information across sequence elements.",
+          material_deep_dive: "As stated on Page 4, attention computes alignment scores between queries and keys.",
+          worked_example: "Given query q and key k, compute dot product and apply softmax.",
+          common_pitfalls: ["Confusing query and key roles", "Ignoring scale factor"]
+        }
+      });
+    }
+    if (pathname === "/api/quiz/next") {
+      nextQuestionCalls++;
+      return jsonResponse({
+        id: "q_attn_1",
+        conceptId: "attention",
+        conceptName: "Attention Mechanism",
+        questionType: "mcq",
+        question: "What scales the dot products in self-attention?",
+        options: ["Square root of key dimension", "Number of layers", "Batch size", "Learning rate"],
+        correct: 0
+      });
+    }
+    if (pathname === "/api/quiz/answer") {
+      submitAnswerCalls++;
+      return jsonResponse({
+        correct: false,
+        correctIndex: 0,
+        explanation: "Attention uses sqrt(d_k) to prevent gradient vanishing.",
+        remediation: {
+          concept_id: "attention",
+          concept_name: "Attention Mechanism",
+          misconception_diagnosis: "You selected batch size, confusing batch normalization with attention scaling.",
+          grounded_rule: "Page 4 dictates scaling by sqrt(d_k) to stabilize softmax gradients.",
+          missing_step: "Divide dot products by the square root of vector dimension before applying softmax.",
+          citations: ["Page 4"],
+          follow_up_question: {
+            question_text: "Why is the scale factor sqrt(d_k) applied?",
+            options: ["To prevent softmax variance from exploding into vanishing gradients", "To accelerate GPU transfer"],
+            correct_option_idx: 0,
+            explanation: "Correct! Softmax saturates when dot products grow large."
+          }
+        }
+      });
+    }
+    return jsonResponse({});
+  });
+
+  // Navigate to #practice
+  harness.windowObj.location.hash = "#practice";
+  const hashListeners = [...(harness.windowObj.__winListeners.get("hashchange") || [])];
+  assert.equal(hashListeners.length, 1);
+  hashListeners[0]();
+
+  await new Promise(r => setTimeout(r, 25));
+
+  // Verify Teach Before Test micro-lesson rendered
+  assert.equal(teachConceptCalls, 1, "Must call /api/mastery/teach-concept before testing weak concept");
+  assert.ok(harness.quizBox.innerHTML.includes("Step 1: Concept Mastery Micro-Lesson"), "Must render micro-lesson header");
+  assert.ok(harness.quizBox.innerHTML.includes("Attention dynamically routes information"), "Must render Big Picture pillar");
+  assert.ok(harness.quizBox.innerHTML.includes("alignment scores between queries and keys"), "Must render Material Deep Dive pillar");
+  assert.ok(harness.quizBox.innerHTML.includes("Given query q and key k"), "Must render Worked Example pillar");
+
+  // Click "I Understand — Start Guided Practice"
+  const startPracticeBtn = harness.quizBox.querySelector("#btn-lesson-start-practice");
+  assert.ok(startPracticeBtn, "Must render Start Guided Practice button in Socratic Checkpoint");
+  startPracticeBtn.click();
+
+  await new Promise(r => setTimeout(r, 25));
+  assert.equal(nextQuestionCalls, 1, "Must request first quiz question after acknowledging lesson");
+
+  // Select wrong option and submit
+  const optBtns = harness.getQuizOptButtons();
+  assert.ok(optBtns.length >= 2, "Quiz question options must be rendered");
+  optBtns[1].click(); // pick option 1 (incorrect)
+
+  const submitBtn = harness.byId.get("btn-quiz-submit");
+  assert.ok(submitBtn, "Submit button must be present");
+  submitBtn.click();
+
+  await new Promise(r => setTimeout(r, 25));
+  assert.equal(submitAnswerCalls, 1, "Submit answer must be dispatched");
+
+  // Verify remediation card is rendered in feedback container
+  const feedbackBox = harness.byId.get("quiz-feedback-container");
+  assert.ok(feedbackBox, "Feedback container must exist");
+  assert.ok(feedbackBox.innerHTML.includes("id=\"quiz-remediation-block\""), "Must contain remediation card block");
+  assert.ok(feedbackBox.innerHTML.includes("Misconception Diagnosis &amp; Remediation"), "Remediation title must be present");
+  assert.ok(feedbackBox.innerHTML.includes("confusing batch normalization"), "Diagnosis content must be rendered");
+  assert.ok(feedbackBox.innerHTML.includes("Page 4 dictates scaling"), "Grounded rule with citation must be rendered");
+  assert.ok(feedbackBox.innerHTML.includes("Why is the scale factor sqrt(d_k) applied?"), "Follow-up verification question must be rendered");
+}
+
 (async function run() {
   await testApiServiceExportsAndDedupe();
   console.log("PASS: testApiServiceExportsAndDedupe");
@@ -1647,4 +1775,6 @@ async function testBaselineDiagnosticGatingAndStudyGuideReport() {
   console.log("PASS: testTutorMarkdownFormattingAndBlockElements");
   await testBaselineDiagnosticGatingAndStudyGuideReport();
   console.log("PASS: testBaselineDiagnosticGatingAndStudyGuideReport");
+  await testTeachBeforeTestMicroLessonAndRemediation();
+  console.log("PASS: testTeachBeforeTestMicroLessonAndRemediation");
 })();

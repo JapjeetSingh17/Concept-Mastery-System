@@ -2123,6 +2123,11 @@
               <button id="btn-recall-continue" class="btn btn-primary" style="width:100%;">
                 Next Concept &rarr;
               </button>
+              ${!isStrong ? `
+                <a href="#practice" class="btn btn-primary btn-sm start-target-quiz" data-target-concept="${esc(session.conceptId)}" data-force-teach="true" style="width:100%; text-align:center;">
+                  📖 Review Micro-Lesson
+                </a>
+              ` : ''}
               <a href="#practice" class="btn btn-outline btn-sm" data-target-concept="${esc(session.conceptId)}" style="width:100%; text-align:center;">
                 Test in Concept Check
               </a>
@@ -3791,7 +3796,11 @@
             <h1>Concept Check</h1>
             <p>Test your understanding of key concepts with adaptive questions generated from verified material.</p>
           </div>
-          <div class="page-header-actions" style="display:flex; align-items:center; gap:0.6rem;">
+          <div class="page-header-actions" style="display:flex; align-items:center; gap:0.6rem; flex-wrap:wrap;">
+            <button id="btn-practice-review-lesson" class="btn btn-secondary btn-sm" type="button" style="display:inline-flex; align-items:center; gap:0.4rem;" title="Review the interactive micro-lesson for this concept">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
+              <span>Review Micro-Lesson</span>
+            </button>
             <label for="practice-topic-select" style="font-size:0.85rem; font-weight:600; color:var(--ink-secondary);">Topic:</label>
             <select id="practice-topic-select" class="form-select" style="padding:0.45rem 0.85rem; border-radius:var(--radius-sm); border:1px solid var(--border-input); background:var(--surface-input); font-size:0.88rem; font-weight:600; color:var(--ink-input); cursor:pointer;">
               <option value="">🎯 Auto-Adaptive (All Concepts)</option>
@@ -5836,7 +5845,21 @@
 
     practice() {
       const targetId = AppState.quizSession.targetConceptId;
-      startNewQuizSession(targetId);
+      const forceTeach = Boolean(AppState.quizSession.forceTeach);
+      AppState.quizSession.forceTeach = false;
+      startNewQuizSession(targetId, { forceTeach });
+
+      const reviewBtn = $("#btn-practice-review-lesson");
+      if (reviewBtn) {
+        reviewBtn.onclick = () => {
+          const currentCid = resolveTargetConceptId(AppState.quizSession.currentConceptId || AppState.quizSession.targetConceptId);
+          if (currentCid) {
+            renderInteractiveMicroLesson($("#quiz-card-box"), currentCid, () => {
+              loadQuizQuestion(currentCid);
+            });
+          }
+        };
+      }
 
       const topicSelect = $("#practice-topic-select");
       if (topicSelect) {
@@ -6037,13 +6060,190 @@
   };
 
   // =========================================================================
-  // QUIZ ENGINE CONTROLLER (Authoritative Server Evaluation)
+  // QUIZ ENGINE CONTROLLER (Authoritative Server Evaluation & Teach Before Test)
   // =========================================================================
 
-  function startNewQuizSession(conceptId = null) {
+  function resolveTargetConceptId(conceptId = null) {
+    if (conceptId) return conceptId;
+    if (AppState.quizSession.targetConceptId) return AppState.quizSession.targetConceptId;
+    if (AppState.quizSession.currentConceptId) return AppState.quizSession.currentConceptId;
+    const concepts = AppState.masteryList || [];
+    const weak = concepts.find(c => (c.status || c.state || "").toLowerCase() === "weak" || getQualitativeOutcome(c) === "NOT_YET_MASTERED");
+    if (weak) return weak.id;
+    const unknown = concepts.find(c => getQualitativeOutcome(c) === "INSUFFICIENT_EVIDENCE" || (c.status || c.state || "").toLowerCase() === "unknown");
+    if (unknown) return unknown.id;
+    return concepts[0] ? concepts[0].id : null;
+  }
+
+  async function renderInteractiveMicroLesson(container, conceptId, onStartPractice) {
+    if (!container) return;
+    detachQuizKeyNav();
+
+    container.innerHTML = `
+      <div style="padding: 2.75rem 1.5rem; text-align: center;">
+        <div class="upload-icon-pulse" style="width: 44px; height: 44px; margin: 0 auto 1rem auto;">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        </div>
+        <h4 style="margin-bottom: 0.4rem;">Synthesizing Interactive Micro-Lesson...</h4>
+        <p style="color: var(--ink-secondary); font-size: 0.88rem;">TeachingAgent is gathering big picture intuition, material deep-dives, worked examples, and pitfalls...</p>
+      </div>
+    `;
+
+    try {
+      const res = await ApiService.teachConcept(conceptId, getCurrentUserId());
+      const lesson = (res && res.lesson) ? res.lesson : res;
+      if (!lesson) throw new Error("Could not load micro-lesson for this concept.");
+
+      const cName = lesson.concept_name || conceptId.replace(/[-_]/g, " ");
+      const prereqs = lesson.prerequisites || [];
+      const citations = lesson.citations || [];
+      const pitfalls = lesson.common_pitfalls || [];
+
+      container.innerHTML = `
+        <div class="micro-lesson-container">
+          <div class="micro-lesson-header">
+            <div class="micro-lesson-title-area">
+              <span class="micro-lesson-badge">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
+                Step 1: Concept Mastery Micro-Lesson
+              </span>
+              <h3 class="micro-lesson-concept-name">${esc(cName)}</h3>
+              ${prereqs.length > 0 ? `
+                <div class="micro-lesson-prereqs">
+                  <span>Prerequisites:</span>
+                  ${prereqs.map(p => `<span class="topic-badge-pill" style="font-size:0.75rem; padding:0.15rem 0.5rem;">${esc(p)}</span>`).join("")}
+                </div>
+              ` : ''}
+            </div>
+            ${citations.length > 0 ? `
+              <div style="display:flex; flex-direction:column; align-items:flex-end; gap:0.25rem;">
+                <span style="font-size:0.75rem; color:var(--ink-muted); font-weight:600;">SOURCE ANCHORS</span>
+                <div style="display:flex; gap:0.35rem; flex-wrap:wrap;">
+                  ${citations.map(c => `<span class="study-guide-citation-pill">Source: ${esc(c)}</span>`).join("")}
+                </div>
+              </div>
+            ` : ''}
+          </div>
+
+          <!-- Pillar 1: The Big Picture & Intuition -->
+          <div class="micro-lesson-section">
+            <div class="micro-lesson-section-title">
+              <span>🌐</span> 1. The Big Picture &amp; Intuition
+            </div>
+            <div class="micro-lesson-section-content">
+              ${esc(lesson.big_picture_intuition || "Foundational mechanism governing this domain.")}
+            </div>
+          </div>
+
+          <!-- Pillar 2: Deep-Dive from Your Material -->
+          <div class="micro-lesson-section">
+            <div class="micro-lesson-section-title">
+              <span>📖</span> 2. Deep-Dive from Your Study Material
+            </div>
+            <div class="micro-lesson-section-content">
+              ${esc(lesson.material_deep_dive || "")}
+            </div>
+          </div>
+
+          <!-- Pillar 3: Worked Example / Case Walkthrough -->
+          <div class="micro-lesson-section">
+            <div class="micro-lesson-section-title">
+              <span>💡</span> 3. Worked Example / Case Walkthrough
+            </div>
+            <div class="micro-lesson-worked-example-box">
+              ${esc(lesson.worked_example || "")}
+            </div>
+          </div>
+
+          <!-- Pillar 4: Common Pitfalls -->
+          <div class="micro-lesson-section">
+            <div class="micro-lesson-section-title">
+              <span>⚠️</span> 4. Common Pitfalls &amp; Reasoning Traps
+            </div>
+            <div class="micro-lesson-section-content">
+              ${pitfalls.map(p => `
+                <div class="micro-lesson-pitfall-item">
+                  <span class="micro-lesson-pitfall-icon">&bull;</span>
+                  <span>${esc(p)}</span>
+                </div>
+              `).join("")}
+            </div>
+          </div>
+
+          <!-- Interactive Socratic Checkpoint Bar -->
+          <div class="micro-lesson-checkpoint-bar">
+            <div class="checkpoint-note">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+              <span>Ready to test your understanding, or need clarification?</span>
+            </div>
+            <div class="checkpoint-actions">
+              <button id="btn-lesson-ask-tutor" class="btn btn-secondary">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/><circle cx="12" cy="12" r="1"/></svg>
+                Ask AI Tutor a Doubt
+              </button>
+              <button id="btn-lesson-start-practice" class="btn btn-primary">
+                I Understand — Start Guided Practice &rarr;
+              </button>
+            </div>
+          </div>
+        </div>
+      `;
+
+      renderMath(container);
+
+      const askTutorBtn = $("#btn-lesson-ask-tutor", container);
+      if (askTutorBtn) {
+        askTutorBtn.onclick = () => {
+          navigateTo("tutor");
+          setTimeout(() => {
+            const select = $("#tutor-concept-select");
+            if (select) {
+              select.value = conceptId;
+              select.dispatchEvent(new Event("change"));
+            }
+            const input = $("#tutor-input");
+            if (input) {
+              input.value = `I am studying the micro-lesson for "${cName}". Can you clarify the core mechanism and give me an analogy?`;
+              const sendBtn = $("#btn-tutor-send");
+              if (sendBtn) sendBtn.click();
+            }
+          }, 300);
+        };
+      }
+
+      const startPracticeBtn = $("#btn-lesson-start-practice", container);
+      if (startPracticeBtn) {
+        startPracticeBtn.onclick = () => {
+          if (typeof onStartPractice === "function") {
+            onStartPractice();
+          } else {
+            loadQuizQuestion(conceptId);
+          }
+        };
+      }
+    } catch (err) {
+      container.innerHTML = `
+        <div style="padding:2rem; text-align:center;">
+          <h4 style="color:var(--color-danger); margin-bottom:0.5rem;">Could not load micro-lesson</h4>
+          <p style="color:var(--ink-secondary); margin-bottom:1.25rem;">${esc(err.message)}</p>
+          <button id="btn-fallback-practice" class="btn btn-primary">Proceed to Guided Practice &rarr;</button>
+        </div>
+      `;
+      const fallbackBtn = $("#btn-fallback-practice", container);
+      if (fallbackBtn) {
+        fallbackBtn.onclick = () => {
+          if (typeof onStartPractice === "function") onStartPractice();
+          else loadQuizQuestion(conceptId);
+        };
+      }
+    }
+  }
+
+  async function startNewQuizSession(conceptId = null, opts = {}) {
     detachQuizKeyNav();
     AppState.quizSession.active = true;
-    AppState.quizSession.currentConceptId = conceptId || null;
+    const resolvedCid = resolveTargetConceptId(conceptId);
+    AppState.quizSession.currentConceptId = resolvedCid;
     AppState.quizSession.targetConceptId = null;
     AppState.quizSession.currentQuestion = null;
     AppState.quizSession.currentIndex = 1;
@@ -6051,11 +6251,32 @@
     AppState.quizSession.score = 0;
     AppState.quizSession.history = [];
 
+    // Sync practice topic selector
+    const topicSelect = $("#practice-topic-select");
+    if (topicSelect && resolvedCid) {
+      topicSelect.value = resolvedCid;
+    }
+
     // Reset session donut & stats
     updateQuizDonut();
 
+    // Enforce "Teach Before Test"
+    if (resolvedCid && !opts.skipLesson) {
+      const concepts = AppState.masteryList || [];
+      const match = concepts.find(c => c.id === resolvedCid);
+      const outcome = match ? getQualitativeOutcome(match) : "INSUFFICIENT_EVIDENCE";
+      const status = match ? (match.status || match.state || "").toLowerCase() : "unknown";
+      const isMastered = outcome === "MASTERED" && status === "strong";
+
+      if (!isMastered || opts.forceTeach) {
+        return renderInteractiveMicroLesson($("#quiz-card-box"), resolvedCid, () => {
+          loadQuizQuestion(resolvedCid);
+        });
+      }
+    }
+
     // Load first question for the fresh session
-    return loadQuizQuestion(conceptId);
+    return loadQuizQuestion(resolvedCid);
   }
 
   async function loadQuizQuestion(conceptId = null) {
@@ -6498,6 +6719,73 @@
               `;
             }
 
+            const rem = result.remediation || (!isCorrect ? {
+              concept_id: q.conceptId,
+              concept_name: q.conceptName || q.conceptId,
+              misconception_diagnosis: explanation || "A conceptual discrepancy was detected in the reasoning step.",
+              grounded_rule: "Review the verified foundation established in your course material.",
+              missing_step: stepSolution || "Trace the prerequisite chain and verify intermediate steps.",
+              citations: [],
+              follow_up_question: null
+            } : null);
+
+            let remediationHtml = "";
+            if (!isCorrect && rem) {
+              const verifQ = rem.follow_up_question;
+              const citations = rem.citations || [];
+              remediationHtml = `
+                <div class="remediation-card" id="quiz-remediation-block">
+                  <div class="remediation-header">
+                    <span class="remediation-header-badge">Targeted Re-Teaching</span>
+                    <h4 class="remediation-header-title">Misconception Diagnosis &amp; Remediation</h4>
+                  </div>
+
+                  <div class="remediation-section diagnosis">
+                    <div class="remediation-section-label">
+                      <span>🔍</span> Why Your Answer Was Incorrect
+                    </div>
+                    <div class="remediation-section-content">${esc(rem.misconception_diagnosis || "A conceptual confusion was detected in the reasoning step.")}</div>
+                  </div>
+
+                  <div class="remediation-section rule">
+                    <div class="remediation-section-label">
+                      <span>📖</span> Grounded Rule from Study Material
+                      ${citations.length > 0 ? `<div style="display:inline-flex; gap:0.25rem; margin-left:auto;">${citations.map(c => `<span class="study-guide-citation-pill">Source: ${esc(c)}</span>`).join("")}</div>` : ''}
+                    </div>
+                    <div class="remediation-section-content">${esc(rem.grounded_rule || "Refer to the foundational principle.")}</div>
+                  </div>
+
+                  ${rem.missing_step ? `
+                    <div class="remediation-section missing-step">
+                      <div class="remediation-section-label">
+                        <span>💡</span> The Missing Step to Solve This
+                      </div>
+                      <div class="remediation-section-content">${esc(rem.missing_step)}</div>
+                    </div>
+                  ` : ''}
+
+                  ${verifQ && (verifQ.question_text || verifQ.question) && Array.isArray(verifQ.options) && verifQ.options.length > 0 ? `
+                    <div class="remediation-verif-box" id="remediation-verif-container">
+                      <div class="remediation-verif-header">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 14 14"/></svg>
+                        <span>Immediate Concept Check: Verify You Got It</span>
+                      </div>
+                      <p style="margin: 0 0 0.6rem 0; font-size: 0.88rem; font-weight: 500;">${esc(verifQ.question_text || verifQ.question)}</p>
+                      <div class="remediation-opt-group">
+                        ${verifQ.options.map((opt, oIdx) => `
+                          <button class="remediation-opt-btn" type="button" data-verif-idx="${oIdx}">
+                            <span class="badge" style="font-size:0.75rem; background:rgba(255,255,255,0.08);">${String.fromCharCode(65 + oIdx)}</span>
+                            <span>${esc(opt)}</span>
+                          </button>
+                        `).join("")}
+                      </div>
+                      <div id="remediation-verif-feedback" style="display:none; margin-top:0.75rem; font-size:0.86rem; padding:0.6rem 0.8rem; border-radius:var(--radius-md);"></div>
+                    </div>
+                  ` : ''}
+                </div>
+              `;
+            }
+
             feedbackBox.innerHTML = `
               <div class="quiz-explanation-box ${isCorrect ? 'correct' : 'incorrect'}">
                 <div style="display:flex; align-items:center; gap:0.5rem; margin-bottom:0.35rem; font-weight:700;">
@@ -6512,8 +6800,44 @@
                 ${reviewSnippet}
                 <p style="margin:0; font-size:0.9rem; margin-top:0.4rem;">${esc(explanation)}</p>
               </div>
+              ${remediationHtml}
             `;
             renderMath(feedbackBox);
+
+            if (!isCorrect && rem && rem.follow_up_question && Array.isArray(rem.follow_up_question.options)) {
+              const verifQ = rem.follow_up_question;
+              const verifBtns = feedbackBox.querySelectorAll(".remediation-opt-btn");
+              const feedbackMsg = $("#remediation-verif-feedback", feedbackBox);
+              verifBtns.forEach(btn => {
+                btn.onclick = () => {
+                  const picked = parseInt(btn.getAttribute("data-verif-idx"), 10);
+                  const correctOptIdx = verifQ.correct_option_idx !== undefined ? verifQ.correct_option_idx : (verifQ.correct_index !== undefined ? verifQ.correct_index : 0);
+                  const isVerifCorrect = picked === correctOptIdx;
+                  verifBtns.forEach((b, bIdx) => {
+                    b.disabled = true;
+                    if (bIdx === correctOptIdx) {
+                      b.classList.add("correct");
+                    } else if (bIdx === picked && !isVerifCorrect) {
+                      b.classList.add("incorrect");
+                    }
+                  });
+                  if (feedbackMsg) {
+                    feedbackMsg.style.display = "block";
+                    if (isVerifCorrect) {
+                      feedbackMsg.style.background = "rgba(16, 185, 129, 0.12)";
+                      feedbackMsg.style.color = "var(--color-strong-text)";
+                      feedbackMsg.style.border = "1px solid rgba(16, 185, 129, 0.25)";
+                      feedbackMsg.innerHTML = `<strong>✓ Verified!</strong> ${esc(verifQ.explanation || "You grasped the core distinction.")}`;
+                    } else {
+                      feedbackMsg.style.background = "rgba(239, 68, 68, 0.12)";
+                      feedbackMsg.style.color = "var(--color-danger)";
+                      feedbackMsg.style.border = "1px solid rgba(239, 68, 68, 0.25)";
+                      feedbackMsg.innerHTML = `<strong>Note:</strong> ${esc(verifQ.explanation || "Re-review the grounded rule above before moving forward.")}`;
+                    }
+                  }
+                };
+              });
+            }
 
             // Change submit button to next question
             submitBtn.textContent = AppState.quizSession.currentIndex >= totalQuestions
@@ -6817,6 +7141,9 @@
       if (targetLink) {
         const cid = targetLink.getAttribute("data-target-concept");
         AppState.quizSession.targetConceptId = cid || null;
+        if (targetLink.getAttribute("data-force-teach") === "true") {
+          AppState.quizSession.forceTeach = true;
+        }
         if (location.hash === "#practice") {
           navigateTo("practice");
         }

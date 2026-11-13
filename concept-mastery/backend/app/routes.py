@@ -20,7 +20,7 @@ from fastapi.concurrency import run_in_threadpool
 from . import config
 from .core import store, tts
 from .core.auth import get_current_user, create_access_token, verify_google_credential
-from .pipelines import ingest, tutor, quiz, mastery, recommend, loop, concepts, active_recall, notes, tools, mastery_orchestrator
+from .pipelines import ingest, tutor, quiz, mastery, recommend, loop, concepts, active_recall, notes, tools, mastery_orchestrator, pedagogical_agents
 from .pipelines.concepts import export_graph
 from .models.schemas import (
     UploadResponse,
@@ -63,6 +63,8 @@ from .models.schemas import (
     LegacyEvaluateReq,
     StartSessionReq,
     DiagnosticSubmitReq,
+    TeachConceptRequest,
+    TeachConceptResponse,
 )
 from .pipelines.ingest import UniversalMaterialIngestor
 
@@ -578,6 +580,7 @@ def legacy_quiz_answer(
         "user_answer": res.get("user_answer", ""),
         "reasoning_depth_level": res.get("reasoning_depth_level", "DEVELOPING"),
         "step_by_step_solution": res.get("step_by_step_solution") or q_data.get("step_by_step_solution"),
+        "remediation": res.get("remediation"),
     }
 
 
@@ -793,6 +796,23 @@ def get_concept_deliberation(
         specialist_findings=findings_objs,
         evidence_records=evidence_objs,
     )
+
+
+@router.post("/mastery/teach-concept", response_model=TeachConceptResponse)
+@router.post("/mastery/teach-concept/", response_model=TeachConceptResponse)
+def post_mastery_teach_concept(
+    req: TeachConceptRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    """Generate rich, structured Interactive Micro-Lesson grounded in study material before testing."""
+    uid = _resolve_tenant_user_id(current_user, request, req.user_id)
+    lesson = pedagogical_agents.generate_interactive_micro_lesson(
+        concept_id=req.concept_id,
+        user_id=uid,
+        target_material_id=req.target_material_id,
+    )
+    return {"ok": True, "lesson": lesson}
 
 
 

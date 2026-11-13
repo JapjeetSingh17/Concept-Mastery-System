@@ -153,6 +153,15 @@ class BaselineSubmissionRequest(BaseModel):
     submissions: list[QuizSubmission]
 
 
+class QuestionRemediation(BaseModel):
+    """Pedagogical remediation card generated when a student misses a question."""
+    misconception_diagnosis: str
+    grounded_rule: str
+    missing_step: str
+    citations: list[str] = Field(default_factory=list)
+    follow_up_question: Optional[dict] = None
+
+
 class QuizResult(BaseModel):
     """Graded result of a quiz submission."""
     question_id: str
@@ -168,6 +177,7 @@ class QuizResult(BaseModel):
     reasoning_clarity: float = Field(default=0.5)
     reasoning_depth_level: str = "DEVELOPING"
     step_by_step_solution: Optional[str] = None
+    remediation: Optional[QuestionRemediation] = None
 
 
 # ── 6. Socratic Tutor Schemas ──────────────────────────────────────────────
@@ -653,6 +663,34 @@ class BaselineDiagnosticReport(BaseModel):
     topic_breakdown: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
     weak_topics_guide: list[dict[str, Any]] = Field(default_factory=list)
     created_at: str
+
+
+class TeachConceptRequest(BaseModel):
+    """Request payload for generating an interactive micro-lesson before testing."""
+
+    concept_id: str
+    user_id: str = "default"
+    target_material_id: Optional[str] = None
+
+
+class ConceptMicroLesson(BaseModel):
+    """Rich, structured interactive micro-lesson for a concept before testing."""
+
+    concept_id: str
+    concept_name: str
+    prerequisites: list[str] = Field(default_factory=list)
+    citations: list[str] = Field(default_factory=list)
+    big_picture_intuition: str
+    material_deep_dive: str
+    worked_example: str
+    common_pitfalls: list[str] = Field(default_factory=list)
+
+
+class TeachConceptResponse(BaseModel):
+    """Response payload containing interactive micro-lesson."""
+
+    ok: bool = True
+    lesson: ConceptMicroLesson
 
 
 # ---------------------------------------------------------------------------

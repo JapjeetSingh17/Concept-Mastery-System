@@ -79,6 +79,7 @@ const ENDPOINTS = {
   mastery:          { method: "GET",  path: "/api/mastery" },
   masteryDashboard: { method: "GET",  path: "/api/mastery/dashboard" },
   masteryReset:     { method: "POST", path: "/api/mastery/reset" },
+  teachConcept:     { method: "POST", path: "/api/mastery/teach-concept" },
   loopNextAction:   { method: "POST", path: "/api/loop/next-action" },
   recommend:        { method: "POST", path: "/api/recommend" },
   dashboardSummary: { method: "GET",  path: "/api/dashboard-summary" },
@@ -668,6 +669,10 @@ const ApiService = {
       pathParams: { material_id: materialId || "latest" },
       skipCache: true
     });
+  },
+
+  async teachConcept(conceptId, userId = "default", options = {}) {
+    return callApi("teachConcept", { concept_id: conceptId, user_id: userId }, options);
   },
 
   async getMaterialPreview(materialId, options = {}) {

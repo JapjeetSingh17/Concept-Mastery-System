@@ -1027,6 +1027,19 @@ def evaluate_submission(sub: QuizSubmission) -> QuizResult:
         page_ref=source_page,
     )
 
+    remediation_data = None
+    if not is_correct:
+        try:
+            from .pedagogical_agents import generate_question_remediation
+            remediation_data = generate_question_remediation(
+                question_id=sub.question_id,
+                concept_id=sub.concept_id,
+                student_answer=user_answer_str or sub.student_reasoning,
+                user_id=sub.user_id,
+            )
+        except Exception as rem_err:
+            logger.warning(f"Failed generating question remediation: {rem_err}")
+
     return QuizResult(
         question_id=sub.question_id,
         concept_id=sub.concept_id,
@@ -1041,6 +1054,7 @@ def evaluate_submission(sub: QuizSubmission) -> QuizResult:
         reasoning_clarity=reasoning_clarity,
         reasoning_depth_level=reasoning_depth,
         step_by_step_solution=q_data.get("step_by_step_solution"),
+        remediation=remediation_data,
     )
 
 
@@ -1154,7 +1168,8 @@ def evaluate_answer(student_answer: str, concept_id: str, question_text: str = "
         "score": res.score,
         "is_correct": res.is_correct,
         "misconceptions": res.misconceptions,
-        "feedback": f"Grounded response for {concept_id} recorded: {res.reasoning_depth_level}."
+        "feedback": f"Grounded response for {concept_id} recorded: {res.reasoning_depth_level}.",
+        "remediation": res.remediation.model_dump() if res.remediation else None,
     }
 
 

@@ -405,6 +405,7 @@ def submit_quiz_answer(sub: QuizSubmission) -> dict:
         "artifacts": remedial_state.get("artifacts", []) if routed == "remedial_reteach" else evaluated_state.get("artifacts", []),
         "external_links": remedial_state.get("external_links", []) if routed == "remedial_reteach" else evaluated_state.get("external_links", []),
         "step_by_step_solution": eval_result.step_by_step_solution,
+        "remediation": eval_result.remediation.model_dump() if eval_result.remediation else None,
     }
 
 
