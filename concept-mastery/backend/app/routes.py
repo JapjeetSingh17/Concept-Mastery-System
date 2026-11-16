@@ -27,9 +27,10 @@ from .core.content_safety import (
     extract_text_for_screening,
     screen_text,
     screen_visual_content,
+    screen_video_content,
+    validate_upload,
     screen_text_async,
 )
-from .core.sheerid import DEFAULT_SHEERID_CLIENT, SheerIDError
 from .core.email_verification import DEFAULT_EMAIL_VERIFIER
 from .core.auth import get_current_user, create_access_token, verify_google_credential
 from .pipelines import ingest, tutor, quiz, mastery, recommend, loop, concepts, active_recall, notes, tools, mastery_orchestrator
@@ -155,14 +156,6 @@ def get_auth_logs(current_user: User = Depends(get_current_user)):
 
 # ── Medical-content access control & Verification ──────────────────────────
 
-class SheerIDInitiateRequest(BaseModel):
-    first_name: str = ""
-    last_name: str = ""
-    email: str = ""
-    birth_date: str | None = None
-    organization_name: str | None = None
-
-
 class EmailChallengeRequest(BaseModel):
     email: str
 
@@ -170,6 +163,18 @@ class EmailChallengeRequest(BaseModel):
 class EmailChallengeVerify(BaseModel):
     email: str
     code: str
+
+
+# ── Media file helpers ────────────────────────────────────────────────────────
+
+_MEDIA_EXTENSIONS = {".mp3", ".wav", ".m4a", ".webm", ".mp4", ".mov", ".avi", ".mkv", ".m4v"}
+
+
+def _is_media_file(filename: str) -> bool:
+    """Return True for audio/video files that have no extractable text pre-transcription."""
+    if not filename:
+        return False
+    return Path(filename).suffix.lower() in _MEDIA_EXTENSIONS
 
 
 async def _enforce_content_policy(upload: UploadFile, user_id: str) -> None:
@@ -188,7 +193,24 @@ async def _enforce_content_policy(upload: UploadFile, user_id: str) -> None:
         )
 
     result = screen_text(extracted)
-    _vis_decision, _vis_msg, vis_signals = screen_visual_content(upload.filename, raw)
+    vis_decision, vis_msg, vis_signals = screen_visual_content(upload.filename, raw)
+
+    # Fail-closed: any visual RESTRICTED/REVIEW decision blocks ingestion for unverified users
+    if vis_decision == ContentDecision.RESTRICTED and not store.is_medical_verified(user_id):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "MEDICAL_VERIFICATION_REQUIRED",
+                "message": "This material contains explicit visual content. Access requires verified medical student status via ID card verification.",
+                "verification_endpoint": "/api/auth/verify-medical-id",
+                "signals": list(result.matched_signals) + list(vis_signals),
+            },
+        )
+
+    # Media files (audio/video) have no extractable text pre-transcription; defer screening
+    # to the ingest pipeline where the transcribed text is screened instead of blocking here.
+    if _is_media_file(upload.filename) and not extracted.strip() and not vis_signals:
+        return
 
     if result.decision == ContentDecision.REVIEW and not result.matched_signals and not vis_signals:
         raise HTTPException(
@@ -203,73 +225,229 @@ async def _enforce_content_policy(upload: UploadFile, user_id: str) -> None:
                 status_code=403,
                 detail={
                     "code": "MEDICAL_VERIFICATION_REQUIRED",
-                    "message": "This material contains explicit or clinical content. Access requires verified medical student status via SheerID.",
-                    "verification_endpoint": "/api/auth/sheerid/initiate",
+                    "message": "This material contains explicit or clinical content. Access requires verified medical student status via ID card verification.",
+                    "verification_endpoint": "/api/auth/verify-medical-id",
                     "signals": all_signals,
                 },
             )
 
 
-# ── SheerID Medical Verification Endpoints ─────────────────────────────────
+# ── Vision-Based Medical ID Verification (Gemini 2.5 Flash via OpenRouter) ──
 
 @router.get("/auth/medical-verification")
-@router.get("/auth/sheerid/status")
 def get_medical_verification_status(current_user: User = Depends(get_current_user)):
-    """Return verified medical learner status and SheerID request details."""
+    """Return verified medical learner status and verification details."""
     request_record = store.get_medical_verification_request(current_user.user_id)
     is_verified = store.is_medical_verified(current_user.user_id)
     status = "approved" if is_verified else (request_record.get("status", "not_submitted") if request_record else "not_submitted")
     return {
         "status": status,
         "is_verified": is_verified,
-        "provider": "sheerid",
-        "hosted_url": DEFAULT_SHEERID_CLIENT.get_hosted_url(current_user.user_id),
+        "provider": "vision_ocr",
         "request": request_record,
     }
 
 
-@router.post("/auth/sheerid/initiate")
-async def initiate_sheerid_verification(
-    body: SheerIDInitiateRequest = Body(default_factory=SheerIDInitiateRequest),
+@router.post("/auth/verify-medical-id")
+async def verify_medical_id(
+    file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
 ):
-    """Initiate SheerID medical student verification session."""
-    email = (body.email or current_user.email).strip().lower()
-    first_name = body.first_name or current_user.full_name.split()[0] if current_user.full_name else "Student"
-    last_name = body.last_name or (current_user.full_name.split()[-1] if len(current_user.full_name.split()) > 1 else "Learner")
+    """Verify a student ID card image using Gemini 2.5 Flash vision via OpenRouter.
+
+    Accepts an image upload (JPEG/PNG), base64-encodes it, and sends it to
+    Gemini 2.5 Flash with a strict JSON schema prompt to extract:
+      - is_valid_id_card (bool)
+      - student_name (str)
+      - institution (str)
+      - department_or_degree (str)
+      - is_medical_or_bio_student (bool)
+      - confidence_score (float 0.0-1.0)
+
+    If is_medical_or_bio_student is true and confidence_score >= 0.7,
+    the user's medical verification status is set to 'approved'.
+    """
+    import base64
+    import httpx
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Image file is required.")
+
+    # Validate file type
+    ext = Path(file.filename).suffix.lower()
+    if ext not in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported image format. Please upload a JPEG, PNG, WebP, or GIF image.",
+        )
+
+    # Read and validate size (max 10 MB)
+    content = await file.read()
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Image too large. Maximum size is 10 MB.")
+    if len(content) < 100:
+        raise HTTPException(status_code=400, detail="Image file is too small or empty.")
+
+    # Encode to base64
+    image_b64 = base64.b64encode(content).decode("utf-8")
+
+    # Use Google Gemini API directly for vision verification (free tier available)
+    if not config.GEMINI_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Vision verification is unavailable: GEMINI_API_KEY is not configured.",
+        )
+
+    system_prompt = (
+        "Analyze the provided image of a college/university ID card. "
+        "Extract the details and determine if the student belongs to a Medical, Biological, "
+        "Nursing, Pharmacy, or Life Sciences stream. "
+        "You must return ONLY valid JSON matching this exact structure:\n"
+        "{\n"
+        '  "is_valid_id_card": true or false,\n'
+        '  "student_name": "extracted name",\n'
+        '  "institution": "extracted university/college name",\n'
+        '  "department_or_degree": "extracted text (e.g., MBBS, B.Sc Biology)",\n'
+        '  "is_medical_or_bio_student": true or false,\n'
+        '  "confidence_score": 0.0 to 1.0\n'
+        "}"
+    )
+
+    # Determine MIME type
+    mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+                ".webp": "image/webp", ".gif": "image/gif"}
+    mime_type = mime_map.get(ext, "image/jpeg")
+
+    # Google Gemini API - free tier supports vision models
+    headers = {
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": system_prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": image_b64,
+                        }
+                    },
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": 600,
+        },
+    }
 
     try:
-        res = await DEFAULT_SHEERID_CLIENT.initiate_verification(
-            user_id=current_user.user_id,
-            first_name=first_name,
-            last_name=last_name,
-            email=email,
-            birth_date=body.birth_date,
-            organization_name=body.organization_name,
+        # Google Gemini API endpoint - use gemini-3.5-flash-lite (latest free tier model)
+        model_name = "gemini-3.5-flash-lite"
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={config.GEMINI_API_KEY}"
+        resp = httpx.post(
+            api_url,
+            headers=headers,
+            json=payload,
+            timeout=60.0,
         )
-        return res
-    except SheerIDError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    except httpx.HTTPError as exc:
+        logger.exception("Gemini vision request failed: %s", exc)
+        raise HTTPException(status_code=502, detail="Vision verification service is temporarily unavailable.")
 
+    if resp.status_code != 200:
+        logger.error("Gemini vision API error: %s %s", resp.status_code, resp.text[:300])
+        raise HTTPException(
+            status_code=502,
+            detail=f"Vision verification API error ({resp.status_code}). Please try again later.",
+        )
 
-@router.post("/auth/sheerid-webhook")
-async def sheerid_webhook(
-    request: Request,
-    x_sheerid_signature: str | None = Header(None),
-    x_sheerid_token: str | None = Header(None),
-):
-    """Authoritative SheerID webhook endpoint with signature verification, replay protection, and idempotent handling."""
-    raw_body = await request.body()
+    data = resp.json()
+    # Gemini API response format
+    candidates = data.get("candidates", [])
+    if not candidates:
+        raise HTTPException(status_code=502, detail="Vision verification returned an empty response.")
+
+    parts = candidates[0].get("content", {}).get("parts", [])
+    if not parts:
+        raise HTTPException(status_code=502, detail="Vision verification returned no content.")
+
+    raw_content = parts[0].get("text", "")
+    if not raw_content:
+        raise HTTPException(status_code=502, detail="Vision verification returned no text content.")
+
+    # Extract and parse JSON from the model response
+    import json
     try:
-        result = await DEFAULT_SHEERID_CLIENT.process_webhook_event(
-            raw_payload=raw_body,
-            signature_header=x_sheerid_signature,
-            token_header=x_sheerid_token,
+        # Try to find JSON in the response
+        clean = raw_content.strip()
+        # Strip markdown code fences if present
+        if clean.startswith("```"):
+            clean = clean.split("\n", 1)[1] if "\n" in clean else clean
+            clean = clean.rsplit("```", 1)[0] if "```" in clean else clean
+            clean = clean.strip()
+        # Find outermost JSON
+        first_brace = clean.find("{")
+        last_brace = clean.rfind("}")
+        if first_brace != -1 and last_brace != -1:
+            clean = clean[first_brace:last_brace + 1]
+        result = json.loads(clean)
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.warning("Failed to parse vision verification JSON: %s | Raw: %s", exc, raw_content[:500])
+        raise HTTPException(
+            status_code=502,
+            detail="Vision verification could not parse the ID card. Please upload a clearer image.",
         )
-        return {"ok": True, "result": result}
-    except SheerIDError as exc:
-        logger.warning("SheerID webhook processing rejected: %s", exc)
-        raise HTTPException(status_code=400, detail=str(exc))
+
+    is_valid = result.get("is_valid_id_card", False)
+    is_medical = result.get("is_medical_or_bio_student", False)
+    confidence = float(result.get("confidence_score", 0.0))
+    student_name = result.get("student_name", "")
+    institution = result.get("institution", "")
+    department = result.get("department_or_degree", "")
+
+    # Update verification status in database
+    verification_id = f"vision_{current_user.user_id}_{int(time.time())}"
+    new_status = "approved" if (is_valid and is_medical and confidence >= 0.7) else "rejected"
+    review_notes = (
+        f"Vision OCR: valid_id={is_valid}, medical_bio={is_medical}, "
+        f"confidence={confidence:.2f}, department={department}"
+    )
+
+    store.record_sheerid_verification(
+        user_id=current_user.user_id,
+        verification_id=verification_id,
+        program_id="vision_ocr",
+        status=new_status,
+        institution=institution,
+        program=department,
+        educational_email=current_user.email or "",
+        metadata=result,
+    )
+    store.update_sheerid_verification_status(
+        verification_id=verification_id,
+        status=new_status,
+        metadata=result,
+        review_notes=review_notes,
+    )
+
+    return {
+        "is_valid_id_card": is_valid,
+        "student_name": student_name,
+        "institution": institution,
+        "department_or_degree": department,
+        "is_medical_or_bio_student": is_medical,
+        "confidence_score": confidence,
+        "verification_status": new_status,
+        "is_medical_verified": store.is_medical_verified(current_user.user_id),
+        "message": (
+            "ID card verified successfully! You now have access to clinical study materials."
+            if new_status == "approved"
+            else "ID card could not be verified as a medical/biological student. Please check your student ID."
+        ),
+    }
 
 
 # ── Institutional Email Mailbox Verification ────────────────────────────────
@@ -991,7 +1169,7 @@ async def post_materials_ingest_file(
     title: str | None = Form(None),
     current_user: User = Depends(get_current_user),
 ):
-    """Ingest multi-format study material (.pdf, .pptx, .md, .txt, .docx, .mp3, .wav, .m4a, .webm)."""
+    """Ingest multi-format study material (.pdf, .pptx, .md, .txt, .docx, .mp3, .wav, .m4a, .webm, .mp4, .mov, .avi, .mkv)."""
     uid = user_id if user_id != "default" else (current_user.user_id if current_user and current_user.user_id != "default" else "default")
     all_uploads: list[UploadFile] = list(files or [])
     if file:
@@ -1000,7 +1178,7 @@ async def post_materials_ingest_file(
     if not all_uploads:
         raise HTTPException(status_code=400, detail="No study material file provided.")
 
-    allowed_exts = {".pdf", ".pptx", ".ppt", ".md", ".txt", ".docx", ".mp3", ".wav", ".m4a", ".webm"}
+    allowed_exts = {".pdf", ".pptx", ".ppt", ".md", ".txt", ".docx", ".mp3", ".wav", ".m4a", ".webm", ".mp4", ".mov", ".avi", ".mkv"}
     ingested_materials = []
 
     for f in all_uploads:
@@ -1010,9 +1188,30 @@ async def post_materials_ingest_file(
         if ext not in allowed_exts:
             raise HTTPException(
                 status_code=400,
-                detail=f"Unsupported format '{ext}'. Supported: PDF, PPTX, MD, TXT, DOCX, MP3, WAV, M4A, WEBM."
+                detail=f"Unsupported format '{ext}'. Supported: PDF, PPTX, MD, TXT, DOCX, MP3, WAV, M4A, WEBM, MP4, MOV, AVI, MKV."
             )
         await _enforce_content_policy(f, uid)
+
+        # Validate file size and magic bytes before writing to disk
+        content = await f.read()
+        await f.seek(0)
+        ok, msg = validate_upload(f.filename, content)
+        if not ok:
+            raise HTTPException(status_code=400, detail=f"File validation failed for '{f.filename}': {msg}")
+
+        # Video files: run frame-based visual moderation before persistence
+        if ext in {".mp4", ".mov", ".avi", ".mkv"}:
+            vis_decision, _vis_msg, _vis_signals = screen_video_content(f.filename, content)
+            if vis_decision == ContentDecision.RESTRICTED and not store.is_medical_verified(uid):
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": "MEDICAL_VERIFICATION_REQUIRED",
+                        "message": "This video contains explicit visual content. Access requires verified medical student status via ID card verification.",
+                        "verification_endpoint": "/api/auth/verify-medical-id",
+                        "signals": list(_vis_signals),
+                    },
+                )
         dest = config.UPLOAD_DIR / Path(f.filename).name
         content = await f.read()
         dest.write_bytes(content)
@@ -1074,8 +1273,8 @@ async def post_materials_ingest_url(req: IngestUrlRequest, current_user: User = 
                 status_code=403,
                 detail={
                     "code": "MEDICAL_VERIFICATION_REQUIRED",
-                    "message": "This material contains explicit or clinical content. Access requires verified medical student status via SheerID.",
-                    "verification_endpoint": "/api/auth/sheerid/initiate",
+                    "message": "This material contains explicit or clinical content. Access requires verified medical student status via ID card verification.",
+                    "verification_endpoint": "/api/auth/verify-medical-id",
                     "signals": list(screening.matched_signals),
                 },
             )

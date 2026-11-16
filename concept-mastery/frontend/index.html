@@ -197,7 +197,7 @@
             <span class="user-name" id="topbar-user-name">Alex</span>
             <span class="user-status" id="topbar-user-email">Learner</span>
           </div>
-          <span class="badge" id="medical-student-badge" style="display:none; font-size:0.75rem; background:#10b981; color:#fff; padding:3px 8px; border-radius:12px; margin-left:6px; font-weight:600;" title="Verified Medical Student (SheerID Approved)">
+          <span class="badge" id="medical-student-badge" style="display:none; font-size:0.75rem; background:#10b981; color:#fff; padding:3px 8px; border-radius:12px; margin-left:6px; font-weight:600;" title="Verified Medical Student (ID Card Verified)">
             ⚕️ Verified Medical
           </span>
           <button class="icon-action-btn logout-action-btn" id="logout-btn" title="Sign Out / Switch Account" aria-label="Sign Out" style="width:28px; height:28px; margin-left:6px; border-radius:50%;">
@@ -362,7 +362,7 @@
     </div>
   </dialog>
 
-  <!-- Native Modal Dialog for SheerID Medical Verification -->
+  <!-- Native Modal Dialog for Medical ID Verification -->
   <dialog id="medical-verification-modal" aria-labelledby="med-verif-modal-title" style="max-width: 620px; width: 92%; border-radius: var(--radius-xl, 16px); border: 1px solid var(--border-subtle, #e2e8f0); box-shadow: var(--shadow-modal, 0 20px 25px -5px rgba(0,0,0,0.2)); background: var(--surface-card, #ffffff); overflow: hidden; padding: 0;">
     <div class="dialog-inner" style="display: flex; flex-direction: column;">
       <div class="dialog-header modal-header" style="display: flex; justify-content: space-between; align-items: center; padding: 1.25rem 1.75rem; border-bottom: 1px solid var(--border-subtle, #e2e8f0); background: #f0fdf4;">
@@ -372,7 +372,7 @@
           </div>
           <div>
             <h3 id="med-verif-modal-title" style="margin: 0; font-size: 1.18rem; font-weight: 700; color: #14532d;">Medical / Clinical Content Verification</h3>
-            <span style="font-size: 0.82rem; color: #15803d;">SheerID Provider-Backed Student Eligibility</span>
+            <span style="font-size: 0.82rem; color: #15803d;">Student ID Card Verification</span>
           </div>
         </div>
         <button class="dialog-close-btn modal-close" id="medical-verification-modal-close" aria-label="Close dialog" style="background: none; border: none; font-size: 1.6rem; cursor: pointer; color: var(--ink-muted); line-height: 1; padding: 0.25rem 0.5rem; border-radius: 6px;">
@@ -384,7 +384,7 @@
         <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 1rem 1.25rem; margin-bottom: 1.5rem;">
           <h4 style="margin: 0 0 0.4rem 0; font-size: 0.95rem; color: #1e40af; font-weight: 600;">Clinical Access Policy</h4>
           <p style="margin: 0; font-size: 0.86rem; color: #1e3a8a; line-height: 1.45;">
-            The uploaded material contains explicit terminology or clinical anatomy (such as sexual pathology, reproductive oncology, or STI dermatology). Access to this study material requires verified medical student enrollment via SheerID to protect general learners and maintain content safety standards.
+            The uploaded material contains explicit terminology or clinical anatomy (such as sexual pathology, reproductive oncology, or STI dermatology). Access to this study material requires verified medical/biological student enrollment. Please upload your college/university student ID card below to verify.
           </p>
         </div>
 
@@ -399,10 +399,17 @@
         </div>
 
         <div id="med-verif-actions-section" style="display: flex; flex-direction: column; gap: 0.85rem;">
-          <button type="button" class="btn btn-primary" id="btn-launch-sheerid" style="width: 100%; justify-content: center; gap: 0.5rem; padding: 0.85rem 1rem; font-size: 0.95rem; background: #16a34a; border-color: #16a34a;">
-            <span>Verify with SheerID Portal</span>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
-          </button>
+          <div style="border: 2px dashed #cbd5e1; border-radius: 12px; padding: 2rem 1.5rem; text-align: center; background: #f8fafc; transition: border-color 0.2s;">
+            <div style="font-size: 2.5rem; margin-bottom: 0.5rem;">🪪</div>
+            <p style="margin: 0 0 1rem 0; font-size: 0.9rem; color: var(--ink-muted); line-height: 1.5;">
+              Upload a photo of your college/university student ID card.<br>
+              <strong>Accepted formats:</strong> JPEG, PNG, WebP, GIF (max 10 MB)
+            </p>
+            <input type="file" id="med-id-file-input" accept="image/jpeg,image/png,image/webp,image/gif" style="display: none;">
+            <button type="button" class="btn btn-primary" id="btn-upload-med-id" style="width: 100%; justify-content: center; gap: 0.5rem; padding: 0.85rem 1rem; font-size: 0.95rem; background: #16a34a; border-color: #16a34a;">
+              <span>📤 Upload Student ID Card</span>
+            </button>
+          </div>
 
           <button type="button" class="btn btn-primary" id="btn-retry-pending-upload" style="display: none; width: 100%; justify-content: center; gap: 0.5rem; padding: 0.85rem 1rem; font-size: 0.95rem; background: #2563eb; border-color: #2563eb;">
             <span>✓ Resume Uploading Study Material</span>
@@ -411,7 +418,7 @@
 
         <div style="margin-top: 1.25rem; text-align: center;">
           <p style="margin: 0; font-size: 0.78rem; color: var(--ink-muted);">
-            🔒 Your student ID documents are processed securely by SheerID and are never stored on this server.
+            🔒 Your student ID image is processed securely via AI vision and is never stored on this server.
           </p>
         </div>
       </div>

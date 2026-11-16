@@ -150,10 +150,10 @@ CREATE TABLE IF NOT EXISTS explainable_mastery_decisions (
 );
 CREATE INDEX IF NOT EXISTS idx_mastery_decisions_user_concept ON explainable_mastery_decisions(user_id, concept_id);
 
--- Medical learner verification records (SheerID provider-backed; no local ID card storage)
+-- Medical learner verification records (Vision OCR provider-backed; no local ID card storage)
 CREATE TABLE IF NOT EXISTS medical_verification_requests (
     user_id             TEXT PRIMARY KEY,
-    provider            TEXT NOT NULL DEFAULT 'sheerid',
+    provider            TEXT NOT NULL DEFAULT 'vision_ocr',
     verification_id     TEXT DEFAULT '',
     program_id          TEXT DEFAULT '',
     institution         TEXT NOT NULL DEFAULT '',
@@ -169,7 +169,7 @@ CREATE TABLE IF NOT EXISTS medical_verification_requests (
 );
 CREATE INDEX IF NOT EXISTS idx_med_verif_id ON medical_verification_requests(verification_id);
 
--- SheerID Webhook Audit & Idempotency / Anti-Replay Store
+-- Vision OCR Webhook Audit & Idempotency / Anti-Replay Store
 CREATE TABLE IF NOT EXISTS sheerid_webhook_events (
     event_id        TEXT PRIMARY KEY,
     verification_id TEXT NOT NULL,
@@ -214,7 +214,7 @@ def init_materials_db():
         try:
             cols = [r["name"] for r in conn.execute("PRAGMA table_info(medical_verification_requests)").fetchall()]
             if "provider" not in cols:
-                conn.execute("ALTER TABLE medical_verification_requests ADD COLUMN provider TEXT NOT NULL DEFAULT 'sheerid'")
+                conn.execute("ALTER TABLE medical_verification_requests ADD COLUMN provider TEXT NOT NULL DEFAULT 'vision_ocr'")
             if "verification_id" not in cols:
                 conn.execute("ALTER TABLE medical_verification_requests ADD COLUMN verification_id TEXT DEFAULT ''")
             if "program_id" not in cols:
@@ -1237,7 +1237,7 @@ def record_sheerid_verification(
     educational_email: str = "",
     metadata: dict | None = None,
 ) -> dict:
-    """Record or update a SheerID verification session."""
+    """Record or update a vision-OCR medical ID verification session."""
     init_materials_db()
     now_iso = datetime.now(timezone.utc).isoformat()
     meta_json = json.dumps(metadata or {})
@@ -1245,9 +1245,9 @@ def record_sheerid_verification(
         conn.execute(
             """INSERT INTO medical_verification_requests
                (user_id, provider, verification_id, program_id, institution, program, educational_email, id_card_filename, status, metadata_json, submitted_at, reviewed_at, reviewed_by, review_notes)
-               VALUES (?, 'sheerid', ?, ?, ?, ?, ?, '', ?, ?, ?, NULL, NULL, '')
+               VALUES (?, 'vision_ocr', ?, ?, ?, ?, ?, '', ?, ?, ?, NULL, NULL, '')
                ON CONFLICT(user_id) DO UPDATE SET
-                 provider='sheerid',
+                 provider='vision_ocr',
                  verification_id=excluded.verification_id,
                  program_id=excluded.program_id,
                  institution=CASE WHEN excluded.institution != '' THEN excluded.institution ELSE medical_verification_requests.institution END,
@@ -1267,14 +1267,14 @@ def update_sheerid_verification_status(
     metadata: dict | None = None,
     review_notes: str = "",
 ) -> dict | None:
-    """Update verification status based on authoritative SheerID webhook or API check."""
+    """Update verification status based on vision-OCR extraction result."""
     init_materials_db()
     now_iso = datetime.now(timezone.utc).isoformat()
     meta_json = json.dumps(metadata or {})
     with get_materials_db() as conn:
         conn.execute(
             """UPDATE medical_verification_requests
-               SET status=?, reviewed_at=?, reviewed_by='sheerid_provider', review_notes=?, metadata_json=?
+               SET status=?, reviewed_at=?, reviewed_by='vision_ocr_provider', review_notes=?, metadata_json=?
                WHERE verification_id=?""",
             (status, now_iso, review_notes[:1000], meta_json, verification_id),
         )
@@ -1285,7 +1285,7 @@ def update_sheerid_verification_status(
 
 
 def get_verification_by_sheerid_id(verification_id: str) -> dict | None:
-    """Lookup medical verification request by SheerID verificationId."""
+    """Lookup medical verification request by verification ID."""
     init_materials_db()
     with get_materials_db() as conn:
         row = conn.execute(
@@ -1300,7 +1300,7 @@ def record_sheerid_webhook_event(
     event_type: str,
     payload_json: str,
 ) -> bool:
-    """Record an incoming SheerID webhook event for replay protection.
+    """Record an incoming vision-OCR verification event for replay protection.
 
     Returns:
         True if the event was newly recorded.
@@ -1398,26 +1398,6 @@ def is_email_ownership_verified(user_id: str, email: str) -> bool:
         return bool(row)
 
 
-def submit_medical_verification_request(user_id: str, institution: str, program: str, educational_email: str, id_card_filename: str = "") -> dict:
-    """Submit a medical-student verification request without persisting raw ID cards."""
-    init_materials_db()
-    now_iso = datetime.now(timezone.utc).isoformat()
-    with get_materials_db() as conn:
-        conn.execute(
-            """INSERT INTO medical_verification_requests
-               (user_id, provider, verification_id, program_id, institution, program, educational_email, id_card_filename, status, metadata_json, submitted_at, reviewed_at, reviewed_by, review_notes)
-               VALUES (?, 'manual_legacy', '', '', ?, ?, ?, '', 'pending', '{}', ?, NULL, NULL, '')
-               ON CONFLICT(user_id) DO UPDATE SET
-                 institution=excluded.institution, program=excluded.program,
-                 educational_email=excluded.educational_email,
-                 status='pending',
-                 submitted_at=excluded.submitted_at, reviewed_at=NULL,
-                 reviewed_by=NULL, review_notes=''""",
-            (user_id, institution, program, educational_email.lower().strip(), now_iso),
-        )
-    return get_medical_verification_request(user_id) or {}
-
-
 def get_medical_verification_request(user_id: str) -> dict | None:
     """Return a learner's medical-verification status."""
     init_materials_db()
@@ -1443,22 +1423,46 @@ def list_medical_verification_requests() -> list[dict]:
         return [dict(row) for row in rows]
 
 
-def review_medical_verification_request(user_id: str, status: str, reviewer: str, notes: str = "") -> dict | None:
-    """Update medical verification request status."""
-    if status not in {"verified", "approved", "rejected"}:
-        raise ValueError("status must be 'verified', 'approved', or 'rejected'")
-    now_iso = datetime.now(timezone.utc).isoformat()
-    with get_materials_db() as conn:
-        conn.execute(
-            """UPDATE medical_verification_requests
-               SET status=?, reviewed_at=?, reviewed_by=?, review_notes=?
-               WHERE user_id=?""",
-            (status, now_iso, reviewer, notes[:1000], user_id),
-        )
-    return get_medical_verification_request(user_id)
-
-
 def is_medical_verified(user_id: str) -> bool:
     """Return True only after authoritative provider verification approves the learner."""
     request = get_medical_verification_request(user_id)
     return bool(request and request.get("status") in {"verified", "approved"})
+
+
+def purge_legacy_id_storage(base_dir: Path | None = None) -> dict[str, Any]:
+    """Securely dispose of any residual local identity-document files and references.
+
+    This is an operational safety utility. It does NOT delete study materials
+    (those live under UPLOAD_DIR). It only removes identity documents that may
+    have been written by a legacy manual-verification workflow, and blanks
+    legacy ``id_card_filename`` references in the database.
+    """
+    import shutil
+
+    target_dir = Path(base_dir) if base_dir else config.MEDICAL_VERIFICATION_DIR
+    deleted_files: list[str] = []
+    if target_dir.exists():
+        for entry in target_dir.glob("**/*"):
+            if entry.is_file():
+                try:
+                    entry.unlink()
+                    deleted_files.append(str(entry))
+                except OSError:
+                    pass
+        try:
+            shutil.rmtree(str(target_dir), ignore_errors=True)
+        except OSError:
+            pass
+
+    cleared_rows = 0
+    with get_materials_db() as conn:
+        cur = conn.execute(
+            "UPDATE medical_verification_requests SET id_card_filename='' WHERE id_card_filename != ''"
+        )
+        cleared_rows = cur.rowcount or 0
+
+    return {
+        "deleted_files": deleted_files,
+        "cleared_id_card_references": cleared_rows,
+        "target_dir": str(target_dir),
+    }

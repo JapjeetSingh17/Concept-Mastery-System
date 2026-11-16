@@ -38,33 +38,60 @@ def test_empty_or_unextractable_content_requires_review():
     assert result.decision is ContentDecision.REVIEW
 
 
-def test_verification_is_pending_until_reviewer_approves():
+def test_verification_is_pending_until_provider_approves():
+    """Verification state is authoritative from the vision-OCR provider, not a manual reviewer.
+
+    A pending vision-OCR session must not grant access; only an approved/verified
+    provider decision flips ``is_medical_verified``.
+    """
     from app.core import store
 
     user_id = "content_safety_test_medical_student"
-    store.submit_medical_verification_request(
+    verification_id = "vision-content-safety-test-001"
+
+    # Clean slate for this fixture user.
+    existing = store.get_medical_verification_request(user_id)
+    if existing:
+        with store.get_materials_db() as conn:
+            conn.execute("DELETE FROM medical_verification_requests WHERE user_id=?", (user_id,))
+
+    # 1. Pending provider session does NOT grant access.
+    store.record_sheerid_verification(
         user_id=user_id,
+        verification_id=verification_id,
+        program_id="vision_ocr",
+        status="pending",
         institution="Example Medical College",
         program="MBBS",
         educational_email="student@examplemedical.edu",
-        id_card_filename="test-id.png",
     )
-
     assert not store.is_medical_verified(user_id)
-    reviewed = store.review_medical_verification_request(
-        user_id=user_id,
-        status="verified",
-        reviewer="test-reviewer",
-        notes="Test fixture approval",
+
+    # 2. Approved provider decision grants access.
+    approved = store.update_sheerid_verification_status(
+        verification_id=verification_id,
+        status="approved",
+        metadata={"provider": "vision_ocr", "decision": "approved"},
     )
-    assert reviewed["status"] == "verified"
+    assert approved is not None
+    assert approved["status"] == "approved"
     assert store.is_medical_verified(user_id)
 
-    store.review_medical_verification_request(
-        user_id=user_id,
+    # 3. Rejected provider decision revokes access.
+    rejected = store.update_sheerid_verification_status(
+        verification_id=verification_id,
         status="rejected",
-        reviewer="test-reviewer",
-        notes="Reset test fixture",
+        metadata={"provider": "vision_ocr", "decision": "rejected"},
+    )
+    assert rejected is not None
+    assert rejected["status"] == "rejected"
+    assert not store.is_medical_verified(user_id)
+
+    # 4. Unrecognized provider statuses never grant access.
+    store.update_sheerid_verification_status(
+        verification_id=verification_id,
+        status="bogus_status",
+        metadata={"provider": "vision_ocr"},
     )
     assert not store.is_medical_verified(user_id)
 

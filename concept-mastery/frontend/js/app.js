@@ -1068,7 +1068,7 @@
     renderMath(textEl);
   }
 
-  // ── SheerID Medical Verification Frontend State & Modal Handlers ─────────
+  // ── Medical ID Verification Frontend State & Modal Handlers ─────────
   let _pendingVerificationUpload = null;
 
   function isMedicalVerificationRequired(err) {
@@ -1084,10 +1084,11 @@
     const badge = $("#medical-student-badge");
     const statusText = $("#med-verif-status-text");
     const retryBtn = $("#btn-retry-pending-upload");
-    const launchBtn = $("#btn-launch-sheerid");
+    const uploadBtn = $("#btn-upload-med-id");
+    const fileInput = $("#med-id-file-input");
 
     try {
-      const res = await ApiService.getSheerIDStatus();
+      const res = await ApiService.getMedicalVerificationStatus();
       const isVerified = Boolean(res && (res.is_verified || res.status === "approved" || res.status === "verified"));
       if (badge) {
         badge.style.display = isVerified ? "inline-flex" : "none";
@@ -1099,12 +1100,14 @@
       if (isVerified) {
         if (_pendingVerificationUpload && retryBtn) {
           retryBtn.style.display = "flex";
-          if (launchBtn) launchBtn.style.display = "none";
+          if (uploadBtn) uploadBtn.style.display = "none";
+          if (fileInput) fileInput.style.display = "none";
         }
         if (notify) showToast("✓ Verified Medical Student status confirmed!", "success");
       } else {
         if (retryBtn) retryBtn.style.display = "none";
-        if (launchBtn) launchBtn.style.display = "flex";
+        if (uploadBtn) uploadBtn.style.display = "flex";
+        if (fileInput) fileInput.style.display = "none";
         if (notify) showToast(`Verification status: ${res ? res.status : "pending"}`, "info");
       }
       return isVerified;
@@ -1128,7 +1131,8 @@
   function initMedicalVerificationModal() {
     const modal = $("#medical-verification-modal");
     const closeBtn = $("#medical-verification-modal-close");
-    const launchBtn = $("#btn-launch-sheerid");
+    const uploadBtn = $("#btn-upload-med-id");
+    const fileInput = $("#med-id-file-input");
     const checkStatusBtn = $("#btn-check-med-status");
     const retryBtn = $("#btn-retry-pending-upload");
 
@@ -1149,20 +1153,29 @@
       };
     }
 
-    if (launchBtn) {
-      launchBtn.onclick = async () => {
+    if (uploadBtn && fileInput) {
+      uploadBtn.onclick = () => fileInput.click();
+      fileInput.onchange = async () => {
+        const file = fileInput.files && fileInput.files[0];
+        if (!file) return;
+        uploadBtn.disabled = true;
+        uploadBtn.innerHTML = '<span>⏳ Verifying ID card...</span>';
         try {
-          launchBtn.disabled = true;
-          launchBtn.textContent = "Initiating Session...";
-          const res = await ApiService.initiateSheerIDVerification();
-          const targetUrl = res.redirect_url || res.hosted_url || "https://services.sheerid.com/";
-          window.open(targetUrl, "_blank", "width=800,height=750");
-          showToast("SheerID verification window opened. Complete verification and click 'Refresh Status'.", "info");
+          const formData = new FormData();
+          formData.append("file", file);
+          const res = await ApiService.verifyMedicalId(formData);
+          if (res.is_medical_verified || res.verification_status === "approved") {
+            showToast(res.message || "ID card verified! You now have clinical access.", "success");
+            await checkAndRefreshMedicalStatus();
+          } else {
+            showToast(res.message || "ID card could not be verified as medical/bio student.", "danger");
+          }
         } catch (e) {
-          showToast(`Could not open SheerID session: ${e.message}`, "danger");
+          showToast(`Verification failed: ${e.message || "Unknown error"}`, "danger");
         } finally {
-          launchBtn.disabled = false;
-          launchBtn.textContent = "Verify with SheerID Portal";
+          uploadBtn.disabled = false;
+          uploadBtn.innerHTML = '<span>📤 Upload Student ID Card</span>';
+          fileInput.value = "";
         }
       };
     }

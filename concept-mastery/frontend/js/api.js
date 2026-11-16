@@ -85,8 +85,8 @@ const ENDPOINTS = {
   materialDeepAudio:   { method: "POST",   path: "/api/materials/{material_id}/deep-audio" },
   toolsGenerate:       { method: "POST",   path: "/api/tools/generate" },
   artifactFile:        { method: "GET",    path: "/api/artifacts/{filename}" },
-  sheeridStatus:       { method: "GET",    path: "/api/auth/sheerid/status" },
-  sheeridInitiate:     { method: "POST",   path: "/api/auth/sheerid/initiate" },
+  medicalVerificationStatus: { method: "GET", path: "/api/auth/medical-verification" },
+  verifyMedicalId:     { method: "POST",   path: "/api/auth/verify-medical-id", isFormData: true },
   emailChallengeReq:   { method: "POST",   path: "/api/auth/email-verification/request" },
   emailChallengeVerify:{ method: "POST",   path: "/api/auth/email-verification/verify" }
 };
@@ -489,12 +489,12 @@ const ApiService = {
     return true;
   },
 
-  async getSheerIDStatus() {
-    return callApi("sheeridStatus");
+  async getMedicalVerificationStatus() {
+    return callApi("medicalVerificationStatus");
   },
 
-  async initiateSheerIDVerification(data = {}) {
-    return callApi("sheeridInitiate", data);
+  async verifyMedicalId(formData) {
+    return callApi("verifyMedicalId", formData);
   },
 
   async requestEmailVerification(email) {

@@ -3,7 +3,7 @@
 Validates:
 1. No local ID-card uploads are saved to disk.
 2. Insecure /admin/.../id-card download route is removed.
-3. Unverified students receive 403 MEDICAL_VERIFICATION_REQUIRED with SheerID endpoint.
+3. Unverified students receive 403 MEDICAL_VERIFICATION_REQUIRED with vision OCR endpoint.
 4. Verified medical students are authorized to access restricted clinical materials.
 """
 import pytest
@@ -40,10 +40,9 @@ def test_no_local_id_files_written_on_verification(client, student_auth):
     """Ensure that requesting verification does not write ID image files to data/vectorstore."""
     initial_files = set(config.MEDICAL_VERIFICATION_DIR.glob("*")) if config.MEDICAL_VERIFICATION_DIR.exists() else set()
 
-    # Initiate SheerID verification
-    res = client.post(
-        "/api/auth/sheerid/initiate",
-        json={"email": "student@medical.edu", "organization_name": "Medical University"},
+    # Check medical verification status endpoint (no file writes)
+    res = client.get(
+        "/api/auth/medical-verification",
         headers=student_auth,
     )
     assert res.status_code == 200
@@ -55,6 +54,10 @@ def test_no_local_id_files_written_on_verification(client, student_auth):
 
 def test_unverified_student_blocked_from_explicit_content(client, student_auth):
     """Ensure unverified students cannot ingest or view explicit content."""
+    # Clean up any previous verification state for this user
+    with store.get_materials_db() as conn:
+        conn.execute("DELETE FROM medical_verification_requests WHERE user_id='sec_student'")
+
     explicit_content = b"This document describes hardcore p0rnography and sexually explicit videos."
     res = client.post(
         "/api/materials/ingest-file",
@@ -65,7 +68,7 @@ def test_unverified_student_blocked_from_explicit_content(client, student_auth):
     data = res.json()
     detail = data.get("detail", {})
     assert detail.get("code") == "MEDICAL_VERIFICATION_REQUIRED"
-    assert "/api/auth/sheerid/initiate" in detail.get("verification_endpoint", "")
+    assert "/api/auth/verify-medical-id" in detail.get("verification_endpoint", "")
 
 
 def test_verified_medical_student_allowed(client, student_auth):
@@ -74,7 +77,7 @@ def test_verified_medical_student_allowed(client, student_auth):
     store.record_sheerid_verification(
         user_id="sec_student",
         verification_id="verif_sec_approved",
-        program_id="medical-student",
+        program_id="vision_ocr",
         status="approved",
     )
     assert store.is_medical_verified("sec_student") is True

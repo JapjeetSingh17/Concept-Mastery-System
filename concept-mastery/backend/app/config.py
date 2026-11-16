@@ -24,10 +24,6 @@ FRONTEND_DIR = (BASE.parent / "frontend").resolve()
 SYNONYMS_FILE = BASE / "synonyms.json"
 
 # Medical & Content Moderation Config
-SHEERID_API_KEY = _e("SHEERID_API_KEY", "")
-SHEERID_PROGRAM_ID = _e("SHEERID_PROGRAM_ID", "")
-SHEERID_WEBHOOK_SECRET = _e("SHEERID_WEBHOOK_SECRET", "")
-SHEERID_BASE_URL = _e("SHEERID_BASE_URL", "https://services.sheerid.com/rest/v2")
 OPENAI_MODERATION_API_KEY = _e("OPENAI_MODERATION_API_KEY", _e("OPENAI_API_KEY", ""))
 OPENAI_MODERATION_URL = _e("OPENAI_MODERATION_URL", "https://api.openai.com/v1/moderations")
 EMAIL_VERIFICATION_SECRET = _e("EMAIL_VERIFICATION_SECRET", "email-verify-secret-key-salt")
