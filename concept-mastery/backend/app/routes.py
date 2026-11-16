@@ -12,13 +12,28 @@ Endpoints:
 
 import logging
 import time
+import hmac
+import uuid
+import inspect
 from pathlib import Path
 from typing import Optional, Literal
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Request, Depends, Query, Body, Response
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Request, Depends, Query, Body, Header, Response
+from fastapi.responses import FileResponse
 from fastapi.concurrency import run_in_threadpool
+from pydantic import BaseModel
 
 from . import config
 from .core import store, tts
+from .core.content_safety import (
+    ContentDecision,
+    extract_text_for_screening,
+    screen_text,
+    screen_visual_content,
+    screen_video_content,
+    validate_upload,
+    screen_text_async,
+)
+from .core.email_verification import DEFAULT_EMAIL_VERIFIER
 from .core.auth import get_current_user, create_access_token, verify_google_credential
 from .pipelines import ingest, tutor, quiz, mastery, recommend, loop, concepts, active_recall, notes, tools, mastery_orchestrator, pedagogical_agents
 from .pipelines.concepts import export_graph
@@ -151,6 +166,352 @@ def get_auth_logs(current_user: User = Depends(get_current_user)):
     }
 
 
+# ── Medical-content access control & Verification ──────────────────────────
+
+class EmailChallengeRequest(BaseModel):
+    email: str
+
+
+class EmailChallengeVerify(BaseModel):
+    email: str
+    code: str
+
+
+# ── Media file helpers ────────────────────────────────────────────────────────
+
+_MEDIA_EXTENSIONS = {".mp3", ".wav", ".m4a", ".webm", ".mp4", ".mov", ".avi", ".mkv", ".m4v"}
+
+
+def _is_media_file(filename: str) -> bool:
+    """Return True for audio/video files that have no extractable text pre-transcription."""
+    if not filename:
+        return False
+    return Path(filename).suffix.lower() in _MEDIA_EXTENSIONS
+
+
+async def _enforce_content_policy(upload: UploadFile, user_id: str) -> None:
+    """Screen extracted document text and visual elements before content is persisted or indexed."""
+    if not upload.filename:
+        raise HTTPException(status_code=400, detail="Uploaded file must have a filename.")
+    raw = await upload.read()
+    await upload.seek(0)
+    try:
+        extracted = extract_text_for_screening(upload.filename, raw)
+    except Exception as exc:
+        logger.warning("Could not screen uploaded file %s: %s", upload.filename, exc)
+        raise HTTPException(
+            status_code=422,
+            detail="This file could not be screened automatically. Upload a text-readable PDF/DOCX/PPTX/TXT/MD file."
+        )
+
+    result = screen_text(extracted)
+    vis_decision, vis_msg, vis_signals = screen_visual_content(upload.filename, raw)
+
+    # Fail-closed: any visual RESTRICTED/REVIEW decision blocks ingestion for unverified users
+    if vis_decision == ContentDecision.RESTRICTED and not store.is_medical_verified(user_id):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "MEDICAL_VERIFICATION_REQUIRED",
+                "message": "This material contains explicit visual content. Access requires verified medical student status via ID card verification.",
+                "verification_endpoint": "/api/auth/verify-medical-id",
+                "signals": list(result.matched_signals) + list(vis_signals),
+            },
+        )
+
+    # Media files (audio/video) have no extractable text pre-transcription; defer screening
+    # to the ingest pipeline where the transcribed text is screened instead of blocking here.
+    if _is_media_file(upload.filename) and not extracted.strip() and not vis_signals:
+        return
+
+    if result.decision == ContentDecision.REVIEW and not result.matched_signals and not vis_signals:
+        raise HTTPException(
+            status_code=422,
+            detail="This file has no supported extractable text or visual elements. It was not uploaded; text moderation or OCR is required."
+        )
+
+    all_signals = list(result.matched_signals) + list(vis_signals)
+    if result.decision == ContentDecision.RESTRICTED or (result.matched_signals and not store.is_medical_verified(user_id)):
+        if not store.is_medical_verified(user_id):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "MEDICAL_VERIFICATION_REQUIRED",
+                    "message": "This material contains explicit or clinical content. Access requires verified medical student status via ID card verification.",
+                    "verification_endpoint": "/api/auth/verify-medical-id",
+                    "signals": all_signals,
+                },
+            )
+
+
+# ── Vision-Based Medical ID Verification (Gemini 2.5 Flash via OpenRouter) ──
+
+@router.get("/auth/medical-verification")
+def get_medical_verification_status(current_user: User = Depends(get_current_user)):
+    """Return verified medical learner status and verification details."""
+    request_record = store.get_medical_verification_request(current_user.user_id)
+    is_verified = store.is_medical_verified(current_user.user_id)
+    status = "approved" if is_verified else (request_record.get("status", "not_submitted") if request_record else "not_submitted")
+    return {
+        "status": status,
+        "is_verified": is_verified,
+        "provider": "vision_ocr",
+        "request": request_record,
+    }
+
+
+@router.post("/auth/verify-medical-id")
+async def verify_medical_id(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+):
+    """Verify a student ID card image using Gemini 2.5 Flash vision via OpenRouter.
+
+    Accepts an image upload (JPEG/PNG), base64-encodes it, and sends it to
+    Gemini 2.5 Flash with a strict JSON schema prompt to extract:
+      - is_valid_id_card (bool)
+      - student_name (str)
+      - institution (str)
+      - department_or_degree (str)
+      - is_medical_or_bio_student (bool)
+      - confidence_score (float 0.0-1.0)
+
+    If is_medical_or_bio_student is true and confidence_score >= 0.7,
+    the user's medical verification status is set to 'approved'.
+    """
+    import base64
+    import httpx
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Image file is required.")
+
+    # Validate file type
+    ext = Path(file.filename).suffix.lower()
+    if ext not in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported image format. Please upload a JPEG, PNG, WebP, or GIF image.",
+        )
+
+    # Read and validate size (max 10 MB)
+    content = await file.read()
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Image too large. Maximum size is 10 MB.")
+    if len(content) < 100:
+        raise HTTPException(status_code=400, detail="Image file is too small or empty.")
+
+    # Encode to base64
+    image_b64 = base64.b64encode(content).decode("utf-8")
+
+    # Use Google Gemini API directly for vision verification (free tier available)
+    if not config.GEMINI_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Vision verification is unavailable: GEMINI_API_KEY is not configured.",
+        )
+
+    system_prompt = (
+        "Analyze the provided image of a college/university ID card. "
+        "Extract the details and determine if the student belongs to a Medical, Biological, "
+        "Nursing, Pharmacy, or Life Sciences stream. "
+        "You must return ONLY valid JSON matching this exact structure:\n"
+        "{\n"
+        '  "is_valid_id_card": true or false,\n'
+        '  "student_name": "extracted name",\n'
+        '  "institution": "extracted university/college name",\n'
+        '  "department_or_degree": "extracted text (e.g., MBBS, B.Sc Biology)",\n'
+        '  "is_medical_or_bio_student": true or false,\n'
+        '  "confidence_score": 0.0 to 1.0\n'
+        "}"
+    )
+
+    # Determine MIME type
+    mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+                ".webp": "image/webp", ".gif": "image/gif"}
+    mime_type = mime_map.get(ext, "image/jpeg")
+
+    # Google Gemini API - free tier supports vision models
+    headers = {
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": system_prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": image_b64,
+                        }
+                    },
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": 600,
+        },
+    }
+
+    try:
+        # Google Gemini API endpoint - use gemini-3.5-flash-lite (latest free tier model)
+        model_name = "gemini-3.5-flash-lite"
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={config.GEMINI_API_KEY}"
+        resp = httpx.post(
+            api_url,
+            headers=headers,
+            json=payload,
+            timeout=60.0,
+        )
+    except httpx.HTTPError as exc:
+        logger.exception("Gemini vision request failed: %s", exc)
+        raise HTTPException(status_code=502, detail="Vision verification service is temporarily unavailable.")
+
+    if resp.status_code != 200:
+        logger.error("Gemini vision API error: %s %s", resp.status_code, resp.text[:300])
+        raise HTTPException(
+            status_code=502,
+            detail=f"Vision verification API error ({resp.status_code}). Please try again later.",
+        )
+
+    data = resp.json()
+    # Gemini API response format
+    candidates = data.get("candidates", [])
+    if not candidates:
+        raise HTTPException(status_code=502, detail="Vision verification returned an empty response.")
+
+    parts = candidates[0].get("content", {}).get("parts", [])
+    if not parts:
+        raise HTTPException(status_code=502, detail="Vision verification returned no content.")
+
+    raw_content = parts[0].get("text", "")
+    if not raw_content:
+        raise HTTPException(status_code=502, detail="Vision verification returned no text content.")
+
+    # Extract and parse JSON from the model response
+    import json
+    try:
+        # Try to find JSON in the response
+        clean = raw_content.strip()
+        # Strip markdown code fences if present
+        if clean.startswith("```"):
+            clean = clean.split("\n", 1)[1] if "\n" in clean else clean
+            clean = clean.rsplit("```", 1)[0] if "```" in clean else clean
+            clean = clean.strip()
+        # Find outermost JSON
+        first_brace = clean.find("{")
+        last_brace = clean.rfind("}")
+        if first_brace != -1 and last_brace != -1:
+            clean = clean[first_brace:last_brace + 1]
+        result = json.loads(clean)
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.warning("Failed to parse vision verification JSON: %s | Raw: %s", exc, raw_content[:500])
+        raise HTTPException(
+            status_code=502,
+            detail="Vision verification could not parse the ID card. Please upload a clearer image.",
+        )
+
+    is_valid = result.get("is_valid_id_card", False)
+    is_medical = result.get("is_medical_or_bio_student", False)
+    confidence = float(result.get("confidence_score", 0.0))
+    student_name = result.get("student_name", "")
+    institution = result.get("institution", "")
+    department = result.get("department_or_degree", "")
+
+    # Update verification status in database
+    verification_id = f"vision_{current_user.user_id}_{int(time.time())}"
+    new_status = "approved" if (is_valid and is_medical and confidence >= 0.7) else "rejected"
+    review_notes = (
+        f"Vision OCR: valid_id={is_valid}, medical_bio={is_medical}, "
+        f"confidence={confidence:.2f}, department={department}"
+    )
+
+    store.record_sheerid_verification(
+        user_id=current_user.user_id,
+        verification_id=verification_id,
+        program_id="vision_ocr",
+        status=new_status,
+        institution=institution,
+        program=department,
+        educational_email=current_user.email or "",
+        metadata=result,
+    )
+    store.update_sheerid_verification_status(
+        verification_id=verification_id,
+        status=new_status,
+        metadata=result,
+        review_notes=review_notes,
+    )
+
+    return {
+        "is_valid_id_card": is_valid,
+        "student_name": student_name,
+        "institution": institution,
+        "department_or_degree": department,
+        "is_medical_or_bio_student": is_medical,
+        "confidence_score": confidence,
+        "verification_status": new_status,
+        "is_medical_verified": store.is_medical_verified(current_user.user_id),
+        "message": (
+            "ID card verified successfully! You now have access to clinical study materials."
+            if new_status == "approved"
+            else "ID card could not be verified as a medical/biological student. Please check your student ID."
+        ),
+    }
+
+
+# ── Institutional Email Mailbox Verification ────────────────────────────────
+
+@router.post("/auth/email-verification/request")
+def request_email_verification(
+    body: EmailChallengeRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Request verification OTP for an institutional mailbox."""
+    try:
+        return DEFAULT_EMAIL_VERIFIER.send_verification_challenge(
+            user_id=current_user.user_id,
+            email=body.email,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/auth/email-verification/verify")
+def verify_email_code(
+    body: EmailChallengeVerify,
+    current_user: User = Depends(get_current_user),
+):
+    """Verify submitted OTP code proving mailbox control."""
+    res = DEFAULT_EMAIL_VERIFIER.verify_challenge(
+        user_id=current_user.user_id,
+        email=body.email,
+        submitted_code=body.code,
+    )
+    if not res.get("verified"):
+        raise HTTPException(status_code=400, detail=res.get("reason", "Verification failed."))
+    return res
+
+
+# ── Safe Admin Verification Inspection (No ID Cards) ───────────────────────
+
+def _require_verification_reviewer(token: str | None) -> None:
+    expected = config.MEDICAL_VERIFICATION_REVIEW_TOKEN
+    if not expected or not token or not hmac.compare_digest(token, expected):
+        raise HTTPException(status_code=403, detail="Authorized verification reviewer access is required.")
+
+
+@router.get("/admin/medical-verification")
+def list_medical_verification_requests(
+    x_verification_review_token: str | None = Header(None),
+):
+    """List verification status audits without exposing identity document files."""
+    _require_verification_reviewer(x_verification_review_token)
+    return {"requests": store.list_medical_verification_requests()}
+
+
 # ── 1. Document Ingestion & Vectorless Index ───────────────────────────────
 
 def _write_uploaded_bytes(dest: Path, content: bytes) -> None:
@@ -159,7 +520,7 @@ def _write_uploaded_bytes(dest: Path, content: bytes) -> None:
     dest.write_bytes(content)
 
 
-async def _save_uploaded_pdfs(files: list[UploadFile], file: UploadFile | None) -> list[Path]:
+async def _save_uploaded_pdfs(files: list[UploadFile], file: UploadFile | None, user_id: str = "default") -> list[Path]:
     all_uploads: list[UploadFile] = list(files or [])
     if file:
         all_uploads.append(file)
@@ -167,6 +528,9 @@ async def _save_uploaded_pdfs(files: list[UploadFile], file: UploadFile | None) 
     valid_pdfs = [f for f in all_uploads if f.filename and f.filename.lower().endswith(".pdf")]
     if not valid_pdfs:
         raise HTTPException(status_code=400, detail="Please upload at least one valid PDF file.")
+
+    for upload in valid_pdfs:
+        await _enforce_content_policy(upload, user_id)
 
     saved_paths: list[Path] = []
     for f in valid_pdfs:
@@ -190,13 +554,15 @@ def _empty_kb(user_id: str) -> dict:
     }
 
 
-def _is_explicit_auth(request: Request) -> bool:
+def _is_explicit_auth(request: Optional[Request] = None) -> bool:
+    if not request or not hasattr(request, "state"):
+        return False
     return getattr(request.state, "auth_source", "jwt") in ("jwt", "dev_header")
 
 
 def _resolve_tenant_user_id(
     current_user: User,
-    request: Request,
+    request: Optional[Request] = None,
     *requested_user_ids: Optional[str],
 ) -> str:
     """Resolve active tenant user_id and block cross-tenant user_id spoofing."""
@@ -224,7 +590,7 @@ def _resolve_tenant_user_id(
     return resolved_fallback or auth_uid
 
 
-def _get_tenant_kb(uid: str, request: Request) -> dict:
+def _get_tenant_kb(uid: str, request: Optional[Request] = None) -> dict:
     """Fetch tenant KB without falling back to the global 'default' KB for authenticated users."""
     if _is_explicit_auth(request) and uid != "default" and uid not in store.USER_KBS:
         if not store.list_study_materials(uid):
@@ -232,14 +598,15 @@ def _get_tenant_kb(uid: str, request: Request) -> dict:
     return store.get_kb(uid)
 
 
-def _require_owned_material(material_id: str, uid: str, request: Request) -> dict:
+def _require_owned_material(material_id: str, uid: str, request: Optional[Request] = None) -> dict:
     """Ensure a study material belongs to the resolved tenant or return 403/404."""
     mat = store.get_study_material(material_id, user_id=uid)
     if mat:
         return mat
     existing = store.get_study_material(material_id, user_id=None)
     if existing:
-        if not _is_explicit_auth(request) and uid == "default" and not request.query_params.get("user_id"):
+        has_query_user_id = bool(getattr(request, "query_params", {}).get("user_id")) if request else False
+        if not _is_explicit_auth(request) and uid == "default" and not has_query_user_id:
             return existing
         raise HTTPException(
             status_code=403,
@@ -309,9 +676,9 @@ async def post_upload(
     user_id: Optional[str] = Query(None),
     current_user: User = Depends(get_current_user),
 ):
-    """Upload one or multiple PDFs, run section chunking & vectorless indexing, build prerequisite DAG."""
+    """Upload one or multiple screened PDFs, run section chunking & vectorless indexing, build prerequisite DAG."""
     uid = _resolve_tenant_user_id(current_user, request, user_id)
-    saved_paths = await _save_uploaded_pdfs(files, file)
+    saved_paths = await _save_uploaded_pdfs(files, file, uid)
     try:
         res = await ingest.run_ingest_async(saved_paths, user_id=uid)
         return UploadResponse(**res)
@@ -332,7 +699,7 @@ async def post_ingest(
 ):
     """Ingest one or multiple PDFs maintaining backward compatibility with existing SPA."""
     uid = _resolve_tenant_user_id(current_user, request, user_id)
-    saved_paths = await _save_uploaded_pdfs(files, file)
+    saved_paths = await _save_uploaded_pdfs(files, file, uid)
     try:
         res = await ingest.run_ingest_async(saved_paths, user_id=uid)
         return {"jobId": res["job_id"], **res}
@@ -1213,7 +1580,7 @@ async def post_materials_ingest_file(
     title: str | None = Form(None),
     current_user: User = Depends(get_current_user),
 ):
-    """Ingest multi-format study material (.pdf, .pptx, .md, .txt, .docx, .mp3, .wav, .m4a, .webm)."""
+    """Ingest multi-format study material (.pdf, .pptx, .md, .txt, .docx, .mp3, .wav, .m4a, .webm, .mp4, .mov, .avi, .mkv)."""
     uid = _resolve_tenant_user_id(current_user, request, user_id)
     all_uploads: list[UploadFile] = list(files or [])
     if file:
@@ -1222,7 +1589,7 @@ async def post_materials_ingest_file(
     if not all_uploads:
         raise HTTPException(status_code=400, detail="No study material file provided.")
 
-    allowed_exts = {".pdf", ".pptx", ".ppt", ".md", ".txt", ".docx", ".mp3", ".wav", ".m4a", ".webm"}
+    allowed_exts = {".pdf", ".pptx", ".ppt", ".md", ".txt", ".docx", ".mp3", ".wav", ".m4a", ".webm", ".mp4", ".mov", ".avi", ".mkv"}
     ingested_materials = []
     safe_uid_dir = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in uid).strip("_") or "default"
     tenant_upload_dir = config.UPLOAD_DIR / safe_uid_dir
@@ -1234,19 +1601,46 @@ async def post_materials_ingest_file(
         if ext not in allowed_exts:
             raise HTTPException(
                 status_code=400,
-                detail=f"Unsupported format '{ext}'. Supported: PDF, PPTX, MD, TXT, DOCX, MP3, WAV, M4A, WEBM."
+                detail=f"Unsupported format '{ext}'. Supported: PDF, PPTX, MD, TXT, DOCX, MP3, WAV, M4A, WEBM, MP4, MOV, AVI, MKV."
             )
+        await _enforce_content_policy(f, uid)
+
+        # Validate file size and magic bytes before writing to disk
+        content = await f.read()
+        await f.seek(0)
+        ok, msg = validate_upload(f.filename, content)
+        if not ok:
+            raise HTTPException(status_code=400, detail=f"File validation failed for '{f.filename}': {msg}")
+
+        # Video files: run frame-based visual moderation before persistence
+        if ext in {".mp4", ".mov", ".avi", ".mkv"}:
+            vis_decision, _vis_msg, _vis_signals = screen_video_content(f.filename, content)
+            if vis_decision == ContentDecision.RESTRICTED and not store.is_medical_verified(uid):
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": "MEDICAL_VERIFICATION_REQUIRED",
+                        "message": "This video contains explicit visual content. Access requires verified medical student status via ID card verification.",
+                        "verification_endpoint": "/api/auth/verify-medical-id",
+                        "signals": list(_vis_signals),
+                    },
+                )
         dest = tenant_upload_dir / Path(f.filename).name
         content = await f.read()
         await run_in_threadpool(_write_uploaded_bytes, dest, content)
 
         try:
+            file_kwargs = {
+                "path": dest,
+                "user_id": uid,
+                "title": title or Path(f.filename).stem.replace("_", " ").title(),
+            }
+            file_sig = inspect.signature(UniversalMaterialIngestor.ingest_file)
+            if "material_id" in file_sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in file_sig.parameters.values()):
+                file_kwargs["material_id"] = material_id
             mat_res = await run_in_threadpool(
                 UniversalMaterialIngestor.ingest_file,
-                path=dest,
-                user_id=uid,
-                title=title or Path(f.filename).stem.replace("_", " ").title(),
-                material_id=material_id,
+                **file_kwargs,
             )
             ingested_materials.append(mat_res)
         except store.UserError as ue:
@@ -1273,27 +1667,66 @@ async def post_materials_ingest_file(
 @router.post("/materials/ingest-url/")
 async def post_materials_ingest_url(
     req: IngestUrlRequest,
-    request: Request,
+    request: Request = None,
     current_user: User = Depends(get_current_user),
 ):
-    """Ingest educational websites (GeeksforGeeks, docs) or YouTube video lectures with timestamped transcripts."""
+    """Screen the fetched URL payload before it can be persisted or indexed, and ingest educational sites or YouTube."""
     uid = _resolve_tenant_user_id(current_user, request, req.user_id)
     url = req.url.strip()
     if not (url.startswith("http://") or url.startswith("https://")):
         raise HTTPException(status_code=400, detail="URL must begin with http:// or https://")
 
     try:
-        mat_res = await run_in_threadpool(
-            UniversalMaterialIngestor.ingest_url,
+        preview = await run_in_threadpool(
+            UniversalMaterialIngestor.preview_url,
             url=url,
             source_type=req.source_type,
-            user_id=uid,
             title=req.title,
-            material_id=req.material_id,
+        )
+        extracted_text = preview.get("raw_text", "")
+        screening = screen_text(extracted_text)
+
+        if screening.decision == ContentDecision.REVIEW and not screening.matched_signals:
+            raise HTTPException(
+                status_code=422,
+                detail="This URL has no supported extractable text or transcript. It was not retained; manual moderation or OCR is required.",
+            )
+
+        if screening.matched_signals and not store.is_medical_verified(uid):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "MEDICAL_VERIFICATION_REQUIRED",
+                    "message": "This material contains explicit or clinical content. Access requires verified medical student status via ID card verification.",
+                    "verification_endpoint": "/api/auth/verify-medical-id",
+                    "signals": list(screening.matched_signals),
+                },
+            )
+
+        url_kwargs = {
+            "url": url,
+            "source_type": req.source_type,
+            "user_id": uid,
+            "title": req.title,
+        }
+        url_sig = inspect.signature(UniversalMaterialIngestor.ingest_url)
+        url_params = url_sig.parameters
+        has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in url_params.values())
+        if has_varkw or "material_id" in url_params:
+            url_kwargs["material_id"] = getattr(req, "material_id", None)
+        if has_varkw or "preloaded_content" in url_params:
+            url_kwargs["preloaded_content"] = preview
+
+        mat_res = await run_in_threadpool(
+            UniversalMaterialIngestor.ingest_url,
+            **url_kwargs,
         )
     except store.UserError as ue:
         raise HTTPException(status_code=400, detail=str(ue))
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.exception("Failed to moderate or ingest URL %s", url)
         raise HTTPException(status_code=500, detail=f"Failed to ingest URL '{url}': {e}")
 
     active_kb = await run_in_threadpool(_get_tenant_kb, uid, request)
@@ -1308,7 +1741,6 @@ async def post_materials_ingest_url(
             "concepts": len(active_kb.get("concepts", [])),
         }
     }
-
 
 @router.get("/materials", response_model=MaterialsListResponse)
 @router.get("/materials/", response_model=MaterialsListResponse)

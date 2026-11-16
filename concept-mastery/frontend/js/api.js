@@ -108,7 +108,11 @@ const ENDPOINTS = {
   notesExport:         { method: "POST",   path: "/api/notes/{note_id}/export" },
   materialDeepAudio:   { method: "POST",   path: "/api/materials/{material_id}/deep-audio" },
   toolsGenerate:       { method: "POST",   path: "/api/tools/generate" },
-  artifactFile:        { method: "GET",    path: "/api/artifacts/{filename}" }
+  artifactFile:        { method: "GET",    path: "/api/artifacts/{filename}" },
+  medicalVerificationStatus: { method: "GET", path: "/api/auth/medical-verification" },
+  verifyMedicalId:     { method: "POST",   path: "/api/auth/verify-medical-id", isFormData: true },
+  emailChallengeReq:   { method: "POST",   path: "/api/auth/email-verification/request" },
+  emailChallengeVerify:{ method: "POST",   path: "/api/auth/email-verification/verify" }
 };
 
 const IN_FLIGHT_REQUESTS = new Map();
@@ -287,8 +291,10 @@ async function callApi(endpointKey, payload = null, options = {}) {
 
       if (!response.ok) {
         let message = "";
+        let detail = null;
         if (data && typeof data === "object") {
-          message = data.detail || data.message || data.error;
+          detail = data.detail || data;
+          message = (typeof detail === "object" ? detail.message || detail.code : detail) || data.message || data.error;
         } else if (typeof data === "string") {
           message = data;
         }
@@ -296,6 +302,8 @@ async function callApi(endpointKey, payload = null, options = {}) {
         const err = new Error(finalMsg);
         err.status = response.status;
         err.endpoint = endpointKey;
+        err.detail = detail || data;
+        err.code = (detail && typeof detail === "object" && detail.code) || "";
         if (typeof window !== "undefined" && !(options && options.silentError)) {
           window.dispatchEvent(new CustomEvent("cm:api-error", {
             detail: { endpointKey, status: response.status, message: finalMsg, method: ep.method, path: cleanPath, error: err }
@@ -951,6 +959,22 @@ const ApiService = {
 
   isMockMode() {
     return isMockModeEnabled();
+  },
+
+  async getMedicalVerificationStatus() {
+    return callApi("medicalVerificationStatus");
+  },
+
+  async verifyMedicalId(formData) {
+    return callApi("verifyMedicalId", formData);
+  },
+
+  async requestEmailVerification(email) {
+    return callApi("emailChallengeReq", { email });
+  },
+
+  async verifyEmailCode(email, code) {
+    return callApi("emailChallengeVerify", { email, code });
   },
 
   saveConfig(newConfig) {

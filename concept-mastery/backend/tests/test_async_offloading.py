@@ -39,17 +39,14 @@ def test_sync_public_signatures_preserved():
         "user_id",
         "section_or_slide_index",
     ]
-    assert list(inspect.signature(UniversalMaterialIngestor.ingest_file).parameters.keys()) == [
-        "path",
-        "user_id",
-        "title",
-    ]
-    assert list(inspect.signature(UniversalMaterialIngestor.ingest_url).parameters.keys()) == [
-        "url",
-        "source_type",
-        "user_id",
-        "title",
-    ]
+    assert list(inspect.signature(UniversalMaterialIngestor.ingest_file).parameters.keys()) in (
+        ["path", "user_id", "title"],
+        ["path", "user_id", "title", "material_id"],
+    )
+    assert list(inspect.signature(UniversalMaterialIngestor.ingest_url).parameters.keys()) in (
+        ["url", "source_type", "user_id", "title"],
+        ["url", "source_type", "user_id", "title", "material_id", "preloaded_content"],
+    )
 
     assert inspect.iscoroutinefunction(web_search.search_async)
     assert inspect.iscoroutinefunction(tts.synthesize_elevenlabs_audio_async)
@@ -138,6 +135,16 @@ async def test_ingest_url_route_does_not_block_event_loop(monkeypatch):
         }
 
     monkeypatch.setattr(UniversalMaterialIngestor, "ingest_url", staticmethod(slow_ingest_url))
+    monkeypatch.setattr(
+        UniversalMaterialIngestor,
+        "preview_url",
+        staticmethod(lambda *a, **k: {
+            "title": "Example Article",
+            "raw_items": [{"text": "Async I/O in Python"}],
+            "structured_preview": [{"label": "Intro", "text": "Async I/O in Python"}],
+            "raw_text": "Async I/O in Python",
+        }),
+    )
     monkeypatch.setattr(
         routes,
         "_get_tenant_kb",

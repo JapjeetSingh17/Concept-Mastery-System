@@ -72,9 +72,16 @@ OPENROUTER_LIVE = _bool("OPENROUTER_LIVE", False)
 # ── Storage & SQLite Database Paths ────────────────────────────────────────────
 UPLOAD_DIR = _p("UPLOAD_DIR", "../data/uploads")
 VECTOR_STORE_PATH = _p("VECTOR_STORE_PATH", "../data/vectorstore")
+MEDICAL_VERIFICATION_DIR = VECTOR_STORE_PATH / "medical_verification"
+MEDICAL_VERIFICATION_REVIEW_TOKEN = _e("MEDICAL_VERIFICATION_REVIEW_TOKEN", "")
 FRONTEND_DIR = (BASE.parent / "frontend").resolve()
 SYNONYMS_FILE = BASE / "synonyms.json"
 GENERATED_ARTIFACTS_DIR = _p("GENERATED_ARTIFACTS_DIR", "generated_artifacts")
+
+# Medical & Content Moderation Config
+OPENAI_MODERATION_API_KEY = _e("OPENAI_MODERATION_API_KEY", _e("OPENAI_API_KEY", ""))
+OPENAI_MODERATION_URL = _e("OPENAI_MODERATION_URL", "https://api.openai.com/v1/moderations")
+EMAIL_VERIFICATION_SECRET = _e("EMAIL_VERIFICATION_SECRET", "email-verify-secret-key-salt")
 
 SQLITE_MATERIALS_DB_PATH = _opt_path("SQLITE_MATERIALS_DB_PATH", VECTOR_STORE_PATH / "study_materials.db")
 SQLITE_INDEX_DB_PATH = _opt_path("SQLITE_INDEX_DB_PATH", VECTOR_STORE_PATH / "vectorless_index.db")
@@ -172,8 +179,13 @@ class Settings:
 
 settings = Settings()
 
+# Direct OpenAI API
+OPENAI_API_KEY = _e("OPENAI_API_KEY", "")
+
 # Legacy / Generic Provider
-LLM_PROVIDER, LLM_API_KEY, LLM_MODEL = _e("LLM_PROVIDER", "openai").lower(), _e("LLM_API_KEY"), _e("LLM_MODEL")
+LLM_PROVIDER = _e("LLM_PROVIDER", "openai").lower()
+LLM_API_KEY = _e("LLM_API_KEY", OPENAI_API_KEY)
+LLM_MODEL = _e("LLM_MODEL", "gpt-4o-mini")
 LLM_BASE_URL = _e("LLM_BASE_URL", "https://api.openai.com/v1")
 
 # ── Timeouts & Rate Limits ─────────────────────────────────────────────────────
@@ -187,6 +199,11 @@ API_RATE_LIMIT_RPM = _int("API_RATE_LIMIT_RPM", 120)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 VECTOR_STORE_PATH.mkdir(parents=True, exist_ok=True)
 GENERATED_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+MEDICAL_VERIFICATION_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    MEDICAL_VERIFICATION_DIR.chmod(0o700)
+except OSError:
+    pass
 
 
 class ConfigValidationError(RuntimeError):
