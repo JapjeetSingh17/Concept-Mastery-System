@@ -17,8 +17,6 @@ A production-grade, closed-loop educational mastery platform that solves the fun
 
 ## Architecture Overview
 
-![System Architecture](concept-mastery/docs/architecture.png)
-
 ```
                       PROPOSED CLOSED-LOOP ARCHITECTURE
                       
